@@ -1,0 +1,8 @@
+# Light bridge/runtime deps for geolip_anima_trainer (mirrors pyproject [project].dependencies).
+# For development:  pip install -e ".[dev]"
+# torch is NOT here — install it from a CUDA wheel index (see requirements-torch.txt).
+# diffusion-pipe's own requirements (deepspeed, torch) are installed ON THE LINUX
+# TARGET from external/diffusion-pipe/requirements.txt — never referenced here.
+huggingface_hub>=0.23
+datasets>=2.19,<3
+Pillow>=10

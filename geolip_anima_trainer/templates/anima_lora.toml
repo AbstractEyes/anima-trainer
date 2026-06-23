@@ -1,0 +1,111 @@
+# =============================================================================
+# anima_lora.toml  —  diffusion-pipe training config for CircleStone Anima (2B)
+# Trainer: tdrussell/diffusion-pipe  (model type 'anima' is native)
+# Target box: RTX PRO 6000 Blackwell, 96GB  ->  bf16, no fp8, no block swap.
+# Objective: CONCEPT / MULTI-CONCEPT LoRA (multiple distinct concepts in one run).
+#   -> higher rank for capacity, per-concept dataset balancing (see dataset toml),
+#      and a two-phase adapter protocol (frozen first, optional low LR second).
+# -----------------------------------------------------------------------------
+# Run:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     deepspeed --num_gpus=1 train.py --deepspeed --config configs/anima_lora.toml
+# Output LoRA is saved in ComfyUI format -> drop into ComfyUI/models/loras/
+# =============================================================================
+
+# ---- top-level run settings -------------------------------------------------
+output_dir = '/data/diffusion_pipe_runs/anima_lora'   # CHANGE: a new subdir is made per run
+dataset    = 'configs/anima_dataset.toml'             # CHANGE: path to the dataset toml below
+
+# I set epochs high and just pick the best saved checkpoint by eval/samples.
+epochs = 100
+
+# 2B model at 1024 on 96GB is tiny — push batch up for throughput.
+# Start at 4; 8 is comfortable. Effective batch = micro_batch * grad_accum.
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1                  # single GPU
+gradient_accumulation_steps = 1
+gradient_clipping = 1.0
+warmup_steps = 50
+
+# ---- eval (optional but useful for picking a checkpoint) --------------------
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 4
+eval_gradient_accumulation_steps = 1
+
+# ---- checkpointing / saving -------------------------------------------------
+# save_every_n_epochs: how often a usable LoRA is written (epochN dirs).
+# Set higher for tiny datasets so you don't drown in saved models.
+save_every_n_epochs = 5
+checkpoint_every_n_minutes = 30      # full training-state checkpoint for --resume_from_checkpoint
+save_dtype = 'bfloat16'
+
+# activation_checkpointing trades compute for VRAM. NOT needed on 96GB for a 2B
+# model — leaving it off is faster. Set to true (or 'unsloth') only if you OOM.
+activation_checkpointing = false
+partition_method = 'parameters'
+caching_batch_size = 8               # latent/text-embed precache batch; bump up, it's one-time
+steps_per_print = 10
+blocks_to_swap = 0                   # 0 = disabled; you have the VRAM
+
+# =============================================================================
+[model]
+type = 'anima'
+# Use the official ComfyUI-format Anima files (see download_anima.py).
+# Point transformer_path at whichever checkpoint you want as the base:
+#   anima-base-v1.0.safetensors   (finalized base, neutral)         <- recommended
+#   anima-preview3-base.safetensors (latest preview, more 1024 training)
+transformer_path = '/data/models/anima/anima-base-v1.0.safetensors'   # CHANGE
+vae_path         = '/data/models/anima/qwen_image_vae.safetensors'    # CHANGE
+llm_path         = '/data/models/anima/qwen_3_06b_base.safetensors'   # CHANGE
+dtype = 'bfloat16'
+
+# -- CRITICAL Anima knob: TWO-PHASE PROTOCOL for multi-concept --------------
+# The LLM adapter maps Qwen3 embeddings -> the Cosmos cond space and carries an
+# outsized amount of the model's knowledge. It degrades easily.
+#
+# Multi-concept is the one case the trainer docs say MIGHT justify training it:
+# "larger dataset or a lot of brand-new concepts." But unfreezing it first risks
+# trading the model's general knowledge for your concepts. So do it in order:
+#
+#   PHASE 1 (start here): llm_adapter_lr = 0  -> adapter FROZEN.
+#       Train, evaluate each concept. For concepts that ALREADY map to things
+#       Anima knows (an existing character, a known style), this alone will work.
+#
+#   PHASE 2 (only if needed): if specific BRAND-NEW concepts won't converge with
+#       the adapter frozen even at high rank, set a very low adapter LR and A/B it:
+#           llm_adapter_lr = 2e-6   # 1e-6 .. 5e-6 ceiling; never higher
+#       Compare against the Phase-1 LoRA on a fixed seed/prompt grid. If general
+#       quality drops or other concepts regress, revert to 0. Frozen wins ties.
+llm_adapter_lr = 0
+
+# =============================================================================
+[adapter]
+type = 'lora'
+# MULTI-CONCEPT: each distinct concept needs representational room, so go higher
+# than the single-concept default of 32. 64 is a solid start for ~3-8 concepts;
+# push to 96/128 if you're packing many concepts or they're visually complex.
+# More rank = more capacity but also more chance to overfit a small concept.
+rank = 64
+dtype = 'bfloat16'
+# init_from_existing = '/data/diffusion_pipe_runs/anima_lora/<run>/epoch20'  # to continue a LoRA
+
+# =============================================================================
+[optimizer]
+# adamw_optimi auto-applies Kahan summation for correct bf16 training. Good default.
+type = 'adamw_optimi'
+lr = 2e-5                            # author's rank-32 starting point. Anima likes LOW lr.
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8
+
+# =============================================================================
+# FULL FINE-TUNE VARIANT (you have the VRAM for it on a 2B model):
+#   1. Delete/comment the entire [adapter] table above.
+#   2. Drop optimizer lr to ~1e-5 (or 5e-6) — base model, light touch.
+#   3. Keep llm_adapter_lr = 0 unless deliberately retraining the adapter.
+#   4. save_dtype = 'bfloat16'; output is a full diffusion_models safetensors.
+# FFT is better for broad concept/aesthetic shifts; LoRA is better for a single
+# style or character and is far more portable. Start with LoRA unless you have a
+# specific reason to move the whole base.
+# =============================================================================

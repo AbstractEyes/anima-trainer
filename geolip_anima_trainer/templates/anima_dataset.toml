@@ -1,0 +1,79 @@
+# =============================================================================
+# anima_dataset.toml  —  MULTI-CONCEPT dataset config for Anima finetuning
+# Referenced by anima_lora.toml via `dataset = 'configs/anima_dataset.toml'`
+# -----------------------------------------------------------------------------
+# The core of multi-concept training is BALANCE: one [[directory]] per concept,
+# with num_repeats set so every concept contributes a comparable number of
+# samples per epoch. An unbalanced run = the model learns the big concept and
+# ignores the small ones. Use build_multiconcept_dataset.py to compute repeats.
+# -----------------------------------------------------------------------------
+# Caching: on first run, latents (VAE) and text embeds (Qwen3) are cached to a
+# `cache/` folder inside each image directory. Reused across runs. Delete it (or
+# pass --regenerate_cache) if you change resolution or swap models.
+# =============================================================================
+
+# Anima preview sweet spot is ~1MP. 1024 is the safe default. You can add 768 to
+# the list for speed/variety, but stick to 1024 if learning fine detail.
+resolutions = [1024]
+
+# Aspect-ratio bucketing so non-square images aren't center-cropped to death.
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 7
+
+# Images only (no video) -> single frame bucket.
+frame_buckets = [1]
+
+# -- Caption handling for Danbooru-style tags --------------------------------
+# Anima is SENSITIVE to tag ORDER:
+#   [quality/meta/year/safety] [1girl/1boy] [character] [series] [artist] [general]
+# So DO NOT blindly shuffle the whole caption. Default: no shuffle.
+shuffle_caption = false
+# If you DO want to shuffle the trailing general tags for regularization, set
+# shuffle_caption = true and keep_tokens to protect the leading ordered block
+# (quality + subject + character + series + artist). Count the leading tags you
+# want frozen and set keep_tokens to that number.
+# keep_tokens = 6
+
+# =============================================================================
+# MULTI-CONCEPT LAYOUT
+# One [[directory]] per concept. Each image foo.png has a sidecar foo.txt caption.
+#
+# TRIGGER DISCIPLINE (Anima is tag-order sensitive):
+#   - Give each concept a UNIQUE trigger token so you can summon it at inference.
+#   - Place the trigger in the slot that matches the concept's nature:
+#       character-like -> [character] slot ;  style-like -> @artist slot ;
+#       a genuinely novel object/concept -> a rare unique tag in [general].
+#   - Keep the rest of each caption honest (describe what's actually in the image)
+#     so the trigger binds to the concept, not to incidental co-occurring tags.
+#
+# BALANCE: num_repeats below should equalize effective samples across concepts.
+#   effective_samples(concept) = image_count * num_repeats
+# Set repeats so those products are roughly equal. The helper script does this.
+# =============================================================================
+
+[[directory]]   # concept A — e.g. 120 images
+path = '/data/datasets/anima_multi/conceptA'   # CHANGE
+caption_extension = '.txt'
+num_repeats = 1
+
+[[directory]]   # concept B — e.g. 40 images -> repeat 3x to ~match A
+path = '/data/datasets/anima_multi/conceptB'   # CHANGE
+caption_extension = '.txt'
+num_repeats = 3
+
+[[directory]]   # concept C — e.g. 20 images -> repeat 6x to ~match A
+path = '/data/datasets/anima_multi/conceptC'   # CHANGE
+caption_extension = '.txt'
+num_repeats = 6
+
+# Add one block per additional concept. Re-run build_multiconcept_dataset.py
+# whenever you add images so the repeats stay balanced.
+
+# =============================================================================
+# Optional separate eval set (for the eval_* settings in anima_lora.toml).
+# Keep it small; it just produces comparable validation loss + sample images.
+# Define it as its own toml and reference via eval_datasets in the main config:
+#   eval_datasets = [ {name = 'val', config = 'configs/anima_eval.toml'} ]
+# =============================================================================

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geolip-anima-trainer"
+version = "0.1.0"
+description = "Bridge + orchestration to finetune CircleStone Anima (2B DiT) with tdrussell/diffusion-pipe."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }   # the tooling code; the Anima MODEL/weights are non-commercial (see README)
+authors = [{ name = "AbstractPhil" }]
+keywords = ["anima", "diffusion-pipe", "lora", "finetuning", "text-to-image"]
+
+# LIGHT BRIDGE DEPS ONLY. torch is deliberately absent — it must come from the
+# CUDA wheel index, not PyPI (see requirements-torch.txt / README). tomllib is
+# stdlib on 3.12 (reads); TOML is hand-rendered for writes (no tomli-w needed).
+dependencies = [
+    "huggingface_hub>=0.23",   # download_anima.py
+    "datasets>=2.19,<3",       # hf_to_diffusion_pipe.py streaming (3.x changed Image decode)
+    "Pillow>=10",              # img.convert("RGB").save(...)
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5", "build>=1.2"]
+
+[project.scripts]
+anima = "geolip_anima_trainer.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/AbstractPhil/anima-trainer"
+
+[tool.setuptools]
+packages = ["geolip_anima_trainer"]
+
+[tool.setuptools.package-data]
+geolip_anima_trainer = ["templates/*.toml"]
