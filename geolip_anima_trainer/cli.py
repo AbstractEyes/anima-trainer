@@ -101,6 +101,18 @@ def build_parser() -> argparse.ArgumentParser:
     sj.add_argument("--min-final-group-size", type=int, default=12)
     sj.add_argument("--drop-small", action="store_true",
                     help="drop ungroupable sparse subjects instead of pooling into misc_*")
+    # dual-caption modes + oversized-bucket splitting
+    sj.add_argument("--caption-mode", default="before_after",
+                    choices=["separate", "mixed", "before_after"],
+                    help="how vlm+animetimm samples are organized (before_after = first LoRA)")
+    sj.add_argument("--no-mixed-concat", action="store_true",
+                    help="MIXED: don't add the 3rd vlm+animetimm joint caption")
+    sj.add_argument("--no-split", action="store_true",
+                    help="don't split oversized buckets")
+    sj.add_argument("--max-bucket-size", type=int, default=None,
+                    help="cap per bucket (default data-dependent: >10k=1000, >=1k=500, else 250)")
+    sj.add_argument("--prefer-attr-source", default="animetimm",
+                    choices=["animetimm", "vlm"], help="which caption's attributes drive splits")
 
     # build
     b = sub.add_parser("build", help="balanced dataset.toml from concept folders")
@@ -141,10 +153,26 @@ def build_parser() -> argparse.ArgumentParser:
         t.add_argument("--dry-run", action="store_true", help="print the command, don't exec")
         if name == "cache":
             t.add_argument("--regenerate", action="store_true")
+            t.add_argument("--progress", action="store_true",
+                           help="live %-done + ETA from the cache SQLite metadata")
+            t.add_argument("--progress-interval", type=float, default=30.0)
+            t.add_argument("--log-path", default=None,
+                           help="send diffusion-pipe output here so the progress line stays clean")
         else:
             t.add_argument("--pipeline-stages", type=int, default=None)
             t.add_argument("--resume", nargs="?", const=True, default=False,
                            help="--resume (latest) or --resume <ckpt-dir>")
+
+    # before_after (two chained runs: full VLM phase -> full animetimm phase)
+    ba = sub.add_parser("train-before-after",
+                        help="BEFORE_AFTER first-LoRA: VLM phase then animetimm phase (resumed)")
+    ba.add_argument("--lora-vlm", required=True, help="lora.toml referencing dataset_vlm.toml")
+    ba.add_argument("--lora-animetimm", required=True,
+                    help="lora.toml referencing dataset_animetimm.toml")
+    ba.add_argument("--repo-root", default=None)
+    ba.add_argument("--num-gpus", type=int, default=1)
+    ba.add_argument("--gpu-ids", default=None)
+    ba.add_argument("--dry-run", action="store_true")
     return p
 
 
@@ -195,21 +223,28 @@ def main(argv: list[str] | None = None) -> int:
             require_audit_approved=not args.no_audit_filter, require_age_pass=args.age_filter,
             use_semantic=not args.no_semantic, similarity_model=args.similarity_model,
             semantic_backend=args.semantic_backend, sim_threshold=args.sim_threshold,
-            min_final_group_size=args.min_final_group_size, keep_small=not args.drop_small)
+            min_final_group_size=args.min_final_group_size, keep_small=not args.drop_small,
+            caption_mode=api.CaptionMode(args.caption_mode),
+            dedupe_mixed_concat=not args.no_mixed_concat,
+            split_oversized=not args.no_split, max_bucket_size=args.max_bucket_size,
+            prefer_attr_source=args.prefer_attr_source)
         rep = api.export_subject_buckets(cfg)
-        print(f"\nscanned={rep['scanned']}  accepted_images={rep['accepted_images']}  "
-              f"dropped={rep['dropped_images']}")
-        print(f"caption stats: {rep['caption_stats']}")
+        print(f"\nmode={rep['caption_mode']}  scanned={rep['scanned']}  "
+              f"accepted_images={rep['accepted_images']}  dropped={rep['dropped_images']}")
+        print(f"caption stats: {rep['caption_stats']}  max_bucket_size={rep['max_bucket_size']}")
         print(f"raw subjects: {rep['raw_subjects']}  ->  final buckets: {rep['n_final_buckets']}")
+        if rep["oversized_subjects"]:
+            print(f"oversized (split): {rep['oversized_subjects'][:10]}")
         print("\nfinal buckets (samples each):")
         for name, n in list(rep["final_buckets"].items())[:40]:
-            print(f"  {name:<28}{n}")
-        merged = [a for a in rep["merge_actions"] if a[2].startswith("merge")]
-        dropped = [a for a in rep["merge_actions"] if a[2] == "drop"]
-        print(f"\nmerged {len(merged)} small subjects into larger ones; dropped {len(dropped)}.")
+            print(f"  {name:<34}{n}")
         if args.build_toml:
-            out = api.build_dataset_toml(args.out_root, args.build_toml)
-            print(f"Wrote {out}")
+            cdir = Path(args.build_toml)
+            if cdir.suffix == ".toml":      # a file path was given -> use its directory
+                cdir = cdir.parent if cdir.parent != Path("") else Path(".")
+            tomls = api.build_mode_tomls(args.out_root, cfg, configs_dir=cdir)
+            for t in tomls:
+                print(f"Wrote {t}")
         return 0
 
     if args.cmd == "build":
@@ -254,6 +289,9 @@ def main(argv: list[str] | None = None) -> int:
                       gpu_ids=_parse_ids(args.gpu_ids), dry_run=args.dry_run)
         if args.cmd == "cache":
             kwargs["regenerate"] = args.regenerate
+            kwargs["progress"] = args.progress
+            kwargs["progress_interval"] = args.progress_interval
+            kwargs["log_path"] = args.log_path
         else:
             kwargs["pipeline_stages"] = args.pipeline_stages
             kwargs["resume"] = args.resume
@@ -266,6 +304,19 @@ def main(argv: list[str] | None = None) -> int:
             print(str(e), file=sys.stderr)
             return 3
         return rc if isinstance(rc, int) else 0
+
+    if args.cmd == "train-before-after":
+        try:
+            api.train_before_after(args.lora_vlm, args.lora_animetimm,
+                                   repo_root=args.repo_root, num_gpus=args.num_gpus,
+                                   gpu_ids=_parse_ids(args.gpu_ids), dry_run=args.dry_run)
+        except api.WindowsTrainingRefused as e:
+            print(str(e), file=sys.stderr)
+            return 2
+        except api.DiffusionPipeNotFound as e:
+            print(str(e), file=sys.stderr)
+            return 3
+        return 0
 
     return 1
 

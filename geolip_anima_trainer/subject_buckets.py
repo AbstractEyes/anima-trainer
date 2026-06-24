@@ -25,17 +25,35 @@ Safety: only reads the narrow column set below — never `extra_json` / `celeb_n
 
 from __future__ import annotations
 
+import enum
 import fnmatch
 import json
 import logging
+import math
 import os
 import re
 import shutil
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher, get_close_matches
 from pathlib import Path
 from typing import Callable
+
+
+class CaptionMode(enum.Enum):
+    """How the VLM-JSON and animetimm-JSON caption samples are organized + trained."""
+    SEPARATE = "separate"          # two bucket trees, ONE dataset.toml, globally shuffled
+    MIXED = "mixed"                # one image inode, both captions via captions.json (deduped)
+    BEFORE_AFTER = "before_after"  # two trees, TWO sequential runs (vlm -> animetimm). FIRST LORA.
+
+
+@dataclass
+class ImageRecord:
+    """Per-image differentiation features carried from pass 1 to bucketing/splitting."""
+    vlm_subject: str | None        # normalized dominant subject of the vlm caption
+    anime_subject: str | None      # normalized dominant subject of the animetimm caption
+    attrs: tuple = ()              # normalized attributes of subjects[0] (prefer-source first)
+    secondary: str | None = None   # normalized subjects[1].name (prefer-source first)
 
 log = logging.getLogger("anima.subjects")
 
@@ -82,6 +100,17 @@ class SubjectBucketConfig:
     min_final_group_size: int = 8         # group below this (summed images) -> misc_* (weighted, not dropped)
     max_group_members: int = 8            # connected-components fallback cap (unused by agglomerative)
     keep_small: bool = True               # weight-don't-drop: leftovers -> misc_*, never None
+
+    # ---- dual-caption modes (bucket the vlm + animetimm samples) ----
+    caption_mode: CaptionMode = CaptionMode.BEFORE_AFTER   # the FIRST LoRA uses before_after
+    dedupe_mixed_concat: bool = True      # MIXED: also emit a 3rd "vlm\nanimetimm" joint caption
+
+    # ---- oversized-bucket splitting (data-dependent cap, attribute differentiation) ----
+    split_oversized: bool = True
+    max_bucket_size: int | None = None    # None -> data-dependent: >10k=1000, >=1k=500, else 250
+    prefer_attr_source: str = "animetimm" # which caption's attributes win ("animetimm" | "vlm")
+    attr_min_split: int = 2               # don't carve a sub-bucket smaller than this
+    split_separator: str = "·"       # display marker (middle dot); slugged away in dir names
 
 
 # =============================================================================
@@ -155,6 +184,174 @@ def dominant_subject(vlm_json: str, *, head_noun: bool = True) -> str | None:
     if not subs:
         return None
     return normalize_subject(_subject_name(subs[0]), head_noun=head_noun)
+
+
+def caption_subject(caption_json: str, *, head_noun: bool = True) -> str | None:
+    """Dominant subject of ONE caption (vlm OR animetimm), bucketed independently."""
+    return dominant_subject(caption_json, head_noun=head_noun)
+
+
+# ---- attributes & secondary subject (for splitting oversized buckets) -------
+# Count/meta booru tags that don't usefully differentiate a subject bucket — so we
+# split a 'woman' bucket by 'blonde_hair', NOT by '1girl' (the requirement).
+_ATTR_STOP = {"1girl", "1boy", "2girls", "2boys", "solo", "general", "sensitive",
+              "simple_background", "white_background", "looking_at_viewer"}
+
+
+def normalize_attr(a: str | None) -> str | None:
+    """Booru attribute -> stable slug-safe differentiator token. Lowercase, spaces->_,
+    KEEP multiword ('blonde_hair' stays distinct from 'red_hair' — no head-noun), drop
+    count/meta tags. 'Blonde Hair' -> 'blonde_hair'; '1girl' -> None."""
+    if not a:
+        return None
+    s = re.sub(r"[^a-z0-9 _]+", " ", str(a).lower()).strip()
+    s = re.sub(r"[ _]+", "_", s).strip("_")
+    if not s or s in _ATTR_STOP:
+        return None
+    return s
+
+
+def _subject_attrs(entry) -> list:
+    """Attributes of a subjects[] entry: dict 'attributes' list, or [] for a bare string."""
+    if isinstance(entry, dict):
+        return [a for a in (entry.get("attributes") or []) if a]
+    return []
+
+
+def _features(caption_json: str | None, *, head_noun: bool):
+    """(dominant_subject, normalized attrs of subjects[0], normalized subjects[1] name)."""
+    if not caption_json:
+        return None, (), None
+    try:
+        obj = json.loads(caption_json)
+    except (json.JSONDecodeError, TypeError):
+        return None, (), None
+    if not isinstance(obj, dict):
+        return None, (), None
+    subs = obj.get("subjects") or []
+    if not subs:
+        return None, (), None
+    subject = normalize_subject(_subject_name(subs[0]), head_noun=head_noun)
+    attrs = tuple(x for x in (normalize_attr(a) for a in _subject_attrs(subs[0])) if x)
+    secondary = normalize_subject(_subject_name(subs[1]), head_noun=head_noun) \
+        if len(subs) > 1 else None
+    return subject, attrs, secondary
+
+
+def extract_features(vlm_json: str | None, anime_json: str | None, *,
+                     prefer: str = "animetimm", head_noun: bool = True) -> ImageRecord:
+    """Per-image record: dominant subject of EACH caption (bucketed independently) +
+    attributes/secondary of subjects[0] taken from the `prefer` caption first (animetimm
+    attrs are richer), the other caption as fallback."""
+    vlm_subj, vlm_attrs, vlm_sec = _features(vlm_json, head_noun=head_noun)
+    anime_subj, anime_attrs, anime_sec = _features(anime_json, head_noun=head_noun)
+    if prefer == "vlm":
+        attrs = vlm_attrs or anime_attrs
+        secondary = vlm_sec or anime_sec
+    else:
+        attrs = anime_attrs or vlm_attrs
+        secondary = anime_sec or vlm_sec
+    return ImageRecord(vlm_subject=vlm_subj, anime_subject=anime_subj,
+                       attrs=attrs, secondary=secondary)
+
+
+# =============================================================================
+# OVERSIZED-BUCKET SPLITTING  (data-dependent cap; attribute -> secondary -> chunk)
+# =============================================================================
+def max_bucket_size(total_images: int, override: int | None = None) -> int:
+    """Per-bucket image ceiling, scaled to dataset size (manually overridable).
+    >10000 imgs -> 1000 ; 1000-10000 -> 500 ; <1000 -> 250."""
+    if override is not None:
+        return override
+    if total_images > 10_000:
+        return 1_000
+    if total_images >= 1_000:
+        return 500
+    return 250
+
+
+def _even_chunks(seq: list, n: int) -> list:
+    """Split seq into n near-equal contiguous chunks (no tiny remainder)."""
+    n = max(1, n)
+    k, m = divmod(len(seq), n)
+    out, start = [], 0
+    for i in range(n):
+        size = k + (1 if i < m else 0)
+        out.append(seq[start:start + size])
+        start += size
+    return [c for c in out if c]
+
+
+def _split_one(records_of: dict, ids: list, subj: str, M: int,
+               cfg: SubjectBucketConfig) -> dict:
+    """Partition one oversized bucket's idslugs into <=M sub-buckets:
+    TIER A rarest dominant-subject attribute -> TIER B secondary subject -> TIER C chunk.
+    Every image lands in exactly one sub-bucket (a true partition)."""
+    sep = cfg.split_separator
+    attr_freq = Counter(a for i in ids for a in records_of[i].attrs)
+    groups: dict = defaultdict(list)
+    no_attr: list = []
+    for i in ids:
+        cand = [a for a in records_of[i].attrs if a]
+        if cand:                                   # rarest attr = most discriminative
+            key = min(cand, key=lambda a: (attr_freq[a], a))
+            groups[f"{subj}{sep}{key}"].append(i)
+        else:
+            no_attr.append(i)
+    # fold sub-threshold attribute splits back into the no-attr pool
+    for name in [n for n, m in groups.items() if len(m) < cfg.attr_min_split]:
+        no_attr.extend(groups.pop(name))
+    for i in no_attr:                              # TIER B: secondary subject
+        sec = records_of[i].secondary
+        groups[f"{subj}{sep}with_{sec}" if sec else f"{subj}{sep}plain"].append(i)
+    final: dict = {}                               # TIER C: even-chunk anything still > M
+    for name, members in groups.items():
+        if len(members) <= M:
+            final[name] = members
+        else:
+            for c, part in enumerate(_even_chunks(sorted(members), math.ceil(len(members) / M))):
+                final[f"{name}_{c:02d}"] = part
+    return final
+
+
+def split_oversized_buckets(records_of: dict, plan: "BucketPlan", cfg: SubjectBucketConfig,
+                            *, stream: str, subject_attr: str):
+    """For ONE caption stream ('vlm'/'anime'), split each FINAL bucket that exceeds the
+    data-dependent cap. Returns (override, subcounts, oversized): override maps
+    (idslug, stream) -> sub-bucket display name; subcounts maps name -> count."""
+    M = max_bucket_size(len(records_of), cfg.max_bucket_size)
+    by_bucket: dict = defaultdict(list)
+    for idslug, rec in records_of.items():
+        subj = getattr(rec, subject_attr)
+        if subj is None:
+            continue
+        bucket = plan.mapping.get(subj)
+        if bucket is not None:
+            by_bucket[bucket].append(idslug)
+    override: dict = {}
+    subcounts: Counter = Counter()
+    oversized: list = []
+    for bucket, ids in by_bucket.items():
+        if len(ids) <= M:
+            continue
+        oversized.append((bucket, len(ids)))
+        log.warning("subject %r (%d imgs, %s stream) breaches max %d -> sub-bucketing",
+                    bucket, len(ids), stream, M)
+        for name, members in _split_one(records_of, ids, bucket, M, cfg).items():
+            for idslug in members:
+                override[(idslug, stream)] = name
+            subcounts[name] += len(members)
+    return override, subcounts, oversized
+
+
+# ---- MIXED-mode caption list + captions.json ------------------------------
+def _mixed_captions(vlm: str, anime: str | None, cfg: SubjectBucketConfig) -> list:
+    caps = [vlm]
+    if anime:
+        caps.append(anime)
+        if cfg.dedupe_mixed_concat:
+            caps.append(vlm + "\n" + anime)        # joint-conditioning sample
+    return caps
 
 
 # =============================================================================
@@ -470,15 +667,16 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
     shards = _resolve_shards(cfg.repo, cfg.config, cfg.split)
     log.info("config %s -> %d parquet shard(s)", cfg.config, len(shards))
 
-    # ---- PASS 1: caption columns only -> subjects + captions (no images) ----
-    # Download shards LAZILY (one at a time, stop at limit) — never pre-fetch all
-    # shards (the full config can be >100 GB). Track which we actually used.
+    mixed = cfg.caption_mode is CaptionMode.MIXED
+
+    # ---- PASS 1: caption columns -> per-image features (no image bytes) ----
+    # Download shards LAZILY (stop at limit) — the full config can be >100 GB.
     cap_cols = [vlm_col] + ([anime_col] if anime_col else []) + \
                ["id", "audit", "age_classifier_pass"]
-    keep: dict = {}                 # idslug -> captions  [(suffix, text), ...]
-    subjects_of: dict = {}          # idslug -> normalized subject
+    keep: dict = {}                 # idslug -> (vlm_caption, anime_caption|None)
+    records_of: dict = {}           # idslug -> ImageRecord
     cap_stats: Counter = Counter()
-    used_local: list[str] = []      # local paths of shards actually downloaded
+    used_local: list[str] = []
     scanned = n_accept = 0
     done = False
     for shard in shards:
@@ -498,19 +696,17 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
                 if vlm is None:
                     cap_stats["no_vlm"] += 1
                     continue
-                subject = dominant_subject(vlm, head_noun=cfg.head_noun)
-                if subject is None:
+                anime = real_caption(animes[i]) if anime_col else None
+                rec = extract_features(vlm, anime, prefer=cfg.prefer_attr_source,
+                                       head_noun=cfg.head_noun)
+                if rec.vlm_subject is None:
                     cap_stats["no_subject"] += 1
                     continue
+                if anime:
+                    cap_stats["with_anime"] += 1
                 idslug = slug(ids[i])
-                captions = [("", vlm)]
-                if anime_col:
-                    anime = real_caption(animes[i])
-                    if anime:
-                        captions.append(("__anime", anime))
-                        cap_stats["with_anime"] += 1
-                keep[idslug] = captions
-                subjects_of[idslug] = subject
+                keep[idslug] = (vlm, anime)
+                records_of[idslug] = rec
                 cap_stats["accepted"] += 1
                 n_accept += 1
                 if cfg.limit and n_accept >= cfg.limit:
@@ -521,23 +717,57 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
         if done:
             break
 
-    # ---- PLAN: semantic grouping (or legacy difflib fuzzy-merge) ----
-    if cfg.use_semantic:
-        plan = plan_buckets_semantic(Counter(subjects_of.values()), cfg)
-    else:
-        plan = plan_buckets(list(subjects_of.values()), cfg)
-    final: dict = {}                # idslug -> (bucket_dir_slug, captions)
-    dropped = 0
-    for idslug, subject in subjects_of.items():
-        bucket = plan.mapping.get(subject)
-        if bucket is None:
-            dropped += 1
-        else:
-            final[idslug] = (slug(bucket), keep[idslug])
+    # ---- PLAN over the UNION of vlm (+ animetimm, unless MIXED) subjects ----
+    subj_counter: Counter = Counter()
+    for rec in records_of.values():
+        if rec.vlm_subject:
+            subj_counter[rec.vlm_subject] += 1
+        if not mixed and rec.anime_subject:
+            subj_counter[rec.anime_subject] += 1
+    plan = (plan_buckets_semantic(subj_counter, cfg) if cfg.use_semantic
+            else plan_buckets(list(subj_counter.elements()), cfg))
 
-    # ---- PASS 2: write ONLY kept images directly into bucket dirs ----
-    # Re-read only the shards we already downloaded in pass 1 (now cached locally).
+    # ---- SPLIT oversized buckets, per caption stream (disjoint from grouping) ----
+    override: dict = {}
+    oversized: list = []
+    if cfg.split_oversized:
+        ov, _, ovr = split_oversized_buckets(records_of, plan, cfg,
+                                              stream="vlm", subject_attr="vlm_subject")
+        override.update(ov)
+        oversized += ovr
+        if not mixed:
+            ov, _, ovr = split_oversized_buckets(records_of, plan, cfg,
+                                                 stream="anime", subject_attr="anime_subject")
+            override.update(ov)
+            oversized += ovr
+
+    def _bucket(idslug, subject, stream):
+        b = override.get((idslug, stream))
+        if b is None and subject is not None:
+            b = plan.mapping.get(subject)
+        return slug(b) if b else None
+
+    # ---- per-image write spec ----
+    final: dict = {}
+    dropped = 0
+    for idslug, rec in records_of.items():
+        vb = _bucket(idslug, rec.vlm_subject, "vlm")
+        if vb is None:
+            dropped += 1
+            continue
+        vlm, anime = keep[idslug]
+        spec = {"vlm": vb, "vlm_cap": vlm}
+        if mixed:
+            spec["mixed_caps"] = _mixed_captions(vlm, anime, cfg)
+        elif anime and rec.anime_subject:
+            ab = _bucket(idslug, rec.anime_subject, "anime")
+            if ab is not None:
+                spec["anime"], spec["anime_cap"] = ab, anime
+        final[idslug] = spec
+
+    # ---- PASS 2: write ONLY kept images, routed per caption mode ----
     bucket_counts: Counter = Counter()
+    captions_accum: dict = defaultdict(dict)     # mixed bucket dir -> {filename: [caps]}
     remaining = set(final)
     for local in used_local:
         if not remaining:
@@ -552,27 +782,44 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
                 if idslug not in remaining:
                     continue
                 remaining.discard(idslug)
-                bucket_dir, captions = final[idslug]
+                spec = final[idslug]
                 ext, raw = _img_bytes(d["image"][i])
                 if raw is None:
                     cap_stats["no_image"] += 1
                     continue
-                bdir = out_root / bucket_dir
-                bdir.mkdir(parents=True, exist_ok=True)
-                primary = bdir / f"{idslug}{ext}"
-                if primary.exists():        # re-run safety: fresh inode, don't truncate a
-                    primary.unlink()        # prior run's __anime hardlink that shares it
-                primary.write_bytes(raw)                       # RAW — no re-encode
-                (bdir / f"{idslug}.txt").write_text(captions[0][1], encoding="utf-8")
-                bucket_counts[bucket_dir] += 1
-                for suffix, caption in captions[1:]:           # animetimm variant
-                    _link_or_copy(primary, bdir / f"{idslug}{suffix}{ext}")
-                    (bdir / f"{idslug}{suffix}.txt").write_text(caption, encoding="utf-8")
-                    bucket_counts[bucket_dir] += 1
+                if mixed:                                      # one inode + captions.json
+                    bdir = out_root / "mixed" / spec["vlm"]
+                    bdir.mkdir(parents=True, exist_ok=True)
+                    img = bdir / f"{idslug}{ext}"
+                    if img.exists():
+                        img.unlink()
+                    img.write_bytes(raw)
+                    captions_accum[str(bdir)][f"{idslug}{ext}"] = spec["mixed_caps"]
+                    bucket_counts[f"mixed/{spec['vlm']}"] += len(spec["mixed_caps"])
+                else:                                          # vlm tree + animetimm tree
+                    vb = out_root / "vlm" / spec["vlm"]
+                    vb.mkdir(parents=True, exist_ok=True)
+                    primary = vb / f"{idslug}{ext}"
+                    if primary.exists():
+                        primary.unlink()
+                    primary.write_bytes(raw)
+                    (vb / f"{idslug}.txt").write_text(spec["vlm_cap"], encoding="utf-8")
+                    bucket_counts[f"vlm/{spec['vlm']}"] += 1
+                    if "anime" in spec:
+                        ab = out_root / "animetimm" / spec["anime"]
+                        ab.mkdir(parents=True, exist_ok=True)
+                        _link_or_copy(primary, ab / f"{idslug}{ext}")    # hardlink, no pixels
+                        (ab / f"{idslug}.txt").write_text(spec["anime_cap"], encoding="utf-8")
+                        bucket_counts[f"animetimm/{spec['anime']}"] += 1
+
+    for bdir_str, mapping in captions_accum.items():           # flush MIXED captions.json
+        (Path(bdir_str) / "captions.json").write_text(
+            json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
 
     return {
         "out_root": str(out_root),
-        "shards_used": len(shards),
+        "caption_mode": cfg.caption_mode.value,
+        "shards_used": len(used_local),
         "scanned": scanned,
         "accepted_images": len(keep),
         "dropped_images": dropped,
@@ -580,5 +827,51 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
         "final_buckets": dict(bucket_counts.most_common()),
         "n_final_buckets": len(bucket_counts),
         "raw_subjects": len(plan.raw_counts),
+        "max_bucket_size": max_bucket_size(len(records_of), cfg.max_bucket_size),
+        "oversized_subjects": oversized,
         "merge_actions": plan.actions,
     }
+
+
+def build_mode_tomls(out_root: str | Path, cfg: SubjectBucketConfig, *,
+                     configs_dir: str | Path, resolutions=(1024,),
+                     balance_alpha: float = 0.5, cap_mult: float = 1.25,
+                     max_repeats: int = 8, target_effective: int | None = None) -> list:
+    """Build the balanced dataset toml(s) for the extracted trees, per caption mode:
+       MIXED        -> one toml over mixed/* (online_captions=true)
+       SEPARATE     -> one toml over vlm/* + animetimm/* (global shuffle)
+       BEFORE_AFTER -> TWO tomls: dataset_vlm.toml + dataset_animetimm.toml (sequential phases)
+    Returns the written toml paths."""
+    from . import build_multiconcept_dataset as _b
+    out_root = Path(out_root).expanduser().resolve()
+    cdir = Path(configs_dir).expanduser()
+    cdir.mkdir(parents=True, exist_ok=True)
+
+    def _build(roots, out_path: Path, *, online: bool) -> Path | None:
+        bcfg = _b.BaseConfig(resolutions=list(resolutions), balance_alpha=balance_alpha,
+                             cap_mult=cap_mult, max_repeats=max_repeats,
+                             target_effective=target_effective, online_captions=online)
+        concepts: list = []
+        for r in roots:
+            if Path(r).is_dir():
+                concepts += _b.discover_concepts(Path(r), bcfg)
+        if not concepts:
+            return None
+        _b.compute_repeats(concepts, bcfg)
+        out_path.write_text(_b.render_toml(concepts, bcfg), encoding="utf-8")
+        return out_path
+
+    if cfg.caption_mode is CaptionMode.MIXED:
+        p = _build([out_root / "mixed"], cdir / "anima_dataset.toml", online=True)
+        return [p] if p else []
+    if cfg.caption_mode is CaptionMode.BEFORE_AFTER:
+        out = []
+        for tree, name in (("vlm", "dataset_vlm.toml"), ("animetimm", "dataset_animetimm.toml")):
+            p = _build([out_root / tree], cdir / name, online=False)
+            if p:
+                out.append(p)
+        return out
+    # SEPARATE
+    p = _build([out_root / "vlm", out_root / "animetimm"], cdir / "anima_dataset.toml",
+               online=False)
+    return [p] if p else []

@@ -15,14 +15,14 @@ See PRELIM_PLAN.md / CLAUDE.md for the domain brief. Public API:
 from __future__ import annotations
 
 from .api import (  # noqa: F401
-    AdapterConfig, ConfigError, DatasetConfig, DatasetTomlConfig, DirectoryConfig,
-    DiffusionPipeNotFound, DoctorReport, ExportConfig, ModelConfig, ModelPaths,
-    OptimizerConfig, RunConfig, SubjectBucketConfig, TrainConfig, WindowsTrainingRefused,
-    apply_overrides, build_dataset_toml, cache, doctor, download_models,
-    export_dataset, export_subject_buckets, inspect_source, load_dataset_config,
-    load_train_config, multi_concept_preset, rebalance, render_dataset_toml,
-    render_lora_toml, render_train_toml, single_concept_preset, sweep, train,
-    validate, validate_bridge,
+    AdapterConfig, CaptionMode, ConfigError, DatasetConfig, DatasetTomlConfig,
+    DirectoryConfig, DiffusionPipeNotFound, DoctorReport, ExportConfig, ModelConfig,
+    ModelPaths, OptimizerConfig, RunConfig, SubjectBucketConfig, TrainConfig,
+    WindowsTrainingRefused, apply_overrides, build_dataset_toml, build_mode_tomls,
+    cache, doctor, download_models, export_dataset, export_subject_buckets,
+    inspect_source, load_dataset_config, load_train_config, multi_concept_preset,
+    rebalance, render_dataset_toml, render_lora_toml, render_train_toml,
+    single_concept_preset, sweep, train, train_before_after, validate, validate_bridge,
 )
 
 try:
@@ -36,14 +36,14 @@ __all__ = [
     # config engine
     "ModelConfig", "AdapterConfig", "OptimizerConfig", "RunConfig",
     "DatasetConfig", "DirectoryConfig", "TrainConfig", "ConfigError", "ModelPaths",
-    "ExportConfig", "DatasetTomlConfig", "SubjectBucketConfig",
+    "ExportConfig", "DatasetTomlConfig", "SubjectBucketConfig", "CaptionMode",
     "load_train_config", "load_dataset_config", "render_train_toml",
     "render_lora_toml", "render_dataset_toml", "apply_overrides", "rebalance",
     "single_concept_preset", "multi_concept_preset", "sweep",
     "validate", "validate_bridge",
     # operations
     "download_models", "inspect_source", "export_dataset", "export_subject_buckets",
-    "build_dataset_toml",
-    "cache", "train", "doctor", "DoctorReport",
+    "build_dataset_toml", "build_mode_tomls",
+    "cache", "train", "train_before_after", "doctor", "DoctorReport",
     "WindowsTrainingRefused", "DiffusionPipeNotFound",
 ]

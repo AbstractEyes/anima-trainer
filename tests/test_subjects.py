@@ -124,3 +124,65 @@ def test_dampened_repeats_curve():
     assert dr(120, 340) == 2
     assert dr(5, 340) == 8            # sparse: bounded at max_repeats, NOT 50x
     assert dr(5, 340, alpha=0.0, max_repeats=50) == 50  # legacy equalize would overtrain
+
+
+# ---- attribute splitting + data-dependent cap ------------------------------
+def test_max_bucket_size_tiers():
+    assert S.max_bucket_size(50_000) == 1000
+    assert S.max_bucket_size(5_000) == 500
+    assert S.max_bucket_size(500) == 250
+    assert S.max_bucket_size(500, override=42) == 42
+
+
+def test_normalize_attr():
+    assert S.normalize_attr("Blonde Hair") == "blonde_hair"
+    assert S.normalize_attr("long_hair") == "long_hair"
+    assert S.normalize_attr("1girl") is None          # count/meta tag dropped
+    assert S.normalize_attr("") is None
+
+
+def test_extract_features_prefers_animetimm():
+    vlm = '{"subjects":[{"name":"woman","attributes":["red dress"]},{"name":"car"}]}'
+    anime = '{"subjects":[{"name":"1girl","attributes":["blonde_hair","1girl"]}]}'
+    r = S.extract_features(vlm, anime, prefer="animetimm")
+    assert r.vlm_subject == "woman" and r.anime_subject == "1girl"
+    assert r.attrs == ("blonde_hair",)                # animetimm attrs win; 1girl dropped
+    assert r.secondary == "car"                        # vlm subjects[1] (animetimm had none)
+    # bare-string subject -> no attributes
+    assert S.extract_features('{"subjects":["man"]}', None).attrs == ()
+
+
+def _plan(mapping, counts):
+    from collections import Counter
+    return S.BucketPlan(mapping=mapping, raw_counts=Counter(counts), actions=[])
+
+
+def test_split_partitions_by_rarest_attribute():
+    cfg = S.SubjectBucketConfig(max_bucket_size=3, attr_min_split=1)
+    recs = {f"m{i}": S.ImageRecord("man", None, ("hat",), None) for i in range(4)}
+    recs["m4"] = S.ImageRecord("man", None, ("monocle",), None)
+    recs["m5"] = S.ImageRecord("man", None, ("monocle", "hat"), None)
+    ov, sub, over = S.split_oversized_buckets(recs, _plan({"man": "man"}, {"man": 6}),
+                                              cfg, stream="vlm", subject_attr="vlm_subject")
+    assert {k[0] for k in ov} == set(recs)             # every image assigned (partition)
+    assert all(c <= 3 for c in sub.values())           # no sub-bucket exceeds the cap
+    assert over and over[0][0] == "man"
+
+
+def test_split_secondary_fallback_and_chunk():
+    cfg = S.SubjectBucketConfig(max_bucket_size=2, attr_min_split=1)
+    # no attributes -> secondary subject; all same secondary + over cap -> even-chunk
+    recs = {f"m{i}": S.ImageRecord("man", None, (), "dog") for i in range(5)}
+    ov, sub, _ = S.split_oversized_buckets(recs, _plan({"man": "man"}, {"man": 5}),
+                                           cfg, stream="vlm", subject_attr="vlm_subject")
+    names = set(ov.values())
+    assert all("with_dog" in n for n in names)         # secondary-subject differentiation
+    assert all(c <= 2 for c in sub.values())           # chunked to <= cap
+
+
+def test_split_leaves_small_buckets_untouched():
+    cfg = S.SubjectBucketConfig(max_bucket_size=10)
+    recs = {f"m{i}": S.ImageRecord("man", None, ("hat",), None) for i in range(4)}
+    ov, sub, over = S.split_oversized_buckets(recs, _plan({"man": "man"}, {"man": 4}),
+                                              cfg, stream="vlm", subject_attr="vlm_subject")
+    assert ov == {} and sub == {} and over == []       # under cap -> no overrides

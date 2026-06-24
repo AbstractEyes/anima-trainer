@@ -222,10 +222,16 @@ def build_plan(
 # =============================================================================
 # EXEC  (platform-guarded)
 # =============================================================================
-def launch(plan: LaunchPlan, *, dry_run: bool = False, check: bool = True) -> Any:
+def launch(plan: LaunchPlan, *, dry_run: bool = False, check: bool = True,
+           monitor: "Callable[[object], None] | None" = None,
+           log_path: str | Path | None = None) -> Any:
     """Execute the plan. dry_run prints the command on any OS and returns the plan.
     On Windows a real launch raises WindowsTrainingRefused (smoke-test box). On Linux
-    it execs deepspeed from the diffusion-pipe dir, inheriting stdio."""
+    it execs deepspeed from the diffusion-pipe dir.
+
+    monitor=None -> blocking subprocess.run, inherited stdio (unchanged, back-compat).
+    monitor set  -> Popen (stdout/stderr -> log_path if given, else inherited) and the
+                    monitor(proc) callable polls until exit (used for the cache facelift)."""
     if plan.pipeline_stages > 1:
         print("[warn] pipeline parallelism is unnecessary for a 2B model on 96GB; "
               "data-parallel (pipeline_stages=1) is faster.")
@@ -243,7 +249,49 @@ def launch(plan: LaunchPlan, *, dry_run: bool = False, check: bool = True) -> An
         )
 
     env = {**os.environ, **plan.env_prefix()}
-    proc = subprocess.run(plan.argv(), env=env, cwd=str(plan.train_py.parent))
-    if check and proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, plan.argv())
-    return proc.returncode
+    cwd = str(plan.train_py.parent)
+    if monitor is None:
+        rc = subprocess.run(plan.argv(), env=env, cwd=cwd).returncode
+    else:
+        logf = open(log_path, "w", encoding="utf-8") if log_path else None
+        try:
+            proc = subprocess.Popen(
+                plan.argv(), env=env, cwd=cwd,
+                stdout=(logf or None),
+                stderr=(subprocess.STDOUT if logf else None))
+            monitor(proc)            # polls + prints progress until the process exits
+            rc = proc.wait()
+        finally:
+            if logf:
+                logf.close()
+    if check and rc != 0:
+        raise subprocess.CalledProcessError(rc, plan.argv())
+    return rc
+
+
+def rewrite_init_from_existing(lora_toml: str | Path, epoch_dir: str | Path,
+                               out_toml: str | Path) -> Path:
+    """Write a copy of a lora toml with [adapter].init_from_existing set to epoch_dir
+    (the adapter handoff for before_after phase 2 — diffusion-pipe reads this only from
+    the toml, there is no CLI flag). Reuses the config engine for a clean round-trip."""
+    from . import config as _cfg
+    tc = _cfg.load_train_config(lora_toml)
+    if tc.adapter is None:
+        raise ValueError("cannot set init_from_existing on a full fine-tune (no [adapter])")
+    from dataclasses import replace
+    tc = replace(tc, adapter=replace(tc.adapter, init_from_existing=str(epoch_dir)))
+    out_toml = Path(out_toml)
+    out_toml.parent.mkdir(parents=True, exist_ok=True)
+    out_toml.write_text(_cfg.render_lora_toml(tc), encoding="utf-8")
+    return out_toml
+
+
+def latest_epoch_dir(output_dir: str | Path) -> Path | None:
+    """The newest run/epoch* dir under a phase's output_dir (for the adapter handoff).
+    diffusion-pipe writes runs/<timestamp>/epoch{N}/adapter_model.safetensors."""
+    p = Path(output_dir)
+    if not p.is_dir():
+        return None
+    epochs = list(p.glob("**/epoch*"))
+    epochs = [e for e in epochs if e.is_dir() and any(e.glob("*.safetensors"))]
+    return max(epochs, key=lambda e: e.stat().st_mtime) if epochs else None

@@ -55,6 +55,9 @@ class BaseConfig:
     cap_mult: float = 1.25
     max_repeats: int = 8           # per-image exposure ceiling (was 50 under equalization)
 
+    # MIXED caption mode: captions come from per-dir captions.json, not .txt sidecars.
+    online_captions: bool = False
+
 
 # =============================================================================
 # BODY
@@ -147,7 +150,10 @@ def render_toml(concepts: list[dict], cfg: BaseConfig) -> str:
             f"x{c['repeats']} = {c['effective']} effective"
         )
         lines.append(f"path = '{c['path']}'")
-        lines.append(f"caption_extension = '{cfg.caption_extension}'")
+        if cfg.online_captions:                       # MIXED: captions.json, not sidecars
+            lines.append("online_captions = true")
+        else:
+            lines.append(f"caption_extension = '{cfg.caption_extension}'")
         lines.append(f"num_repeats = {c['repeats']}")
         lines.append("")
     return "\n".join(lines)
