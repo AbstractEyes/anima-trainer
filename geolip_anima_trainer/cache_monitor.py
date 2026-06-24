@@ -163,12 +163,35 @@ def _fmt(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+def last_log_line(log_path: str | Path | None, maxbytes: int = 8192) -> str:
+    """The last non-empty line of diffusion-pipe's log — so the warm-up phase shows what
+    the trainer is ACTUALLY doing ('Grouping examples: 45%', 'caching latents: ...').
+    Splits on BOTH '\\n' and '\\r' because tqdm overwrites its bar in place with carriage
+    returns (which never become newlines when piped to a file). Best-effort; '' on any error."""
+    if not log_path:
+        return ""
+    try:
+        p = Path(log_path)
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            if size > maxbytes:
+                f.seek(size - maxbytes)
+            tail = f.read()
+        text = tail.decode("utf-8", errors="replace").replace("\r", "\n")
+        for ln in reversed(text.splitlines()):
+            if ln.strip():
+                return ln.strip()
+    except OSError:
+        pass
+    return ""
+
+
 # =============================================================================
 # MONITOR  (returns a callable(proc) that polls until the subprocess exits)
 # =============================================================================
 def make_monitor(*, cache_roots: list[Path], dataset_dirs: list[Path],
                  captions_per_image: int | None = None, interval: float = 30.0,
-                 eta_window_s: float = 90.0,
+                 eta_window_s: float = 90.0, log_path: str | Path | None = None,
                  on_update: Callable[[dict], None] | None = None,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> Callable[[object], None]:
@@ -194,9 +217,10 @@ def make_monitor(*, cache_roots: list[Path], dataset_dirs: list[Path],
         d = count_done(cache_roots)
         dl, dt = d.get("latents_", 0), d.get("text_embeddings_", 0)
         if nbytes == 0 and dl == 0 and dt == 0:
-            line = (f"[cache] warming up — loading VAE + Qwen-3 0.6B and building the "
-                    f"dataset · {_fmt(elapsed)} elapsed (no shards yet)")
-            info = {"bytes": 0, "records": 0, "elapsed": elapsed}
+            tail = last_log_line(log_path)
+            phase = tail if tail else "loading VAE + Qwen-3 0.6B and building the dataset"
+            line = (f"[cache] warming up · {_fmt(elapsed)} elapsed (no shards yet) — {phase}")
+            info = {"bytes": 0, "records": 0, "elapsed": elapsed, "log_tail": tail}
         else:
             recs = (f" · latents {dl}/{total_lat} · text {dt}/{total_txt}"
                     if total_imgs else f" · {dl + dt} records")

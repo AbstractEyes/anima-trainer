@@ -190,11 +190,30 @@ resident, forward-only — **low VRAM is correct, not a bug**. The wall-clock bo
 decode worker does `queue.put` then BLOCKS on the GPU round-trip (`dataset.py:1098`), and the
 pool is capped at `min(8, cpu)` single-threaded workers (`dataset.py:33,1055`) decoding images
 with PIL — so the GPU idles. Levers, ranked: (1) **`map_num_proc`** = the decode-worker count
-(NOW exposed in `RunConfig`/template; set to the box's core count — the highest-impact knob),
-(2) **`caching_batch_size`** 8→16+ (96 GB has headroom), (3) **`--num-gpus N`** to shard the
-encode (raise `map_num_proc` to ≥N×8 first — only rank 0 spawns the producer pool). dtype stays
-bf16 (Anima invariant). The Qwen-3 `max_length=512` fixed padding is the biggest GPU item but
-the GPU is starved, so it's not the wall-clock bottleneck.
+(NOW exposed in `RunConfig`/template; set to the box's core count — the highest-impact knob;
+default `min(8, cpu)` at `dataset.py:33`), (2) **`--num-gpus N`** to shard the encode (raise
+`map_num_proc` to ≥N×8 first — only rank 0 spawns the producer pool). dtype stays bf16 (Anima
+invariant). The Qwen-3 `max_length=512` fixed padding is the biggest GPU item but the GPU is
+starved, so it's not the wall-clock bottleneck.
+
+⚠️ **`caching_batch_size` is NOT a throughput lever — keep it small (8, ≤16).** It is read raw
+(`train.py:424`, default 1, no clamp) and applied to BOTH passes (`dataset.py:1111,1124`). It only
+sets how many images a worker must decode+stack into ONE VAE forward before the first shard is
+written (`dataset.py:1090,1093` overrides it to the realized batch len; tqdm ticks once per
+*batch*, `dataset.py:151,154`). A big value (e.g. 256) just (a) **delays the first shard / makes
+warm-up look hung**, (b) **risks a VAE/text-encoder OOM** from one stacked 256-batch, (c) coarsens
+resume. The qwen example uses 8. The earlier "8→16+, 96 GB has headroom" note was wrong — headroom
+doesn't help a knob that only inflates first-shard latency.
+
+**Why caching is silent for the first 1–2 min (expected, not a hang):** `--cache_only` runs a
+**metadata pass** that `Image.open`s *every* file for AR bucketing (`dataset.py:1058` strictly
+before `:1111`; size read at `:797-798`) BEFORE any latent encode — zero shard bytes by design.
+Two facelifts make it legible: `launch.env_prefix()` sets **`PYTHONUNBUFFERED=1`** (diffusion-pipe
+uses only `print()`+tqdm with no `--verbose`; on a non-TTY pipe the `print()` markers block-buffer
+and tqdm auto-disables — unbuffering streams the markers), and `cache_monitor.make_monitor(log_path=)`
+**tails the log's last line** during the no-shards-yet phase via `last_log_line` (splits on `\r` for
+tqdm). Genuine-hang escape hatch: HF `datasets` map-over-fork can hang (`dataset.py:1052-1053`); if
+nothing grows after ~10–15 min, lower `map_num_proc` (→2).
 
 ### Backend tiers (optional `[similarity]` extra)
 `make_sim_fn` picks best-available, logs the tier: **sentence-transformers**

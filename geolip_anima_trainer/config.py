@@ -93,10 +93,12 @@ class RunConfig:
     activation_checkpointing: bool = False   # 96GB -> off (faster).
     partition_method: str = "parameters"
     # Caching throughput (--cache_only is decode/plumbing-bound, NOT GPU-bound; the 2B DiT
-    # never loads, so VRAM is low by design). caching_batch_size = the VAE/text-encoder
-    # batch; map_num_proc = the image-DECODE worker pool (the real bottleneck — diffusion-pipe
-    # caps it at min(8, cpu); raise it to the box's core count). None -> leave at the default.
-    caching_batch_size: int = 16
+    # never loads, so VRAM is low by design). map_num_proc = the image-DECODE worker pool =
+    # the real bottleneck (diffusion-pipe caps it at min(8, cpu); raise to the box's core
+    # count). None -> leave at default. caching_batch_size is NOT a throughput knob: it only
+    # sets how many images a worker decodes+stacks into ONE VAE forward before the first shard
+    # (and the VRAM that spikes) — keep small (8, <=16); big values delay the first shard / OOM.
+    caching_batch_size: int = 8
     map_num_proc: int | None = None
     steps_per_print: int = 10
     blocks_to_swap: int = 0          # 0 = disabled; VRAM is abundant.

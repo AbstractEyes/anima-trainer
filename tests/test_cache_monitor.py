@@ -51,6 +51,38 @@ def test_dataset_dirs_from_toml(tmp_path):
     assert [str(p).replace("\\", "/") for p in dirs] == ["/data/man", "/data/woman"]
 
 
+def test_last_log_line_handles_tqdm_carriage_returns(tmp_path):
+    log = tmp_path / "cache_vlm.log"
+    # tqdm overwrites in place with \r (never a newline when piped to a file)
+    log.write_bytes(b"loading models\ncaching latents: (1024, 1024)\n"
+                    b"Grouping examples:  10%\rGrouping examples:  55%\r")
+    assert cm.last_log_line(log) == "Grouping examples:  55%"
+    # missing file / None -> '' (never raises)
+    assert cm.last_log_line(tmp_path / "nope.log") == ""
+    assert cm.last_log_line(None) == ""
+
+
+def test_warmup_line_shows_log_tail(tmp_path, capsys):
+    # no shards yet + a log_path -> the warm-up line surfaces diffusion-pipe's real phase
+    root = tmp_path / "man" / "cache" / "anima"
+    (root / "latents_").mkdir(parents=True)
+    imgdir = tmp_path / "man"
+    imgdir.mkdir(exist_ok=True)
+    (imgdir / "a.png").write_bytes(b"x")
+    log = tmp_path / "cache.log"
+    log.write_text("caching latents: (1024, 1024)\n", encoding="utf-8")
+
+    class _Proc:
+        def poll(self):
+            return 0      # exits immediately -> one final _tick()
+
+    mon = cm.make_monitor(cache_roots=[root], dataset_dirs=[imgdir], captions_per_image=1,
+                          interval=0, log_path=log, sleep=lambda s: None)
+    mon(_Proc())
+    out = capsys.readouterr().out
+    assert "warming up" in out and "caching latents: (1024, 1024)" in out
+
+
 def test_rate_and_fmt():
     r = cm._Rate(window_s=100)
     r.update(0.0, 0)

@@ -99,6 +99,12 @@ class LaunchPlan:
         """Env overlay applied on top of os.environ at exec time."""
         e = dict(self.env)
         e.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        # diffusion-pipe reports caching progress via bare print()/tqdm. When stdout is a
+        # PIPE (our log_path) rather than a TTY, those print() phase markers ("Enumerating
+        # all files.", "caching latents: ...") are block-buffered and don't appear for
+        # minutes — making a slow warm-up look hung. Force line/unbuffered so they stream
+        # immediately (also lets cache_monitor tail the log during the no-shards-yet phase).
+        e.setdefault("PYTHONUNBUFFERED", "1")
         if self.gpu_ids is not None:
             # deepspeed --include scopes the launch, but some child paths read
             # CUDA_VISIBLE_DEVICES; set both so they agree.

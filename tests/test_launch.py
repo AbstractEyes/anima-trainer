@@ -57,6 +57,13 @@ def test_expandable_segments_default(tmp_path: Path):
     assert plan.env_prefix()["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
 
 
+def test_pythonunbuffered_default(tmp_path: Path):
+    # so diffusion-pipe's print() phase markers stream to the log instead of block-buffering
+    root = _fake_pipe(tmp_path)
+    plan = L.build_plan(config_toml=_lora(tmp_path), repo_root=root, num_gpus=1)
+    assert plan.env_prefix()["PYTHONUNBUFFERED"] == "1"
+
+
 def test_cache_only_and_resume_flags(tmp_path: Path):
     root = _fake_pipe(tmp_path)
     plan = L.build_plan(config_toml=_lora(tmp_path), repo_root=root,

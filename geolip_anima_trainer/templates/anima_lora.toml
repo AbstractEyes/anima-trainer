@@ -48,7 +48,10 @@ partition_method = 'parameters'
 # `anima cache --cache_only` is DECODE/PLUMBING-bound, not GPU-bound: the 2B DiT never
 # loads (low VRAM is correct), and each ≤8 single-threaded CPU worker decodes an image then
 # BLOCKS on the GPU round-trip, so the card idles. The real lever is the decode-worker pool.
-caching_batch_size = 16              # VAE/text-encoder precache batch (one-time); 96GB has headroom
+caching_batch_size = 8               # NOT a throughput knob — only how many images a worker decodes
+                                     # +stacks into ONE VAE forward before the first shard (and the
+                                     # VRAM it spikes). Keep small (8, <=16); 256 delays the first
+                                     # shard / can OOM. The decode pool below is the real lever.
 map_num_proc = 24                    # image-DECODE workers — THE bottleneck knob. diffusion-pipe
                                      # caps the pool at min(8, cpu); set this to the box's CORE COUNT.
 steps_per_print = 10

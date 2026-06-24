@@ -167,7 +167,7 @@ def cache(config_toml: str | Path, *, repo_root: str | Path | None = None,
         monitor = _cm.make_monitor(
             cache_roots=_cm.cache_roots_for(dirs), dataset_dirs=dirs,
             captions_per_image=captions_per_image, interval=progress_interval,
-            on_update=on_update)
+            log_path=log_path, on_update=on_update)
     return _launch.launch(plan, dry_run=dry_run, monitor=monitor, log_path=log_path)
 
 
