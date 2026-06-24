@@ -14,27 +14,33 @@ installable package **`geolip_anima_trainer`** (console command **`anima`**):
   `validate()`.
 - `launch.py` — `build_plan`/`launch`: builds the `deepspeed --num_gpus=N train.py
   --deepspeed --config ...` command (native multi-GPU), guarded so it never execs
-  on Windows.
+  on Windows. `launch(monitor=...)` adds the non-blocking cache-progress path;
+  `rewrite_init_from_existing`/`latest_epoch_dir` drive the before_after handoff.
 - `doctor.py` — environment diagnostics (`anima doctor`).
 - `download_anima.py`, `hf_to_diffusion_pipe.py`, `build_multiconcept_dataset.py` —
   the original bridge scripts (still runnable standalone; now also importable).
-  `build_multiconcept_dataset.py` also holds the **`dampened_repeats`** weighting.
+  `build_multiconcept_dataset.py` also holds the **`dampened_repeats`** weighting and
+  the `online_captions` toml emission (for MIXED mode).
 - `subject_buckets.py` — **`anima subjects`**: columnar pyarrow extraction into
   semantic SUBJECT buckets with the JSON caption trained verbatim (the real
-  methodology for `diffusion-pretrain-set-ft1`). See "Subject buckets" below.
+  methodology for `diffusion-pretrain-set-ft1`). Holds the 3 caption modes,
+  attribute splitting, and `build_mode_tomls`. See "Subject buckets" below.
 - `subject_similarity.py` — 3-tier similarity backend (sentence-transformers →
   numpy char-trigram → difflib) behind the optional `[similarity]` extra.
+- `cache_monitor.py` — **`anima cache --progress`**: live %-done + ETA from the cache
+  SQLite `metadata.db` COUNT(*) (the cache is sharded blobs, not per-image files).
 - `api.py` / `cli.py` — the Python API and the `anima` CLI.
 - `templates/anima_lora.toml`, `templates/anima_dataset.toml` — packaged templates;
   copy into `./configs` with `anima init-config`.
 
 Two extraction paths:
 - **`anima subjects`** (recommended for this dataset) → subject buckets, JSON caption
-  verbatim, semantic grouping + anti-overtraining weighting.
+  verbatim, semantic grouping + attribute splitting + anti-overtraining weighting.
 - **`anima export`** (generic) → renders JSON captions to tag strings, routes by `source`.
 
-Workflow: `anima inspect` → `anima subjects --build-toml ...` → (target) `anima cache`
-→ `anima train --num-gpus N`. See README.md for the full command sequence.
+Workflow: `anima inspect` → `anima subjects --caption-mode before_after --build-toml configs`
+→ (target) `anima cache --progress` → `anima train-before-after` (first LoRA) or
+`anima train --num-gpus N`. See README.md for the full command sequence.
 
 ## Environment (fixed facts — do not re-derive)
 - **Target GPU:** RTX PRO 6000 Blackwell, 96 GB, **sm_120**, one or many on a shared box.
@@ -112,8 +118,9 @@ this dataset. Read this before changing it.
 ### Why it exists / what it does (the methodology, with the WHY)
 1. **Caption = the `caption_vlm_json` string VERBATIM** in the `.txt` sidecar (the
    dataset is meant to teach JSON-prompt conditioning), plus `caption_animetimm_json`
-   as a **second sample** (a hardlinked image copy) when it's a real JSON. *Do not
-   render to tags here.*
+   as a second sample. *Do not render to tags here.* Each caption is bucketed by
+   **its own** `subjects[0]` (the vlm sample by the vlm subject, the animetimm sample by
+   the animetimm subject) — see "Caption modes" below for how the two are organized.
 2. **Columnar read, not row-by-row.** `hf_hub_download` the shard(s) → `pyarrow
    ParquetFile.iter_batches(columns=[...])` → write the image's **raw bytes** straight
    to disk (no PIL decode/re-encode). The earlier `datasets`-streaming + PNG-encode
@@ -138,6 +145,42 @@ this dataset. Read this before changing it.
    capped at `max_repeats` and `cap_mult*top` effective. `alpha=0.5` (sqrt) is the
    default; `alpha=0` is the legacy equalize-to-largest policy that repeats a 5-image
    bucket ~50×/epoch (memorization). New policy caps every bucket at ~8×.
+7. **Split oversized buckets** (`split_oversized_buckets`) so no bucket exceeds a
+   **data-dependent cap** (`max_bucket_size`: >10k imgs→1000, ≥1k→500, else 250;
+   `--max-bucket-size` overrides). This is a 3rd tier AFTER grouping, on a **disjoint
+   domain** (grouping touches `<min_bucket_size`; splitting touches `>cap`, far apart).
+   An oversized bucket splits by its dominant subject's **rarest attribute**
+   (animetimm-preferred, booru-style; `_ATTR_STOP` drops `1girl`/`solo`/… so it defaults
+   to `blonde_hair` not `1girl`) → **secondary subject** (`man·with_dog`) → even-chunk
+   (hard guarantee). One attr per image (rarest) = a true partition. Each sub-bucket is
+   its own dir → weighted by its own count via `dampened_repeats`. Splitting runs
+   **per caption stream**, keyed `(idslug, stream)`, because vlm/animetimm trees differ.
+
+### Caption modes (`--caption-mode`, the two captions trained together)
+Both `caption_vlm_json` (plain-english) and `caption_animetimm_json` (booru tags) train.
+`export_subject_buckets` routes by `CaptionMode`:
+- **`before_after`** (DEFAULT, the first LoRA): `out/vlm/<subj>` + `out/animetimm/<subj>`
+  trees + **two** dataset tomls. Trained as **two sequential runs** via
+  `anima train-before-after` (full VLM phase, then full animetimm phase).
+- **`separate`**: same two trees, but ONE dataset.toml → diffusion-pipe globally shuffles.
+- **`mixed`**: ONE image inode + a `captions.json` `{file: [vlm, animetimm, joint]}`
+  (`online_captions=true`) → each image trains once with N prompts (physical dedupe).
+
+**WHY before_after is two runs** (verified in `external/diffusion-pipe`, file:line): the
+trainer builds ONE `Dataset` + ONE LR schedule, and shuffle is MANDATORY (3 hardcoded-seed
+layers, `dataset.py:211,354,972`) — so "VLM strictly before animetimm" is **impossible
+inside one run**. `train_before_after` chains run A → run B, handing the adapter off via
+`[adapter].init_from_existing` (there is NO CLI flag — `launch.rewrite_init_from_existing`
+writes a temp toml pointing at phase-1's latest `epoch{N}` dir).
+
+### Cache facelift (`anima cache --progress`)
+`cache_monitor.py` prints `[cache] done/total (%) rate ETA` from the cache's **SQLite
+`metadata.db` COUNT(*)** — NOT file counts: diffusion-pipe's cache is a SHARDED BLOB store
+(a new `shard_*.bin` only every ~10 GB) under `<dir>/cache/anima/`, so `latents_`/
+`text_embeddings_*` `metadata.db` row counts are the exact, monotonic, resumable counter.
+Total = images-on-disk (latents, 1/image) + images×captions (text-embeds; captions/image
+auto-detected from `captions.json`). `launch(monitor=...)` runs the subprocess non-blocking
+and polls. Colab: pair with `--log-path` so the progress line isn't buried in tqdm output.
 
 ### Backend tiers (optional `[similarity]` extra)
 `make_sim_fn` picks best-available, logs the tier: **sentence-transformers**
@@ -162,10 +205,15 @@ The extra downgrades `huggingface_hub` 1.x→0.36 (pinned `<1`) — harmless, ve
   routing** (route a singleton-dominant image by a *secondary* subject that matches a
   real bucket — the "hierarchy of fulfillment" idea, the biggest lever, not yet built);
   or stop using `misc_other` as the balancing `top` reference.
-- **Tuning knobs** (all on `SubjectBucketConfig` / CLI): `min_bucket_size` (large/
-  protected floor), `human_min_size`, `sim_threshold` (preset-overridden per backend:
-  ST 0.58, trigram 0.50, difflib 0.60), `min_final_group_size`, `balance_alpha`,
-  `cap_mult`, `max_repeats`. `balance_alpha`/`cap_mult` are sweepable via `apply_overrides`.
+- **Tuning knobs** (all on `SubjectBucketConfig` / CLI): `caption_mode`,
+  `max_bucket_size` (split cap; `None`=data-dependent), `prefer_attr_source`,
+  `min_bucket_size` (large/protected floor), `human_min_size`, `sim_threshold`
+  (preset-overridden per backend: ST 0.58, trigram 0.50, difflib 0.60),
+  `min_final_group_size`, `balance_alpha`, `cap_mult`, `max_repeats`.
+  `balance_alpha`/`cap_mult` are sweepable via `apply_overrides`.
+- **Attribute splitting carries per-image data** (`ImageRecord` in pass 1: vlm/anime
+  subjects + `attrs` + `secondary`). A new dataset with different attribute shapes only
+  needs `normalize_attr`/`_ATTR_STOP` tuned; the tier A→B→C split is schema-agnostic.
 - **Validation:** `validate()`'s ">3× effective spread" warning is gated on
   `balance_alpha == 0` — under dampening a wide spread is intended, don't re-enable it.
 - **F: cache space:** dataset shards cache to `HF_HOME` (F:, ~25 GB free behind the

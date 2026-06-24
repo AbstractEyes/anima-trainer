@@ -98,8 +98,8 @@ anima export --repo AbstractPhil/diffusion-pretrain-set-ft1 --configs qwen_90k \
 # 4. balanced dataset.toml
 anima build --root datasets/anima_qwen90k --out configs/anima_dataset.toml
 
-# 5. (target box) precache latents/text-embeds, then train on N GPUs
-anima cache --config configs/anima_lora.toml --repo-root .
+# 5. (target box) precache latents/text-embeds (with a live progress + ETA bar), then train
+anima cache --config configs/anima_lora.toml --repo-root . --progress --log-path runs/cache.log
 anima train --config configs/anima_lora.toml --num-gpus 4
 #   shared box: pin specific cards instead ->  --gpu-ids 0,1
 #   preview the command anywhere (incl. Windows): add --dry-run
@@ -120,10 +120,15 @@ learned via a cross-subject shuffle. So `anima subjects` does a **columnar** pya
 writes the JSON caption **as-is** into the `.txt` sidecar (plus `caption_animetimm_json` as a
 second sample when present), and organizes images into **subject buckets**:
 
-- **Bucket key = the dominant subject** (`subjects[0]`), normalized to a head-noun.
+- **Bucket key = the dominant subject** (`subjects[0]`), normalized to a head-noun —
+  each caption (vlm and animetimm) is bucketed by **its own** `subjects[0]`.
 - **Sparse subjects are grouped, not dropped.** Similar weak buckets are merged by
   *semantic* similarity (`grp_boat`=[sailboat,boat,yacht], `grp_car`=[car,suv], …);
   ungroupable singletons pool into a weighted `misc_*` catch-all. Nothing is omitted.
+- **Large buckets are split** so none exceeds a **data-dependent cap** (>10k imgs→1000,
+  ≥1k→500, else 250; `--max-bucket-size` overrides). A bucket over the cap splits by the
+  dominant subject's rarest **attribute** (`woman`→`woman·blonde_hair`, not `1girl`), then
+  by **secondary subject**, then even-chunk — a hard guarantee no bucket exceeds the cap.
 - **Distinct human subgroups stay separate** (`man`/`woman`/`player`/`person`/`guitarist`
   are never merged) — they're meaningful in Qwen-3.5's captioner grouping.
 - **Weighting prevents overtraining.** `num_repeats` uses a diminishing-returns policy
@@ -131,21 +136,37 @@ second sample when present), and organizes images into **subject buckets**:
   equalize-to-largest policy would repeat a 5-image bucket **50×/epoch** → memorization).
 
 ```bash
-# columnar extraction into semantic subject buckets (needs [similarity] for real grouping)
+# columnar extraction into semantic subject buckets (needs [similarity] for real grouping).
+# --caption-mode before_after (default) -> separate vlm/ and animetimm/ trees + two tomls.
 anima subjects --repo AbstractPhil/diffusion-pretrain-set-ft1 --config qwen_90k \
     --out datasets/anima_subjects --limit 1000 \
-    --build-toml configs/anima_dataset.toml          # also writes the balanced toml
+    --caption-mode before_after \
+    --build-toml configs                       # writes dataset_vlm.toml + dataset_animetimm.toml
 
-# zero-download backend (reuses a model already cached): nomic
+# zero-download similarity backend (reuses a model already cached): nomic
 anima subjects ... --similarity-model nomic-ai/nomic-embed-text-v1
 ```
 
-Key flags: `--limit N` (total images), `--min-bucket-size` (size to be a "large" protected
-bucket), `--sim-threshold` (grouping tightness; higher = tighter), `--min-final-group-size`
-(below this a group → `misc_*`), `--similarity-model`, `--semantic-backend
-auto|sentence-transformers|trigram|difflib`, `--no-semantic` (legacy difflib path),
-`--drop-small` (omit instead of pooling into `misc_*`). The output bucket dirs feed straight
-into `anima build` / `anima train`.
+**Caption modes** (`--caption-mode`) — both `caption_vlm_json` (plain-english) and
+`caption_animetimm_json` (booru tags) are trained:
+- **`before_after`** (default, the first LoRA): `vlm/` + `animetimm/` trees, trained as **two
+  sequential runs** — full VLM phase, then full animetimm phase resuming the VLM adapter.
+- **`separate`**: same two trees but **one** dataset.toml — globally shuffled together.
+- **`mixed`**: one image on disk + a `captions.json` carrying `[vlm, animetimm, joint]` — each
+  image trains once with multiple prompts (physical dedupe), no pixel duplication.
+
+```bash
+# the first LoRA: VLM phase, then animetimm phase (resumes via [adapter].init_from_existing).
+# diffusion-pipe can't phase-order inside one run (mandatory shuffle), so this is two runs.
+anima train-before-after --lora-vlm configs/lora_vlm.toml \
+    --lora-animetimm configs/lora_animetimm.toml --num-gpus N
+```
+
+Key flags: `--caption-mode {before_after,separate,mixed}`, `--max-bucket-size N` /
+`--no-split`, `--prefer-attr-source {animetimm,vlm}`, `--limit N`, `--min-bucket-size`,
+`--sim-threshold` (grouping tightness), `--min-final-group-size`, `--similarity-model`,
+`--semantic-backend auto|sentence-transformers|trigram|difflib`, `--no-semantic`,
+`--drop-small`. `--build-toml DIR` writes the per-mode dataset toml(s) into `DIR`.
 
 ## Programmatic / sweeps
 
