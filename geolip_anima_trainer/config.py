@@ -125,9 +125,13 @@ class DatasetConfig:
     keep_tokens: int | None = None   # required iff shuffle_caption is True.
     directories: list[DirectoryConfig] = field(default_factory=list)
     # Balancing policy (folded in from the builder script's BaseConfig):
-    #   repeats(c) = round(target / images(c)), clamped to [1, max_repeats].
+    #   repeats(c) = round((top/images(c)) ** (1-balance_alpha)), capped — a
+    #   diminishing-returns weighting so sparse concepts don't overtrain
+    #   (balance_alpha=0 -> legacy equalization; 0.5 -> sqrt default; 1 -> all 1x).
     target_effective: int | None = None
-    max_repeats: int = 50
+    balance_alpha: float = 0.5
+    cap_mult: float = 1.25
+    max_repeats: int = 8
 
 
 # =============================================================================
@@ -351,7 +355,8 @@ def rebalance(ds: DatasetConfig) -> None:
     from . import build_multiconcept_dataset as _b
     if not any(d.image_count for d in ds.directories):
         return
-    bcfg = _b.BaseConfig(target_effective=ds.target_effective, max_repeats=ds.max_repeats)
+    bcfg = _b.BaseConfig(target_effective=ds.target_effective, max_repeats=ds.max_repeats,
+                         balance_alpha=ds.balance_alpha, cap_mult=ds.cap_mult)
     concepts = [{"name": d.name, "path": d.path, "images": d.image_count or 0,
                  "captions": d.caption_count or 0} for d in ds.directories]
     _b.compute_repeats(concepts, bcfg)
@@ -365,6 +370,7 @@ def rebalance(ds: DatasetConfig) -> None:
 # The real sweep axes — a flat, deliberate allowlist (not reflective magic).
 _OVERRIDE_AXES = {
     "rank", "lr", "llm_adapter_lr", "resolutions", "target_effective",
+    "balance_alpha", "cap_mult",
     "output_dir", "micro_batch_size_per_gpu", "gradient_accumulation_steps",
 }
 
@@ -388,6 +394,12 @@ def apply_overrides(base: TrainConfig, /, **ov: Any) -> TrainConfig:
         cfg.dataset = replace(cfg.dataset, resolutions=list(ov["resolutions"]))
     if "target_effective" in ov:
         cfg.dataset = replace(cfg.dataset, target_effective=ov["target_effective"])
+        rebalance(cfg.dataset)
+    if "balance_alpha" in ov:
+        cfg.dataset = replace(cfg.dataset, balance_alpha=ov["balance_alpha"])
+        rebalance(cfg.dataset)
+    if "cap_mult" in ov:
+        cfg.dataset = replace(cfg.dataset, cap_mult=ov["cap_mult"])
         rebalance(cfg.dataset)
     if "output_dir" in ov:
         cfg.run = replace(cfg.run, output_dir=ov["output_dir"])
@@ -509,7 +521,11 @@ def validate(cfg: TrainConfig, *, strict: bool = True) -> TrainConfig:
     # -- balance sanity -------------------------------------------------------
     effs = [(d.image_count or 0) * d.num_repeats for d in cfg.dataset.directories
             if d.image_count]
-    if len(effs) > 1 and min(effs) and max(effs) > 3 * min(effs):
+    # Under diminishing-returns weighting (balance_alpha>0) a >3x effective spread is
+    # INTENDED (sparse concepts are deliberately under-exposed to avoid overtraining),
+    # so only warn in legacy equalization mode.
+    if (cfg.dataset.balance_alpha == 0 and len(effs) > 1
+            and min(effs) and max(effs) > 3 * min(effs)):
         warns.append("effective sample counts differ >3x across concepts; re-balance "
                      "(call rebalance() / build_multiconcept_dataset.py).")
 

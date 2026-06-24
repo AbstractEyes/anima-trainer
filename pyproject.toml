@@ -23,6 +23,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.5", "build>=1.2"]
+# Real semantic grouping of sparse subject buckets (offline, once per extraction).
+# Default model all-MiniLM-L6-v2 (~90 MB first use), or pass nomic-embed-text-v1 to
+# reuse a model already cached. Without this extra, grouping falls back to a numpy
+# char-trigram backend (morphological) then difflib — never drops, just less semantic.
+similarity = ["sentence-transformers>=2.7,<4"]
 
 [project.scripts]
 anima = "geolip_anima_trainer.cli:main"

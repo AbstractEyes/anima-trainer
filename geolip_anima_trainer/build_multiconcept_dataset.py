@@ -42,12 +42,18 @@ class BaseConfig:
     # Anima is tag-order sensitive -> do NOT shuffle captions by default.
     shuffle_caption: bool = False
 
-    # Balancing policy:
-    #   repeats(concept) = round(target / image_count), clamped to [1, max_repeats].
-    # If target is None, it defaults to the largest concept's image count (so the
-    # biggest concept gets 1 repeat and smaller ones are scaled up to match).
+    # Balancing policy (DIMINISHING-RETURNS, anti-overtraining):
+    #   repeats(c) = round((top / images(c)) ** (1 - balance_alpha)), capped.
+    #   balance_alpha = 0.0 -> legacy full equalization (scale small concepts up to
+    #     the largest -> sparse concepts seen up to max_repeats x per epoch = overfit);
+    #   balance_alpha = 1.0 -> no balancing (every concept 1x);
+    #   balance_alpha = 0.5 -> sqrt damping (default): big concepts ~1x, sparse ones get
+    #     a bounded lift so they contribute without being memorized.
+    # cap_mult caps a bucket's EFFECTIVE samples at cap_mult * top (no bucket dominates).
     target_effective: int | None = None
-    max_repeats: int = 50          # clamp; warns if a concept would exceed this
+    balance_alpha: float = 0.5
+    cap_mult: float = 1.25
+    max_repeats: int = 8           # per-image exposure ceiling (was 50 under equalization)
 
 
 # =============================================================================
@@ -87,14 +93,34 @@ def discover_concepts(root: Path, cfg: BaseConfig) -> list[dict]:
     return concepts
 
 
+def dampened_repeats(images: int, top: int, *, alpha: float = 0.5,
+                     max_repeats: int = 8, cap_mult: float = 1.25) -> int:
+    """Bounded, diminishing-returns num_repeats for one bucket.
+
+    alpha=0 -> equalize (legacy: small buckets scaled up to `top`, which OVERTRAINS
+    sparse concepts); alpha=1 -> no balancing (all 1x); 0.5 -> sqrt (default).
+    Caps per-image exposure at `max_repeats` and effective samples at `cap_mult*top`.
+    """
+    if images <= 0:
+        return 1
+    rep = max(1, round((top / images) ** (1.0 - alpha)))
+    rep = min(rep, max_repeats)
+    if images * rep > cap_mult * top:          # effective-samples ceiling
+        rep = max(1, int(cap_mult * top // images))
+    return rep
+
+
 def compute_repeats(concepts: list[dict], cfg: BaseConfig) -> None:
-    """Fill each concept dict with 'repeats' and 'effective' in place."""
+    """Fill each concept dict with 'repeats' and 'effective' in place, using the
+    diminishing-returns policy so sparse concepts contribute without overtraining."""
     if not concepts:
         return
-    target = cfg.target_effective or max(c["images"] for c in concepts)
+    top = cfg.target_effective or max(c["images"] for c in concepts)
     for c in concepts:
-        raw = max(1, round(target / c["images"]))
-        c["repeats"] = min(raw, cfg.max_repeats)
+        c["repeats"] = dampened_repeats(c["images"], top, alpha=cfg.balance_alpha,
+                                        max_repeats=cfg.max_repeats, cap_mult=cfg.cap_mult)
+        # "clamped" = the per-image exposure ceiling actually bit (under-represented).
+        raw = max(1, round((top / c["images"]) ** (1.0 - cfg.balance_alpha)))
         c["clamped"] = raw > cfg.max_repeats
         c["effective"] = c["images"] * c["repeats"]
 
@@ -135,11 +161,16 @@ def main() -> None:
     ap.add_argument("--root", required=True, help="Parent dir of concept subfolders.")
     ap.add_argument("--out", default="anima_dataset.toml", help="Output toml path.")
     ap.add_argument("--target", type=int, default=None,
-                    help="Target effective samples/concept. Default = largest concept's image count.")
-    ap.add_argument("--max-repeats", type=int, default=50, help="Clamp on num_repeats.")
+                    help="Top reference count. Default = largest concept's image count.")
+    ap.add_argument("--alpha", type=float, default=0.5,
+                    help="Balance damping: 0=equalize (legacy/overtrains), 1=no balance, 0.5=sqrt.")
+    ap.add_argument("--cap-mult", type=float, default=1.25,
+                    help="Cap a bucket's effective samples at cap_mult*top.")
+    ap.add_argument("--max-repeats", type=int, default=8, help="Per-image exposure ceiling.")
     args = ap.parse_args()
 
-    cfg = BaseConfig(target_effective=args.target, max_repeats=args.max_repeats)
+    cfg = BaseConfig(target_effective=args.target, balance_alpha=args.alpha,
+                     cap_mult=args.cap_mult, max_repeats=args.max_repeats)
     root = Path(args.root).expanduser().resolve()
     if not root.is_dir():
         raise SystemExit(f"Not a directory: {root}")

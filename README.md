@@ -4,11 +4,12 @@ Bridge + orchestration to finetune **CircleStone Anima** (2B anime text-to-image
 with **[tdrussell/diffusion-pipe](https://github.com/tdrussell/diffusion-pipe)** — the
 only trainer that natively supports Anima.
 
-Anima's DiT backbone is NVIDIA Cosmos-Predict2-2B. This package streams an HF
-`datasets`-format parquet repo into the image + `.txt`-sidecar layout diffusion-pipe
-requires, builds balanced multi-concept dataset configs, models a training run as
-composable/sweepable config objects, and launches diffusion-pipe's native multi-GPU
-deepspeed trainer.
+Anima's DiT backbone is NVIDIA Cosmos-Predict2-2B. This package reads an HF
+`datasets`-format parquet repo (columnar, via pyarrow) into the image + `.txt`-sidecar
+layout diffusion-pipe requires, organizes images into **subject buckets** with
+semantic grouping, builds balanced dataset configs with anti-overtraining weighting,
+models a training run as composable/sweepable config objects, and launches
+diffusion-pipe's native multi-GPU deepspeed trainer.
 
 > **License.** This tooling/code is **Apache-2.0** (see [LICENSE](LICENSE)). The **Anima
 > model** itself and any weights you finetune from it are **non-commercial** — CircleStone
@@ -23,9 +24,15 @@ deepspeed trainer.
 
 ```bash
 # from repo root, in a Python 3.12 venv
-pip install -e .            # the package + light bridge deps (huggingface_hub, datasets, Pillow)
-pip install -e ".[dev]"     # + pytest/ruff/build for development
+pip install -e .                  # package + light bridge deps (huggingface_hub, datasets, Pillow)
+pip install -e ".[dev]"           # + pytest/ruff/build for development
+pip install -e ".[similarity]"    # + sentence-transformers/sklearn for SEMANTIC subject grouping
 ```
+
+> `[similarity]` unlocks real semantic grouping of sparse subjects (it pulls
+> sentence-transformers + transformers + scikit-learn). Without it, grouping falls back
+> to a numpy char-trigram backend then difflib — it never drops images, just groups them
+> less semantically. See **Subject buckets** below.
 
 torch is installed separately from a CUDA wheel index (it bundles its own CUDA runtime,
 so your local toolkit version is irrelevant):
@@ -100,6 +107,45 @@ anima train --config configs/anima_lora.toml --num-gpus 4
 
 `anima init-config` copies the packaged `anima_lora.toml` / `anima_dataset.toml`
 templates into `./configs` to edit.
+
+> `anima export` (step 3) is the **generic** path: it renders the JSON captions into
+> Danbooru-style tag strings and routes by `source`. For `diffusion-pretrain-set-ft1`
+> the intended methodology is different — use **`anima subjects`** below.
+
+## Subject buckets (recommended for `diffusion-pretrain-set-ft1`)
+
+This dataset's captions are `task_1` JSON (`{"subjects":[...],"actions":[...],"setting":...}`)
+meant to be trained **verbatim**, and its README warns that subject association must NOT be
+learned via a cross-subject shuffle. So `anima subjects` does a **columnar** pyarrow read,
+writes the JSON caption **as-is** into the `.txt` sidecar (plus `caption_animetimm_json` as a
+second sample when present), and organizes images into **subject buckets**:
+
+- **Bucket key = the dominant subject** (`subjects[0]`), normalized to a head-noun.
+- **Sparse subjects are grouped, not dropped.** Similar weak buckets are merged by
+  *semantic* similarity (`grp_boat`=[sailboat,boat,yacht], `grp_car`=[car,suv], …);
+  ungroupable singletons pool into a weighted `misc_*` catch-all. Nothing is omitted.
+- **Distinct human subgroups stay separate** (`man`/`woman`/`player`/`person`/`guitarist`
+  are never merged) — they're meaningful in Qwen-3.5's captioner grouping.
+- **Weighting prevents overtraining.** `num_repeats` uses a diminishing-returns policy
+  (`--alpha 0.5`): big buckets ~1–2×, sparse/grouped buckets capped at **8×** (the old
+  equalize-to-largest policy would repeat a 5-image bucket **50×/epoch** → memorization).
+
+```bash
+# columnar extraction into semantic subject buckets (needs [similarity] for real grouping)
+anima subjects --repo AbstractPhil/diffusion-pretrain-set-ft1 --config qwen_90k \
+    --out datasets/anima_subjects --limit 1000 \
+    --build-toml configs/anima_dataset.toml          # also writes the balanced toml
+
+# zero-download backend (reuses a model already cached): nomic
+anima subjects ... --similarity-model nomic-ai/nomic-embed-text-v1
+```
+
+Key flags: `--limit N` (total images), `--min-bucket-size` (size to be a "large" protected
+bucket), `--sim-threshold` (grouping tightness; higher = tighter), `--min-final-group-size`
+(below this a group → `misc_*`), `--similarity-model`, `--semantic-backend
+auto|sentence-transformers|trigram|difflib`, `--no-semantic` (legacy difflib path),
+`--drop-small` (omit instead of pooling into `misc_*`). The output bucket dirs feed straight
+into `anima build` / `anima train`.
 
 ## Programmatic / sweeps
 

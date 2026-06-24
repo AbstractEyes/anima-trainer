@@ -18,11 +18,22 @@ installable package **`geolip_anima_trainer`** (console command **`anima`**):
 - `doctor.py` — environment diagnostics (`anima doctor`).
 - `download_anima.py`, `hf_to_diffusion_pipe.py`, `build_multiconcept_dataset.py` —
   the original bridge scripts (still runnable standalone; now also importable).
+  `build_multiconcept_dataset.py` also holds the **`dampened_repeats`** weighting.
+- `subject_buckets.py` — **`anima subjects`**: columnar pyarrow extraction into
+  semantic SUBJECT buckets with the JSON caption trained verbatim (the real
+  methodology for `diffusion-pretrain-set-ft1`). See "Subject buckets" below.
+- `subject_similarity.py` — 3-tier similarity backend (sentence-transformers →
+  numpy char-trigram → difflib) behind the optional `[similarity]` extra.
 - `api.py` / `cli.py` — the Python API and the `anima` CLI.
 - `templates/anima_lora.toml`, `templates/anima_dataset.toml` — packaged templates;
   copy into `./configs` with `anima init-config`.
 
-Workflow: `anima inspect` → `anima export` → `anima build` → (target) `anima cache`
+Two extraction paths:
+- **`anima subjects`** (recommended for this dataset) → subject buckets, JSON caption
+  verbatim, semantic grouping + anti-overtraining weighting.
+- **`anima export`** (generic) → renders JSON captions to tag strings, routes by `source`.
+
+Workflow: `anima inspect` → `anima subjects --build-toml ...` → (target) `anima cache`
 → `anima train --num-gpus N`. See README.md for the full command sequence.
 
 ## Environment (fixed facts — do not re-derive)
@@ -44,12 +55,19 @@ Fetch with `anima download --dest models/anima --base base-v1.0` (huggingface_hu
 never wget). It prints the exact `[model]` paths for `configs/anima_lora.toml`.
 
 ## Dataset
-- Repo: `AbstractPhil/diffusion-pretrain-set-ft1`; config: **`qwen_90k`** (83.0K rows,
-  high-res, good for 1024). Uniform 17-col schema.
-- Captions are **JSON**: `caption_animetimm_json` (booru-style), `caption_vlm_json`,
-  `captions_source_json`. The bridge renders them to tag strings.
-- Quality gates in-schema: `audit == "approved"`, `age_classifier_pass == True`
-  (on by default). **May be unpopulated for qwen_90k — `anima inspect` first.**
+- Repo: `AbstractPhil/diffusion-pretrain-set-ft1`; config: **`qwen_90k`** (= the
+  `data/sdxl_qwen_phase0/` folder, 83.0K rows, high-res). Uniform 17-col schema.
+- Captions are **`task_1` JSON**: `caption_vlm_json` and `caption_animetimm_json`
+  are `{"subjects":[{"name","attributes":[...]}],"actions":[...],"setting":...}`;
+  `captions_source_json` is `{caption_kind: plain_text}`. The dataset's own
+  README/CLAUDE.md say to train the JSON **verbatim** (NOT rendered to tags) — that is
+  what `anima subjects` does. `anima export` is the generic render-to-tags fallback.
+- A `subjects[]` entry may be a `{"name":...}` dict **OR a bare string** — parse both.
+- Quality gates in-schema: `audit == "approved"`, `age_classifier_pass == True/None`.
+  For qwen_90k: `audit` is always approved (keep), `age_classifier_pass` is `None`
+  (unpopulated → must disable the age gate). **`anima inspect` a new config first.**
+- ⚠️ **Never** put `extra_json` / `celeb_name_raw` (IMDB) into a caption — takedown-only,
+  never a training signal. The narrow column read in `subject_buckets.py` excludes it.
 
 ## Non-negotiable rules
 - **`llm_adapter_lr = 0`** (adapter frozen). High knowledge density, degrades easily.
@@ -79,9 +97,82 @@ never wget). It prints the exact `[model]` paths for `configs/anima_lora.toml`.
   (`anima.multi_concept_preset(...)`, rank 64, balanced). Re-inspect a larger sample
   on the target to enumerate the full `source` distribution before final balancing.
 
-  Example extract command (target box):
+  Example generic extract (render-to-tags path):
   ```
   anima export --repo AbstractPhil/diffusion-pretrain-set-ft1 --configs qwen_90k \
       --out datasets/anima_qwen90k --caption-column caption_vlm_json \
       --caption-format vlm --route-by source --no-age-filter --limit-per-concept 8000
   ```
+
+## Subject buckets — how it was built (and how to adapt it for new datasets)
+
+`anima subjects` (`subject_buckets.py` + `subject_similarity.py`) is the real path for
+this dataset. Read this before changing it.
+
+### Why it exists / what it does (the methodology, with the WHY)
+1. **Caption = the `caption_vlm_json` string VERBATIM** in the `.txt` sidecar (the
+   dataset is meant to teach JSON-prompt conditioning), plus `caption_animetimm_json`
+   as a **second sample** (a hardlinked image copy) when it's a real JSON. *Do not
+   render to tags here.*
+2. **Columnar read, not row-by-row.** `hf_hub_download` the shard(s) → `pyarrow
+   ParquetFile.iter_batches(columns=[...])` → write the image's **raw bytes** straight
+   to disk (no PIL decode/re-encode). The earlier `datasets`-streaming + PNG-encode
+   path was ~1 img/s; this is ~network-bound. Download shards **lazily** (stop at
+   `--limit`) — the full config is >100 GB; never pre-fetch all shards.
+3. **Bucket = the dominant subject** (`subjects[0]`, normalized to a head-noun via
+   `normalize_subject`: lowercase, strip articles, last word, singularize).
+4. **Group the sparse tail by SEMANTIC similarity, don't drop it** (`keep_small=True`
+   → leftovers pool into weighted `misc_*`, never omitted). Grouping uses
+   **agglomerative average-linkage** over cosine distance (`sklearn`), NOT
+   single-linkage connected-components — CC *chains* dense embeddings into one giant
+   blob (we hit a 961-image `grp_bed` doing that; agglomerative gives clean groups like
+   `grp_boat`=[sailboat,boat,yacht]).
+5. **Keep distinct human subgroups SEPARATE** (`man`/`woman`/`player`/`person`/
+   `guitarist` never merge) — Qwen-3.5-0.8B distinguishes them on purpose. The guard is
+   an explicit `_HUMAN_SEED` (~12 anchors) + similarity propagation, **NOT** a cosine
+   threshold: `man`/`woman` cosine is ~0.5–0.75, so a threshold alone would wrongly
+   merge them. Large + human buckets are `protected` and removed from all merge
+   candidates.
+6. **Weighting prevents sparse overtraining** (`dampened_repeats` in
+   `build_multiconcept_dataset.py`): `num_repeats = round((top/imgs)**(1-alpha))`,
+   capped at `max_repeats` and `cap_mult*top` effective. `alpha=0.5` (sqrt) is the
+   default; `alpha=0` is the legacy equalize-to-largest policy that repeats a 5-image
+   bucket ~50×/epoch (memorization). New policy caps every bucket at ~8×.
+
+### Backend tiers (optional `[similarity]` extra)
+`make_sim_fn` picks best-available, logs the tier: **sentence-transformers**
+(`all-MiniLM-L6-v2`, ~90 MB; or `--similarity-model nomic-ai/nomic-embed-text-v1` =
+0 download, already cached) → **numpy char-trigram** (zero-dep, morphological only —
+can't group `truck`~`car`) → **difflib**. Real semantic grouping needs the extra
+(`pip install -e ".[similarity]"`); without it nothing drops, it just groups less well.
+The extra downgrades `huggingface_hub` 1.x→0.36 (pinned `<1`) — harmless, verified.
+
+### How to ADAPT for a new / different dataset
+- **Inspect first** (`anima inspect <config>` or a small pyarrow read): confirm the
+  caption column name + that it's `task_1`-shaped JSON; whether `subjects[]` items are
+  dicts or strings (`_subject_name` handles both); the image column form
+  (`{bytes,path}` here — `_img_bytes`/`_sniff_ext` handle raw bytes + format sniff);
+  and which gates are populated (`require_audit_approved` / `require_age_pass`).
+- **Different caption schema** (no `subjects` field, or non-JSON): adjust
+  `dominant_subject` / `normalize_subject`; the columnar read + bucketing + weighting
+  scaffold is reusable as-is.
+- **`misc_*` too large** (very diverse sources make most dominant subjects singletons):
+  options, smallest-effort first — lower `--min-final-group-size`; raise `--sim-threshold`
+  modestly (looser grouping, watch for over-merge); implement **secondary-subject
+  routing** (route a singleton-dominant image by a *secondary* subject that matches a
+  real bucket — the "hierarchy of fulfillment" idea, the biggest lever, not yet built);
+  or stop using `misc_other` as the balancing `top` reference.
+- **Tuning knobs** (all on `SubjectBucketConfig` / CLI): `min_bucket_size` (large/
+  protected floor), `human_min_size`, `sim_threshold` (preset-overridden per backend:
+  ST 0.58, trigram 0.50, difflib 0.60), `min_final_group_size`, `balance_alpha`,
+  `cap_mult`, `max_repeats`. `balance_alpha`/`cap_mult` are sweepable via `apply_overrides`.
+- **Validation:** `validate()`'s ">3× effective spread" warning is gated on
+  `balance_alpha == 0` — under dampening a wide spread is intended, don't re-enable it.
+- **F: cache space:** dataset shards cache to `HF_HOME` (F:, ~25 GB free behind the
+  model cache). One shard ≈ 1.3 GB; a full 56-shard extraction (~106 GB) won't fit —
+  do full runs on the target box or point the cache at a roomier drive.
+- **Tests:** `tests/test_subjects.py` covers the planner with a **stub `sim_fn`** (no
+  model/download) — add cases there; keep the legacy `plan_buckets` shim green.
+- **Design provenance:** the methodology came from a 3-agent design workflow
+  (similarity method / human-aware clustering / weighting) + adversarial synthesis; the
+  CC→agglomerative fix was a course-correction the clustering agent had flagged as a risk.

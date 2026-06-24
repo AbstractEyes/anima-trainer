@@ -23,6 +23,7 @@ from . import build_multiconcept_dataset as _build
 from . import download_anima as _dl
 from . import hf_to_diffusion_pipe as _bridge
 from . import launch as _launch
+from . import subject_buckets as _subjects
 from .config import (  # re-exported "elemental construction" surface
     AdapterConfig, ConfigError, DatasetConfig, DirectoryConfig, ModelConfig,
     OptimizerConfig, RunConfig, TrainConfig,
@@ -35,6 +36,7 @@ from .doctor import DoctorReport, doctor
 # Bridge configs re-exported under disambiguated names.
 ExportConfig = _bridge.BridgeConfig
 DatasetTomlConfig = _build.BaseConfig
+SubjectBucketConfig = _subjects.SubjectBucketConfig
 
 __all__ = [
     # config engine
@@ -45,10 +47,10 @@ __all__ = [
     "single_concept_preset", "multi_concept_preset", "sweep",
     "validate", "validate_bridge",
     # bridge configs
-    "ExportConfig", "DatasetTomlConfig", "ModelPaths",
+    "ExportConfig", "DatasetTomlConfig", "SubjectBucketConfig", "ModelPaths",
     # operations
-    "download_models", "inspect_source", "export_dataset", "build_dataset_toml",
-    "cache", "train", "doctor", "DoctorReport",
+    "download_models", "inspect_source", "export_dataset", "export_subject_buckets",
+    "build_dataset_toml", "cache", "train", "doctor", "DoctorReport",
     "WindowsTrainingRefused", "DiffusionPipeNotFound",
 ]
 
@@ -123,6 +125,17 @@ def build_dataset_toml(root: str | Path, out: str | Path,
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(_build.render_toml(concepts, cfg), encoding="utf-8")
     return out
+
+
+# ---- 4b. subject-bucket export (columnar; JSON caption verbatim) ----------
+def export_subject_buckets(cfg: "SubjectBucketConfig | None" = None, /, **overrides) -> dict:
+    """Columnar extraction into subject buckets, training caption_vlm_json verbatim
+    (+ caption_animetimm_json as a second sample when present). Returns a report dict
+    (final bucket sizes, merge actions, caption stats)."""
+    cfg = cfg or SubjectBucketConfig()
+    if overrides:
+        cfg = replace(cfg, **overrides)
+    return _subjects.export_subject_buckets(cfg)
 
 
 # =============================================================================

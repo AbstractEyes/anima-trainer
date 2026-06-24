@@ -73,12 +73,44 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--no-audit-filter", action="store_true")
     e.add_argument("--no-age-filter", action="store_true")
 
+    # subjects (columnar subject-bucket export; JSON caption verbatim)
+    sj = sub.add_parser("subjects", help="columnar extraction into subject buckets")
+    sj.add_argument("--repo", default=api.SubjectBucketConfig.repo)
+    sj.add_argument("--config", default="qwen_90k", help="HF config to extract")
+    sj.add_argument("--out", dest="out_root", default="datasets/anima_subjects")
+    sj.add_argument("--limit", type=int, default=1000, help="total accepted images")
+    sj.add_argument("--min-bucket-size", type=int, default=10)
+    sj.add_argument("--fuzzy-cutoff", type=float, default=0.62)
+    sj.add_argument("--no-head-noun", action="store_true",
+                    help="bucket by full subject phrase instead of head noun")
+    sj.add_argument("--keep-unmergeable", action="store_true",
+                    help="(legacy difflib path) send unmergeable small buckets to 'misc'")
+    sj.add_argument("--no-audit-filter", action="store_true")
+    sj.add_argument("--age-filter", action="store_true", help="require age_classifier_pass")
+    sj.add_argument("--build-toml", default=None,
+                    help="also write a balanced dataset.toml at this path")
+    # semantic grouping of the sparse tail
+    sj.add_argument("--no-semantic", action="store_true",
+                    help="disable semantic grouping (use legacy difflib plan)")
+    sj.add_argument("--similarity-model", default=api.SubjectBucketConfig.similarity_model,
+                    help="sentence-transformers model id (needs the [similarity] extra); "
+                         "nomic-ai/nomic-embed-text-v1 reuses a cached model (0 download)")
+    sj.add_argument("--semantic-backend", default="auto",
+                    choices=["auto", "sentence-transformers", "trigram", "difflib"])
+    sj.add_argument("--sim-threshold", type=float, default=0.45)
+    sj.add_argument("--min-final-group-size", type=int, default=12)
+    sj.add_argument("--drop-small", action="store_true",
+                    help="drop ungroupable sparse subjects instead of pooling into misc_*")
+
     # build
     b = sub.add_parser("build", help="balanced dataset.toml from concept folders")
     b.add_argument("--root", required=True)
     b.add_argument("--out", default="configs/anima_dataset.toml")
     b.add_argument("--target", type=int, default=None)
-    b.add_argument("--max-repeats", type=int, default=50)
+    b.add_argument("--alpha", type=float, default=0.5,
+                   help="balance damping: 0=equalize(legacy), 1=none, 0.5=sqrt(default)")
+    b.add_argument("--cap-mult", type=float, default=1.25)
+    b.add_argument("--max-repeats", type=int, default=8)
 
     # init-config
     ic = sub.add_parser("init-config", help="copy packaged toml templates into ./configs")
@@ -155,9 +187,36 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nOutput root: {Path(args.out_root).resolve()}")
         return 0
 
+    if args.cmd == "subjects":
+        cfg = api.SubjectBucketConfig(
+            repo=args.repo, config=args.config, out_root=args.out_root, limit=args.limit,
+            min_bucket_size=args.min_bucket_size, fuzzy_cutoff=args.fuzzy_cutoff,
+            head_noun=not args.no_head_noun, drop_unmergeable=not args.keep_unmergeable,
+            require_audit_approved=not args.no_audit_filter, require_age_pass=args.age_filter,
+            use_semantic=not args.no_semantic, similarity_model=args.similarity_model,
+            semantic_backend=args.semantic_backend, sim_threshold=args.sim_threshold,
+            min_final_group_size=args.min_final_group_size, keep_small=not args.drop_small)
+        rep = api.export_subject_buckets(cfg)
+        print(f"\nscanned={rep['scanned']}  accepted_images={rep['accepted_images']}  "
+              f"dropped={rep['dropped_images']}")
+        print(f"caption stats: {rep['caption_stats']}")
+        print(f"raw subjects: {rep['raw_subjects']}  ->  final buckets: {rep['n_final_buckets']}")
+        print("\nfinal buckets (samples each):")
+        for name, n in list(rep["final_buckets"].items())[:40]:
+            print(f"  {name:<28}{n}")
+        merged = [a for a in rep["merge_actions"] if a[2].startswith("merge")]
+        dropped = [a for a in rep["merge_actions"] if a[2] == "drop"]
+        print(f"\nmerged {len(merged)} small subjects into larger ones; dropped {len(dropped)}.")
+        if args.build_toml:
+            out = api.build_dataset_toml(args.out_root, args.build_toml)
+            print(f"Wrote {out}")
+        return 0
+
     if args.cmd == "build":
         out = api.build_dataset_toml(args.root, args.out,
                                      api.DatasetTomlConfig(target_effective=args.target,
+                                                           balance_alpha=args.alpha,
+                                                           cap_mult=args.cap_mult,
                                                            max_repeats=args.max_repeats))
         print(f"Wrote {out}")
         return 0
