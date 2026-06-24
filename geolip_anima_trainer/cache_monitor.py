@@ -186,12 +186,36 @@ def last_log_line(log_path: str | Path | None, maxbytes: int = 8192) -> str:
     return ""
 
 
+def log_tail_block(log_path: str | Path | None, maxbytes: int = 4096) -> str:
+    """The raw tail of the log (for surfacing a crash traceback). '' on any error."""
+    if not log_path:
+        return ""
+    try:
+        p = Path(log_path)
+        size = p.stat().st_size
+        with p.open("rb") as f:
+            if size > maxbytes:
+                f.seek(size - maxbytes)
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def log_has_traceback(log_path: str | Path | None) -> bool:
+    """True if the log tail shows a Python traceback — diffusion-pipe's cache work runs in a
+    forked child whose crash never signals the parent's queue, so the run HANGS instead of
+    exiting. We treat a traceback + stalled bytes as fatal and terminate (see make_monitor)."""
+    tail = log_tail_block(log_path, maxbytes=8192)
+    return "Traceback (most recent call last)" in tail
+
+
 # =============================================================================
 # MONITOR  (returns a callable(proc) that polls until the subprocess exits)
 # =============================================================================
 def make_monitor(*, cache_roots: list[Path], dataset_dirs: list[Path],
                  captions_per_image: int | None = None, interval: float = 30.0,
                  eta_window_s: float = 90.0, log_path: str | Path | None = None,
+                 stall_limit: int = 2,
                  on_update: Callable[[dict], None] | None = None,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> Callable[[object], None]:
@@ -236,10 +260,38 @@ def make_monitor(*, cache_roots: list[Path], dataset_dirs: list[Path],
                 pass
         return info
 
+    def _terminate(proc) -> None:
+        for meth in ("terminate", "kill"):
+            fn = getattr(proc, meth, None)
+            if callable(fn):
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001 — best-effort teardown
+                    pass
+
     def monitor(proc) -> None:
+        prev_bytes, stalls = -1, 0
         while getattr(proc, "poll", lambda: None)() is None:
             sleep(interval)
-            _tick()
+            info = _tick()
+            nb = info.get("bytes", 0)
+            # A diffusion-pipe cache crash happens in a forked child that never signals the
+            # parent's queue, so the process HANGS instead of exiting (poll() stays None). Detect
+            # it: a traceback in the log + no byte progress for `stall_limit` ticks -> terminate.
+            if stall_limit and log_has_traceback(log_path) and nb == prev_bytes:
+                stalls += 1
+            else:
+                stalls = 0
+            prev_bytes = nb
+            if stall_limit and stalls >= stall_limit:
+                print("[cache] FATAL: a cache worker crashed and the run is wedged (a forked "
+                      "child died without exiting the parent) — terminating. Traceback:",
+                      flush=True)
+                tb = log_tail_block(log_path)
+                if tb:
+                    print(tb, flush=True)
+                _terminate(proc)
+                break
         _tick()  # final line
 
     return monitor

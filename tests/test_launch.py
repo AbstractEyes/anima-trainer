@@ -1,6 +1,7 @@
 """Launch-orchestration tests — pure command construction, no deepspeed/GPU."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -62,6 +63,14 @@ def test_pythonunbuffered_default(tmp_path: Path):
     root = _fake_pipe(tmp_path)
     plan = L.build_plan(config_toml=_lora(tmp_path), repo_root=root, num_gpus=1)
     assert plan.env_prefix()["PYTHONUNBUFFERED"] == "1"
+
+
+def test_pythonpath_prepends_compat_shim(tmp_path: Path):
+    # the diffusion-pipe subprocess must import our sitecustomize.py first -> shim dir leads PYTHONPATH
+    from geolip_anima_trainer.dp_compat import shim_dir
+    root = _fake_pipe(tmp_path)
+    plan = L.build_plan(config_toml=_lora(tmp_path), repo_root=root, num_gpus=1)
+    assert plan.env_prefix()["PYTHONPATH"].split(os.pathsep)[0] == shim_dir()
 
 
 def test_cache_only_and_resume_flags(tmp_path: Path):

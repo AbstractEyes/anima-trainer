@@ -83,6 +83,46 @@ def test_warmup_line_shows_log_tail(tmp_path, capsys):
     assert "warming up" in out and "caching latents: (1024, 1024)" in out
 
 
+def test_log_has_traceback(tmp_path):
+    log = tmp_path / "c.log"
+    log.write_text("caching latents: x\n", encoding="utf-8")
+    assert cm.log_has_traceback(log) is False
+    log.write_text("Process Process-2:\nTraceback (most recent call last):\n"
+                   "FileNotFoundError: nope\n", encoding="utf-8")
+    assert cm.log_has_traceback(log) is True
+    assert cm.log_has_traceback(None) is False
+
+
+def test_monitor_terminates_on_fatal_traceback(tmp_path, capsys):
+    # a diffusion-pipe child crash leaves the parent hung (poll() stays None). The monitor must
+    # detect the traceback + stalled bytes and TERMINATE instead of looping forever.
+    root = tmp_path / "man" / "cache" / "anima"
+    (root / "latents_").mkdir(parents=True)
+    imgdir = tmp_path / "man"
+    imgdir.mkdir(exist_ok=True)
+    (imgdir / "a.png").write_bytes(b"x")
+    log = tmp_path / "cache.log"
+    log.write_text("caching latents: (1.0, 1)\nProcess Process-2:\n"
+                   "Traceback (most recent call last):\n"
+                   "FileNotFoundError: .../metadata/tmp0\n", encoding="utf-8")
+
+    class _Proc:  # never exits on its own -> only termination breaks the loop
+        def __init__(self):
+            self.killed = False
+        def poll(self):
+            return 0 if self.killed else None
+        def terminate(self):
+            self.killed = True
+
+    p = _Proc()
+    mon = cm.make_monitor(cache_roots=[root], dataset_dirs=[imgdir], captions_per_image=1,
+                          interval=0, log_path=log, stall_limit=2, sleep=lambda s: None)
+    mon(p)                       # must return, not hang
+    assert p.killed is True
+    out = capsys.readouterr().out
+    assert "FATAL" in out and "FileNotFoundError" in out
+
+
 def test_rate_and_fmt():
     r = cm._Rate(window_s=100)
     r.update(0.0, 0)

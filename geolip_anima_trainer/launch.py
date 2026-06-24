@@ -105,6 +105,14 @@ class LaunchPlan:
         # minutes — making a slow warm-up look hung. Force line/unbuffered so they stream
         # immediately (also lets cache_monitor tail the log during the no-shards-yet phase).
         e.setdefault("PYTHONUNBUFFERED", "1")
+        # Auto-apply the diffusion-pipe compat shim (datasets Dataset.map mkdir fix) in the
+        # subprocess: prepend our shim dir so Python imports its sitecustomize.py at startup,
+        # BEFORE diffusion-pipe forks its caching child. Without it, --cache_only crashes with
+        # FileNotFoundError on an uncreated ar_frames_*/metadata/ dir and then HANGS forever
+        # (the dead child never signals its queue sentinel). See dp_compat.py.
+        from .dp_compat import shim_dir
+        prev_pp = e.get("PYTHONPATH") or os.environ.get("PYTHONPATH", "")
+        e["PYTHONPATH"] = shim_dir() + (os.pathsep + prev_pp if prev_pp else "")
         if self.gpu_ids is not None:
             # deepspeed --include scopes the launch, but some child paths read
             # CUDA_VISIBLE_DEVICES; set both so they agree.

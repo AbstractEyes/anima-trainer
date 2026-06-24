@@ -215,6 +215,24 @@ and tqdm auto-disables — unbuffering streams the markers), and `cache_monitor.
 tqdm). Genuine-hang escape hatch: HF `datasets` map-over-fork can hang (`dataset.py:1052-1053`); if
 nothing grows after ~10–15 min, lower `map_num_proc` (→2).
 
+⚠️ **diffusion-pipe cache CRASH→HANG bug (`dp_compat.py` fixes it).** diffusion-pipe writes per-AR
+bucket metadata via `Dataset.map(cache_file_name=<dir>/ar_frames_*/metadata/…arrow)` but only
+creates `ar_frames_*/` (`dataset.py:410`), never its `metadata/` subdir (`:429`). HF `datasets`
+(confirmed 2.21) opens the map temp file with `NamedTemporaryFile(dir=dirname(cache_file_name))` and
+does **not** mkdir the parent → `FileNotFoundError`. The directory-level metadata path only survives
+because an earlier `save_to_disk` side-effect-creates its dir. Worse, the crash is in a **forked
+child** (`_cache_fn`, `dataset.py:1047`) that never puts its queue sentinel, so the parent blocks on
+`queue.get()` (`:1184`) **forever** — a silent unkillable hang (this is the real "no exception
+catching" the user hit; many small AR buckets trip it). Two-layer fix, both ours:
+(1) **`dp_compat.patch_datasets_map_makedirs`** wraps `Dataset.map` to mkdir `dirname(cache_file_name)`
+first (universally safe, idempotent). It's auto-applied in the subprocess via a bundled
+`_dp_compat/sitecustomize.py` that `launch.env_prefix()` puts FIRST on `PYTHONPATH` (Python imports
+`sitecustomize` at startup, before diffusion-pipe forks). The shim is self-contained (no package
+import) and shipped as package-data.
+(2) **`cache_monitor` hang-detection**: a Python traceback in the log + stalled bytes for
+`stall_limit` (2) ticks ⇒ print the traceback and **terminate** the wedged process (→ launch raises),
+instead of polling a hung `poll()==None` forever. So even a *different* child crash fails fast/loud.
+
 ### Backend tiers (optional `[similarity]` extra)
 `make_sim_fn` picks best-available, logs the tier: **sentence-transformers**
 (`all-MiniLM-L6-v2`, ~90 MB; or `--similarity-model nomic-ai/nomic-embed-text-v1` =

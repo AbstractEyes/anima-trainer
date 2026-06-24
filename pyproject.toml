@@ -39,4 +39,4 @@ Homepage = "https://github.com/AbstractPhil/anima-trainer"
 packages = ["geolip_anima_trainer"]
 
 [tool.setuptools.package-data]
-geolip_anima_trainer = ["templates/*.toml"]
+geolip_anima_trainer = ["templates/*.toml", "_dp_compat/*.py"]
