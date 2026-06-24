@@ -253,6 +253,8 @@ def launch(plan: LaunchPlan, *, dry_run: bool = False, check: bool = True,
     if monitor is None and log_path is None:
         rc = subprocess.run(plan.argv(), env=env, cwd=cwd).returncode
     else:
+        if log_path:
+            Path(log_path).parent.mkdir(parents=True, exist_ok=True)
         logf = open(log_path, "w", encoding="utf-8") if log_path else None
         try:
             proc = subprocess.Popen(

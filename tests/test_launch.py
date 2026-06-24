@@ -83,3 +83,22 @@ def test_dry_run_returns_plan(tmp_path: Path):
     root = _fake_pipe(tmp_path)
     plan = L.build_plan(config_toml=_lora(tmp_path), repo_root=root, num_gpus=1)
     assert L.launch(plan, dry_run=True) is plan  # works on any OS, no exec
+
+
+def test_launch_creates_missing_log_parent(tmp_path: Path, monkeypatch):
+    """log_path in a not-yet-existing dir must not raise FileNotFoundError — launch()
+    mkdirs the parent (caching runs before the training cell creates OUTPUT_DIR)."""
+    root = _fake_pipe(tmp_path)
+    plan = L.build_plan(config_toml=_lora(tmp_path), repo_root=root, num_gpus=1)
+    monkeypatch.setattr(L.platform, "system", lambda: "Linux")  # bypass the Windows guard
+
+    class _FakeProc:
+        def wait(self):
+            return 0
+    monkeypatch.setattr(L.subprocess, "Popen", lambda *a, **k: _FakeProc())
+
+    log_path = tmp_path / "runs" / "anima_prelim" / "cache_vlm.log"
+    assert not log_path.parent.exists()
+    rc = L.launch(plan, log_path=log_path)        # monitor=None + log_path set -> the fixed branch
+    assert rc == 0
+    assert log_path.parent.is_dir() and log_path.exists()
