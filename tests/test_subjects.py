@@ -107,6 +107,17 @@ def test_semantic_keep_small_pools_leftovers_not_dropped():
     assert plan2.mapping["zebra"] is None                      # drop when asked
 
 
+def test_link_or_copy_idempotent(tmp_path):
+    # re-running an extraction must not crash on an existing hardlinked variant
+    src = tmp_path / "img.png"
+    src.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 40)
+    dst = tmp_path / "img__anime.png"
+    S._link_or_copy(src, dst)                     # first run: create the variant
+    assert dst.read_bytes() == src.read_bytes()
+    S._link_or_copy(src, dst)                     # second run: must overwrite, not raise
+    assert dst.read_bytes() == src.read_bytes()
+
+
 def test_dampened_repeats_curve():
     from geolip_anima_trainer.build_multiconcept_dataset import dampened_repeats as dr
     assert dr(340, 340) == 1          # biggest concept ~1x

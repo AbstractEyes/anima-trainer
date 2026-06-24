@@ -442,7 +442,11 @@ def _passes(audit, age, cfg: SubjectBucketConfig) -> bool:
 
 
 def _link_or_copy(src: Path, dst: Path) -> None:
-    """Hardlink dst -> src (no extra bytes, same volume); fall back to a copy."""
+    """Hardlink dst -> src (no extra bytes, same volume); fall back to a copy.
+    Overwrite-safe: removes an existing dst first so a re-run can't collide (a stale
+    hardlink would make os.link raise FileExistsError and copyfile raise SameFileError)."""
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
     try:
         os.link(src, dst)
     except OSError:
@@ -556,6 +560,8 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
                 bdir = out_root / bucket_dir
                 bdir.mkdir(parents=True, exist_ok=True)
                 primary = bdir / f"{idslug}{ext}"
+                if primary.exists():        # re-run safety: fresh inode, don't truncate a
+                    primary.unlink()        # prior run's __anime hardlink that shares it
                 primary.write_bytes(raw)                       # RAW — no re-encode
                 (bdir / f"{idslug}.txt").write_text(captions[0][1], encoding="utf-8")
                 bucket_counts[bucket_dir] += 1
