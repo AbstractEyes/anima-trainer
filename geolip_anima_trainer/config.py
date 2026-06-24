@@ -92,7 +92,12 @@ class RunConfig:
     save_dtype: str = "bfloat16"
     activation_checkpointing: bool = False   # 96GB -> off (faster).
     partition_method: str = "parameters"
-    caching_batch_size: int = 8
+    # Caching throughput (--cache_only is decode/plumbing-bound, NOT GPU-bound; the 2B DiT
+    # never loads, so VRAM is low by design). caching_batch_size = the VAE/text-encoder
+    # batch; map_num_proc = the image-DECODE worker pool (the real bottleneck — diffusion-pipe
+    # caps it at min(8, cpu); raise it to the box's core count). None -> leave at the default.
+    caching_batch_size: int = 16
+    map_num_proc: int | None = None
     steps_per_print: int = 10
     blocks_to_swap: int = 0          # 0 = disabled; VRAM is abundant.
 
@@ -289,6 +294,8 @@ def render_lora_toml(cfg: TrainConfig) -> str:
                  "activation_checkpointing", "partition_method", "caching_batch_size",
                  "steps_per_print", "blocks_to_swap"):
         lines.append(f"{name} = {_toml_scalar(getattr(r, name))}")
+    if r.map_num_proc is not None:    # decode-worker pool (omitted -> diffusion-pipe default)
+        lines.append(f"map_num_proc = {r.map_num_proc}")
 
     m = cfg.model
     lines += ["", "[model]",

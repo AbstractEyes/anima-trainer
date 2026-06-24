@@ -25,6 +25,16 @@ def test_db_count_and_count_done(tmp_path):
     assert cm._db_count(str(tmp_path / "nope.db")) == 0
 
 
+def test_cache_bytes_is_the_continuous_signal(tmp_path):
+    # bytes grow continuously even while the items table stays uncommitted (the fix)
+    root = tmp_path / "man" / "cache" / "anima" / "latents_"
+    root.mkdir(parents=True)
+    (root / "shard_0.bin").write_bytes(b"x" * 1000)
+    (root / "shard_1.bin").write_bytes(b"y" * 2000)
+    (root / "metadata.db").write_bytes(b"z" * 99)        # not a .bin -> excluded
+    assert cm.cache_bytes([tmp_path / "man" / "cache" / "anima"]) == 3000
+
+
 def test_count_total_images(tmp_path):
     d = tmp_path / "man"
     d.mkdir()

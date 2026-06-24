@@ -98,12 +98,19 @@ anima export --repo AbstractPhil/diffusion-pretrain-set-ft1 --configs qwen_90k \
 # 4. balanced dataset.toml
 anima build --root datasets/anima_qwen90k --out configs/anima_dataset.toml
 
-# 5. (target box) precache latents/text-embeds (with a live progress + ETA bar), then train
+# 5. (target box) precache latents/text-embeds (live GB/s progress), then train
 anima cache --config configs/anima_lora.toml --repo-root . --progress --log-path runs/cache.log
 anima train --config configs/anima_lora.toml --num-gpus 4
 #   shared box: pin specific cards instead ->  --gpu-ids 0,1
 #   preview the command anywhere (incl. Windows): add --dry-run
 ```
+
+> **Caching is decode-bound, not GPU-bound** — `--cache_only` never loads the 2B DiT (only the
+> VAE + Qwen-3 0.6B text encoder, forward-only), so **low VRAM is expected, not a bug**. The
+> throughput lever is the image-**decode worker pool**: diffusion-pipe caps it at `min(8, cpu)`,
+> so set **`map_num_proc`** (in the lora toml) to the box's core count, raise `caching_batch_size`
+> (16+), and on a multi-GPU box add `--num-gpus N`. The `--progress` line tracks **shard bytes**
+> (the live signal — the cache only commits its record count per 10 GB shard).
 
 `anima init-config` copies the packaged `anima_lora.toml` / `anima_dataset.toml`
 templates into `./configs` to edit.

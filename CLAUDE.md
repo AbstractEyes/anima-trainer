@@ -173,14 +173,28 @@ inside one run**. `train_before_after` chains run A → run B, handing the adapt
 `[adapter].init_from_existing` (there is NO CLI flag — `launch.rewrite_init_from_existing`
 writes a temp toml pointing at phase-1's latest `epoch{N}` dir).
 
-### Cache facelift (`anima cache --progress`)
-`cache_monitor.py` prints `[cache] done/total (%) rate ETA` from the cache's **SQLite
-`metadata.db` COUNT(*)** — NOT file counts: diffusion-pipe's cache is a SHARDED BLOB store
-(a new `shard_*.bin` only every ~10 GB) under `<dir>/cache/anima/`, so `latents_`/
-`text_embeddings_*` `metadata.db` row counts are the exact, monotonic, resumable counter.
-Total = images-on-disk (latents, 1/image) + images×captions (text-embeds; captions/image
-auto-detected from `captions.json`). `launch(monitor=...)` runs the subprocess non-blocking
-and polls. Colab: pair with `--log-path` so the progress line isn't buried in tqdm output.
+### Cache facelift (`anima cache --progress`) + caching throughput
+`cache_monitor.py` prints a live `[cache] N.NN GB cached · MB/s · latents/text · elapsed` line.
+**Primary signal = total `shard_*.bin` BYTES** (`cache_bytes`), NOT the metadata `items`
+COUNT(*): diffusion-pipe writes each item to the `.bin` immediately (`cache.py:115`) but only
+**commits the items table when a 10 GB shard finalizes or a pass ends** (`cache.py:106`,
+`dataset.py:91`) — so COUNT(*) is 0 for long stretches even while caching is busy (this was a
+real "stuck at 0" bug; `immutable=1` made it worse and was removed). Record counts are shown
+as a coarse phase marker. `launch(monitor=...)` runs the subprocess non-blocking; pair with
+`--log-path` so the line isn't buried in tqdm.
+
+**Throughput diagnosis (verified in `external/diffusion-pipe`, file:line):** `--cache_only`
+is **decode/plumbing-bound, NOT GPU-bound**. The 2B DiT never loads (`train.py:511-512` quits
+before `:517`), so only the VAE (~0.25 GB) + **Qwen-3 0.6B** text encoder (~1.2 GB) are
+resident, forward-only — **low VRAM is correct, not a bug**. The wall-clock bottleneck: each
+decode worker does `queue.put` then BLOCKS on the GPU round-trip (`dataset.py:1098`), and the
+pool is capped at `min(8, cpu)` single-threaded workers (`dataset.py:33,1055`) decoding images
+with PIL — so the GPU idles. Levers, ranked: (1) **`map_num_proc`** = the decode-worker count
+(NOW exposed in `RunConfig`/template; set to the box's core count — the highest-impact knob),
+(2) **`caching_batch_size`** 8→16+ (96 GB has headroom), (3) **`--num-gpus N`** to shard the
+encode (raise `map_num_proc` to ≥N×8 first — only rank 0 spawns the producer pool). dtype stays
+bf16 (Anima invariant). The Qwen-3 `max_length=512` fixed padding is the biggest GPU item but
+the GPU is starved, so it's not the wall-clock bottleneck.
 
 ### Backend tiers (optional `[similarity]` extra)
 `make_sim_fn` picks best-available, logs the tier: **sentence-transformers**

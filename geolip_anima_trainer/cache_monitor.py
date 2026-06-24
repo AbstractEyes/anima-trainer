@@ -38,17 +38,33 @@ IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
 # COUNTING
 # =============================================================================
 def _db_count(db_path: str) -> int:
-    """COUNT(*) of the `items` table in one Cache metadata.db. 0 on any error
-    (table not created yet / transient lock). Read-only + immutable so it never
-    blocks or corrupts the writer."""
+    """COUNT(*) of the `items` table in one Cache metadata.db. Read-only (NOT immutable —
+    the file is actively written, immutable would pin a stale snapshot). NOTE: diffusion-pipe
+    commits items only when a shard finalizes (cache.py:106, shards are 10 GB) or at the end
+    of a pass — so this jumps in big steps and is 0 until the first commit. Use cache_bytes()
+    for live progress; this is the exact (coarse) record count once commits land."""
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True, timeout=0.25)
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.25)
         try:
             return int(con.execute("SELECT COUNT(*) FROM items").fetchone()[0])
         finally:
             con.close()
     except sqlite3.Error:
         return 0
+
+
+def cache_bytes(cache_roots: list[Path]) -> int:
+    """Total bytes across all shard_*.bin files — the CONTINUOUS progress signal.
+    cache.py writes each encoded item to the shard .bin immediately (line 115), so this
+    grows in real time even while the metadata.db items table stays uncommitted."""
+    total = 0
+    for root in cache_roots:
+        for binf in Path(root).glob("**/*.bin"):
+            try:
+                total += binf.stat().st_size
+            except OSError:
+                pass
+    return total
 
 
 def count_done(cache_roots: list[Path],
@@ -156,39 +172,38 @@ def make_monitor(*, cache_roots: list[Path], dataset_dirs: list[Path],
                  on_update: Callable[[dict], None] | None = None,
                  clock: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep) -> Callable[[object], None]:
-    """Build a monitor(proc) that prints `[cache] done/total (xx%) rate ETA` every
-    `interval`s until proc.poll() is not None. Never touches/kills the subprocess."""
+    """Build a monitor(proc) printing a live cache line every `interval`s until the
+    subprocess exits. PRIMARY signal = shard .bin BYTES (continuous), because the metadata
+    `items` table only commits per-10 GB shard / per-pass, so the record COUNT is 0 for
+    long stretches even while caching is busy. Records are shown as a coarse phase marker
+    (latents commit at the end of the latents pass, text at the end of the text pass)."""
     total_imgs = count_total_images(dataset_dirs)
     cpi = captions_per_image if captions_per_image is not None else _captions_per_image(dataset_dirs)
-    total_lat = total_imgs
-    total_txt = total_imgs * cpi
-    total = total_lat + total_txt
-    rate = _Rate(eta_window_s)
-    warmed = 0
+    total_lat, total_txt = total_imgs, total_imgs * cpi
+    byte_rate = _Rate(eta_window_s)
+    t0: list = [None]
 
     def _tick() -> dict:
-        nonlocal warmed
+        now = clock()
+        if t0[0] is None:
+            t0[0] = now
+        elapsed = now - t0[0]
+        nbytes = cache_bytes(cache_roots)
+        byte_rate.update(now, nbytes)
+        mbps = byte_rate.rate() / 1e6
         d = count_done(cache_roots)
         dl, dt = d.get("latents_", 0), d.get("text_embeddings_", 0)
-        done = dl + dt
-        rate.update(clock(), done)
-        r = rate.rate()
-        if total <= 0:
-            line = f"[cache] {done} cached ({_fmt(0)} elapsed)  (total unknown)"
-            info = {"done": done, "total": None, "rate": r}
+        if nbytes == 0 and dl == 0 and dt == 0:
+            line = (f"[cache] warming up — loading VAE + Qwen-3 0.6B and building the "
+                    f"dataset · {_fmt(elapsed)} elapsed (no shards yet)")
+            info = {"bytes": 0, "records": 0, "elapsed": elapsed}
         else:
-            pct = min(99.9, 100.0 * done / total) if done < total else 100.0
-            remaining = max(0, total - done)
-            note = ""
-            if done == 0:
-                warmed += 1
-                if warmed >= 2:
-                    note = "  (warming up — loading VAE/text-encoder)"
-            line = (f"[cache] {done}/{total} ({pct:.1f}%)  rate {r:.1f}/s  "
-                    f"ETA {_fmt(rate.eta(remaining))}   [latents {dl}/{total_lat} "
-                    f"· text {dt}/{total_txt}]{note}")
-            info = {"done": done, "total": total, "pct": pct, "rate": r,
-                    "latents": (dl, total_lat), "text": (dt, total_txt)}
+            recs = (f" · latents {dl}/{total_lat} · text {dt}/{total_txt}"
+                    if total_imgs else f" · {dl + dt} records")
+            line = (f"[cache] {nbytes / 1e9:.2f} GB cached · {mbps:.0f} MB/s{recs} · "
+                    f"{_fmt(elapsed)} elapsed")
+            info = {"bytes": nbytes, "mbps": mbps, "latents": (dl, total_lat),
+                    "text": (dt, total_txt), "elapsed": elapsed}
         print(line, flush=True)
         if on_update:
             try:
