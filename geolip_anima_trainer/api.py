@@ -191,11 +191,19 @@ def _toml_output_dir(lora_toml: str | Path) -> str | None:
 def train_before_after(lora_vlm: str | Path, lora_animetimm: str | Path, *,
                        repo_root: str | Path | None = None, num_gpus: int = 1,
                        gpu_ids: list[int] | None = None, dry_run: bool = False,
-                       configs_dir: str | Path | None = None) -> list:
+                       configs_dir: str | Path | None = None,
+                       log_dir: str | Path | None = None) -> list:
     """The BEFORE_AFTER first-LoRA recipe: run the full VLM phase, then the full animetimm
     phase resuming the VLM adapter. diffusion-pipe has one Dataset + one LR schedule and a
     mandatory shuffle, so phase ordering is achieved as TWO chained runs handed off via
-    [adapter].init_from_existing (rewritten into a temp toml). Returns per-phase rc/plans."""
+    [adapter].init_from_existing (rewritten into a temp toml). log_dir -> each phase's
+    output goes to <log_dir>/{vlm,animetimm}.log. Returns per-phase rc/plans."""
+    def _log(phase):
+        if not log_dir:
+            return None
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        return str(Path(log_dir) / f"{phase}.log")
+
     plan1 = _launch.build_plan(config_toml=lora_vlm, repo_root=repo_root,
                                num_gpus=num_gpus, gpu_ids=gpu_ids)
     if dry_run:
@@ -206,7 +214,7 @@ def train_before_after(lora_vlm: str | Path, lora_animetimm: str | Path, *,
         _launch.launch(plan2, dry_run=True)
         return [plan1, plan2]
 
-    rc1 = _launch.launch(plan1)
+    rc1 = _launch.launch(plan1, log_path=_log("vlm"))
     lora2 = lora_animetimm
     out1 = _toml_output_dir(lora_vlm)
     epoch = _launch.latest_epoch_dir(out1) if out1 else None
@@ -217,7 +225,7 @@ def train_before_after(lora_vlm: str | Path, lora_animetimm: str | Path, *,
         log.warning("no phase-1 epoch found under %s; phase 2 trains from base", out1)
     plan2 = _launch.build_plan(config_toml=lora2, repo_root=repo_root,
                                num_gpus=num_gpus, gpu_ids=gpu_ids)
-    rc2 = _launch.launch(plan2)
+    rc2 = _launch.launch(plan2, log_path=_log("animetimm"))
     return [rc1, rc2]
 
 

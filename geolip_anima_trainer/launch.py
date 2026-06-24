@@ -250,7 +250,7 @@ def launch(plan: LaunchPlan, *, dry_run: bool = False, check: bool = True,
 
     env = {**os.environ, **plan.env_prefix()}
     cwd = str(plan.train_py.parent)
-    if monitor is None:
+    if monitor is None and log_path is None:
         rc = subprocess.run(plan.argv(), env=env, cwd=cwd).returncode
     else:
         logf = open(log_path, "w", encoding="utf-8") if log_path else None
@@ -259,7 +259,8 @@ def launch(plan: LaunchPlan, *, dry_run: bool = False, check: bool = True,
                 plan.argv(), env=env, cwd=cwd,
                 stdout=(logf or None),
                 stderr=(subprocess.STDOUT if logf else None))
-            monitor(proc)            # polls + prints progress until the process exits
+            if monitor is not None:
+                monitor(proc)        # polls + prints progress until the process exits
             rc = proc.wait()
         finally:
             if logf:
