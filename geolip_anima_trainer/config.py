@@ -90,7 +90,18 @@ class RunConfig:
     save_every_n_epochs: int = 5
     checkpoint_every_n_minutes: int = 30
     save_dtype: str = "bfloat16"
-    activation_checkpointing: bool = False   # 96GB -> off (faster).
+    # activation_checkpointing is a VRAM<->speed TRADE, not a free win. OFF keeps all 28 DiT
+    # blocks' activations resident (the bulk of VRAM at 1024² — ~89 GB at micro_batch 4) but
+    # is ~25-33% FASTER per step. ON recomputes each block in backward -> drops VRAM to ~25-30
+    # GB but costs that recompute. On the 96 GB box leave it OFF for speed; turn it ON only to
+    # FREE VRAM for a bigger micro_batch / higher resolution (the activation term is linear in both).
+    activation_checkpointing: bool = False
+    # torch.compile(dynamic=True) on the DiT — the ONE real throughput lever (~+10-25%). Costs a
+    # one-time compile + one recompile per distinct AR-bucket shape, so it amortizes over a real
+    # multi-epoch run but is net-negative for a tiny smoke test. Maskless SDPA already uses the
+    # efficient (flash/mem-efficient) backend on sm_120/cu128 (PyTorch PR 145602) — NOT math — so
+    # ~2.8 samples/s at 1024² is compute-bound-normal, not a fallback; compile is the lever left.
+    compile: bool = False
     partition_method: str = "parameters"
     # Caching throughput (--cache_only is decode/plumbing-bound, NOT GPU-bound; the 2B DiT
     # never loads, so VRAM is low by design). map_num_proc = the image-DECODE worker pool =
@@ -293,8 +304,8 @@ def render_lora_toml(cfg: TrainConfig) -> str:
                  "eval_every_n_epochs", "eval_before_first_step",
                  "eval_micro_batch_size_per_gpu", "eval_gradient_accumulation_steps",
                  "save_every_n_epochs", "checkpoint_every_n_minutes", "save_dtype",
-                 "activation_checkpointing", "partition_method", "caching_batch_size",
-                 "steps_per_print", "blocks_to_swap"):
+                 "activation_checkpointing", "compile", "partition_method",
+                 "caching_batch_size", "steps_per_print", "blocks_to_swap"):
         lines.append(f"{name} = {_toml_scalar(getattr(r, name))}")
     if r.map_num_proc is not None:    # decode-worker pool (omitted -> diffusion-pipe default)
         lines.append(f"map_num_proc = {r.map_num_proc}")

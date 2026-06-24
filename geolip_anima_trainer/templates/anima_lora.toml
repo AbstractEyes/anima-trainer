@@ -40,9 +40,15 @@ save_every_n_epochs = 5
 checkpoint_every_n_minutes = 30      # full training-state checkpoint for --resume_from_checkpoint
 save_dtype = 'bfloat16'
 
-# activation_checkpointing trades compute for VRAM. NOT needed on 96GB for a 2B
-# model — leaving it off is faster. Set to true (or 'unsloth') only if you OOM.
+# activation_checkpointing trades compute for VRAM (NOT a free win). OFF keeps all
+# 28 DiT blocks' activations resident (~89GB at 1024² micro_batch 4) but is ~25-33%
+# FASTER. Turn it ON only to FREE VRAM for a bigger micro_batch / higher resolution.
 activation_checkpointing = false
+# torch.compile(dynamic=True) on the DiT — the ONE real throughput lever (~+10-25%).
+# Costs a one-time compile + a recompile per AR-bucket shape, so enable it for real
+# multi-epoch runs (amortizes), not tiny smoke tests. Maskless SDPA already uses the
+# efficient backend on sm_120/cu128 — ~2.8 samples/s at 1024² is compute-bound-normal.
+compile = false
 partition_method = 'parameters'
 # --- caching throughput -------------------------------------------------------
 # `anima cache --cache_only` is DECODE/PLUMBING-bound, not GPU-bound: the 2B DiT never

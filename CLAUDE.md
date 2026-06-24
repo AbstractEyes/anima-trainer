@@ -45,9 +45,20 @@ Workflow: `anima inspect` → `anima subjects --caption-mode before_after --buil
 ## Environment (fixed facts — do not re-derive)
 - **Target GPU:** RTX PRO 6000 Blackwell, 96 GB, **sm_120**, one or many on a shared box.
 - **bf16 throughout. No fp8** (e4m3 degrades this lineage; 96 GB makes fp8 pointless).
-- **Do NOT install flash-attn** — broken on sm_120. diffusion-pipe runs on **SDPA**.
-- No block swapping, no activation checkpointing (VRAM abundant).
-- Python 3.12. Blackwell needs **torch ≥ 2.7 / cu128**.
+- **Do NOT install flash-attn** — broken on sm_120 (that's the standalone Dao-AILab package).
+  diffusion-pipe runs on **PyTorch SDPA**, whose flash/mem-efficient kernels ARE enabled for
+  sm_120 in torch ≥2.7/cu128 (PyTorch PR 145602). The 2B DiT self-attention is **maskless**
+  (`cosmos_predict2_modeling.py:303`) → efficient backend, **not** the math fallback.
+- No block swapping (VRAM abundant). **`activation_checkpointing` off by default** — but it's a
+  VRAM↔speed TRADE, not a free win: OFF keeps all 28 DiT blocks' activations resident (≈89 GB at
+  1024² micro_batch 4 — that VRAM is **activations, not the 4 GB model**; expected, not a leak) and
+  is ~25-33% FASTER. Turn it ON only to FREE VRAM for a bigger `micro_batch`/higher res.
+- **Training perf (1024², single Blackwell):** ~2.8 samples/s at micro_batch 4 is **compute-bound-
+  normal**, not a fallback. The one real throughput lever is **`compile = true`** (torch.compile,
+  ~+10-25%; amortizes its one-time + per-AR-shape compile over a real run — net-negative for smoke
+  tests). Bigger `micro_batch` grows EFFECTIVE batch, not samples/s (use grad_accum for that at no
+  VRAM cost). Both `compile` and `activation_checkpointing` are exposed on `RunConfig`/template.
+- Python 3.12. Blackwell needs **torch ≥ 2.7 / cu128** (cu130/2.9 only refreshes the cuDNN path — optional).
 - **Local box is an RTX 4090 (sm_89, Windows) — smoke-test only, never a full train.**
 
 ## Model files (circlestone-labs/Anima, split_files/)

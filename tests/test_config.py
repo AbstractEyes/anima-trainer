@@ -67,6 +67,19 @@ def test_round_trip_render_then_load(tmp_path: Path):
     assert len(loaded.dataset.directories) == 1
 
 
+def test_compile_and_ckpt_round_trip(tmp_path: Path):
+    # the throughput/VRAM knobs render and load back (compile is the one real speed lever)
+    cfg = C.single_concept_preset("data/concept", output_dir="runs/x", model=_model())
+    cfg.run.compile = True
+    cfg.run.activation_checkpointing = True
+    lora_path, ds_path = C.render_train_toml(cfg, tmp_path)
+    text = lora_path.read_text(encoding="utf-8")
+    assert "compile = true" in text and "activation_checkpointing = true" in text
+    loaded = C.load_train_config(lora_path, ds_path)
+    assert loaded.run.compile is True
+    assert loaded.run.activation_checkpointing is True
+
+
 def test_sweep_emits_grid(tmp_path: Path):
     base = C.single_concept_preset("data/concept", output_dir="runs/x", model=_model())
     out = list(C.sweep(base, ranks=[32, 64], lrs=[1e-5, 2e-5],
