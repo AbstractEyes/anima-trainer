@@ -55,7 +55,8 @@ __all__ = [
     "ExportConfig", "DatasetTomlConfig", "SubjectBucketConfig", "CaptionMode", "ModelPaths",
     # operations
     "download_models", "inspect_source", "export_dataset", "export_subject_buckets",
-    "build_dataset_toml", "build_mode_tomls", "cache", "train", "train_before_after",
+    "build_dataset_toml", "build_mode_tomls", "cache", "cache_push", "cache_pull",
+    "train", "train_before_after",
     "doctor", "DoctorReport", "WindowsTrainingRefused", "DiffusionPipeNotFound",
 ]
 
@@ -151,24 +152,75 @@ def cache(config_toml: str | Path, *, repo_root: str | Path | None = None,
           regenerate: bool = False, dry_run: bool = False,
           progress: bool = False, progress_interval: float = 30.0,
           captions_per_image: int | None = None,
-          log_path: str | Path | None = None, on_update=None):
+          log_path: str | Path | None = None, on_update=None,
+          backup_repo: str | None = None, backup_interval: float = 1800.0,
+          backup_token: str | None = None, backup_root: str | Path | None = None,
+          trust_cache: bool = False):
     """Precache latents/text-embeds: deepspeed ... train.py --cache_only.
 
     progress=True attaches the cache_monitor: a live `[cache] done/total (%) ETA` line
     every progress_interval seconds (counted from the cache SQLite metadata.db). Pair with
-    log_path to send diffusion-pipe's own output to a file so the progress line stays clean."""
+    log_path to send diffusion-pipe's own output to a file so the progress line stays clean.
+
+    backup_repo: an HF *dataset* repo to PERIODICALLY push the CACHE subtree to during the run
+    — on every committed-record bump (a 10 GB shard just finalized = a new restorable
+    checkpoint) or every backup_interval seconds, PLUS a guaranteed final push even if the run
+    fails. So a Colab reset never loses more than the in-progress <=10 GB shard. The dataset
+    itself must be frozen once to the same repo via cache_push(include_dataset=True).
+    backup_root: the tree to push from (so the repo layout matches the freeze). For before_after
+    pass the anima_subjects parent (e.g. SUBJECTS_ROOT) so vlm/ and animetimm/ caches land under
+    the same repo root as the frozen dataset; default = the toml's own [[directory]] ancestor.
+    trust_cache: pass --trust_cache so a restored cache's metadata loads without re-validation
+    (faster, stabler resume); it does NOT bypass the latent fingerprint (DATA_ROOT must match)."""
     plan = _launch.build_plan(config_toml=config_toml, repo_root=repo_root,
                               num_gpus=num_gpus, gpu_ids=gpu_ids,
-                              cache_only=True, regenerate_cache=regenerate)
+                              cache_only=True, regenerate_cache=regenerate,
+                              trust_cache=trust_cache)
+
+    pusher, composed = None, on_update
+    if backup_repo and not dry_run:
+        from . import cache_sync as _cs
+        folder = Path(backup_root).expanduser() if backup_root else _cs.out_root_of(config_toml)
+        composed, pusher = _cs.make_periodic_pusher(
+            folder, backup_repo, token=backup_token,
+            interval=backup_interval, user_on_update=on_update)
+
     monitor = None
-    if progress and not dry_run:
+    if (progress or backup_repo) and not dry_run:
         from . import cache_monitor as _cm
         dirs = _cm.dataset_dirs_from_toml(config_toml)
         monitor = _cm.make_monitor(
             cache_roots=_cm.cache_roots_for(dirs), dataset_dirs=dirs,
             captions_per_image=captions_per_image, interval=progress_interval,
-            log_path=log_path, on_update=on_update)
-    return _launch.launch(plan, dry_run=dry_run, monitor=monitor, log_path=log_path)
+            log_path=log_path, on_update=composed)
+    try:
+        return _launch.launch(plan, dry_run=dry_run, monitor=monitor, log_path=log_path)
+    finally:
+        if pusher is not None:      # final push even if the run failed (the "8h lost" case)
+            pusher()
+
+
+def cache_push(out_root_or_toml: str | Path, repo_id: str, *, token: str | None = None,
+               include_dataset: bool = True, commit_message: str = "cache sync",
+               dry_run: bool = False) -> str:
+    """Push the frozen dataset+cache tree to an HF *dataset* repo (incremental). Accepts an
+    out_root DIR or a dataset/lora toml (resolves the common-ancestor out_root). The first push
+    freezes the dataset (include_dataset=True); later pushes only re-upload the growing cache."""
+    from . import cache_sync as _cs
+    p = Path(out_root_or_toml).expanduser()
+    folder = p if p.is_dir() else _cs.out_root_of(p)
+    if folder is None:
+        raise FileNotFoundError(f"could not resolve an out_root from {out_root_or_toml}")
+    return _cs.sync_up(folder, repo_id, token=token, include_dataset=include_dataset,
+                       commit_message=commit_message, dry_run=dry_run)
+
+
+def cache_pull(out_root: str | Path, repo_id: str, *, token: str | None = None,
+               dry_run: bool = False) -> str:
+    """Pull the frozen dataset+cache tree from HF into a FIXED local out_root (deterministic
+    absolute paths so the cache fingerprint matches on resume). Returns the local path."""
+    from . import cache_sync as _cs
+    return _cs.sync_down(out_root, repo_id, token=token, dry_run=dry_run)
 
 
 def train(config_toml: str | Path, *, repo_root: str | Path | None = None,

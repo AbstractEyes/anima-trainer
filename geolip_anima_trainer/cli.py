@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -158,6 +159,15 @@ def build_parser() -> argparse.ArgumentParser:
             t.add_argument("--progress-interval", type=float, default=30.0)
             t.add_argument("--log-path", default=None,
                            help="send diffusion-pipe output here so the progress line stays clean")
+            t.add_argument("--backup-repo", default=None,
+                           help="HF dataset repo to periodically push the cache to during the run")
+            t.add_argument("--backup-interval", type=float, default=1800.0,
+                           help="seconds between cache pushes (also pushes on each shard finalize)")
+            t.add_argument("--backup-root", default=None,
+                           help="tree to push from (before_after: the anima_subjects parent)")
+            t.add_argument("--backup-token", default=None, help="HF token (else $HF_TOKEN)")
+            t.add_argument("--trust-cache", action="store_true",
+                           help="load a restored cache's metadata without re-validating (resume)")
         else:
             t.add_argument("--pipeline-stages", type=int, default=None)
             t.add_argument("--resume", nargs="?", const=True, default=False,
@@ -173,6 +183,20 @@ def build_parser() -> argparse.ArgumentParser:
     ba.add_argument("--num-gpus", type=int, default=1)
     ba.add_argument("--gpu-ids", default=None)
     ba.add_argument("--dry-run", action="store_true")
+
+    # cache preservation on HF Hub (frozen dataset + accumulating cache)
+    cp = sub.add_parser("cache-push", help="push the frozen dataset+cache tree to an HF dataset repo")
+    cp.add_argument("--out", dest="out_root_or_toml", required=True, help="out_root dir OR a toml")
+    cp.add_argument("--repo-id", required=True)
+    cp.add_argument("--token", default=None, help="HF token (else $HF_TOKEN / cached login)")
+    cp.add_argument("--cache-only", action="store_true", help="push only cache/anima/** (no images)")
+    cp.add_argument("--dry-run", action="store_true")
+
+    cl = sub.add_parser("cache-pull", help="pull the frozen dataset+cache tree from an HF dataset repo")
+    cl.add_argument("--out", dest="out_root", required=True, help="FIXED local dir to restore into")
+    cl.add_argument("--repo-id", required=True)
+    cl.add_argument("--token", default=None, help="HF token (else $HF_TOKEN / cached login)")
+    cl.add_argument("--dry-run", action="store_true")
     return p
 
 
@@ -292,6 +316,11 @@ def main(argv: list[str] | None = None) -> int:
             kwargs["progress"] = args.progress
             kwargs["progress_interval"] = args.progress_interval
             kwargs["log_path"] = args.log_path
+            kwargs["backup_repo"] = args.backup_repo
+            kwargs["backup_interval"] = args.backup_interval
+            kwargs["backup_root"] = args.backup_root
+            kwargs["backup_token"] = args.backup_token or os.environ.get("HF_TOKEN")
+            kwargs["trust_cache"] = args.trust_cache
         else:
             kwargs["pipeline_stages"] = args.pipeline_stages
             kwargs["resume"] = args.resume
@@ -316,6 +345,18 @@ def main(argv: list[str] | None = None) -> int:
         except api.DiffusionPipeNotFound as e:
             print(str(e), file=sys.stderr)
             return 3
+        return 0
+
+    if args.cmd == "cache-push":
+        tok = args.token or os.environ.get("HF_TOKEN")
+        print("pushed ->", api.cache_push(args.out_root_or_toml, args.repo_id, token=tok,
+              include_dataset=not args.cache_only, dry_run=args.dry_run))
+        return 0
+
+    if args.cmd == "cache-pull":
+        tok = args.token or os.environ.get("HF_TOKEN")
+        print("pulled ->", api.cache_pull(args.out_root, args.repo_id, token=tok,
+              dry_run=args.dry_run))
         return 0
 
     return 1

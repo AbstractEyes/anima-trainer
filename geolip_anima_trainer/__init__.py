@@ -19,7 +19,8 @@ from .api import (  # noqa: F401
     DirectoryConfig, DiffusionPipeNotFound, DoctorReport, ExportConfig, ModelConfig,
     ModelPaths, OptimizerConfig, RunConfig, SubjectBucketConfig, TrainConfig,
     WindowsTrainingRefused, apply_overrides, build_dataset_toml, build_mode_tomls,
-    cache, doctor, download_models, export_dataset, export_subject_buckets,
+    cache, cache_pull, cache_push, doctor, download_models, export_dataset,
+    export_subject_buckets,
     inspect_source, load_dataset_config, load_train_config, multi_concept_preset,
     rebalance, render_dataset_toml, render_lora_toml, render_train_toml,
     single_concept_preset, sweep, train, train_before_after, validate, validate_bridge,
@@ -44,6 +45,6 @@ __all__ = [
     # operations
     "download_models", "inspect_source", "export_dataset", "export_subject_buckets",
     "build_dataset_toml", "build_mode_tomls",
-    "cache", "train", "train_before_after", "doctor", "DoctorReport",
-    "WindowsTrainingRefused", "DiffusionPipeNotFound",
+    "cache", "cache_push", "cache_pull", "train", "train_before_after", "doctor",
+    "DoctorReport", "WindowsTrainingRefused", "DiffusionPipeNotFound",
 ]

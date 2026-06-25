@@ -56,6 +56,7 @@ class LaunchPlan:
     gradient_accumulation_steps: int = 1
     cache_only: bool = False
     regenerate_cache: bool = False
+    trust_cache: bool = False                 # load restored metadata without re-validating (resume)
     resume_from_checkpoint: bool | str = False
     env: dict[str, str] = field(default_factory=dict)
     extra_args: tuple[str, ...] = ()
@@ -88,6 +89,8 @@ class LaunchPlan:
             cmd += ["--cache_only"]
         if self.regenerate_cache:
             cmd += ["--regenerate_cache"]
+        if self.trust_cache:
+            cmd += ["--trust_cache"]
         if self.resume_from_checkpoint is True:
             cmd += ["--resume_from_checkpoint"]
         elif isinstance(self.resume_from_checkpoint, str):
@@ -176,6 +179,7 @@ def build_plan(
     pipeline_stages: int | None = None,
     cache_only: bool = False,
     regenerate_cache: bool = False,
+    trust_cache: bool = False,
     resume_from_checkpoint: bool | str = False,
     expandable_segments: bool = True,
     extra_env: dict[str, str] | None = None,
@@ -228,7 +232,7 @@ def build_plan(
         pipeline_stages=stages, micro_batch_size_per_gpu=micro,
         gradient_accumulation_steps=grad_accum,
         cache_only=cache_only, regenerate_cache=regenerate_cache,
-        resume_from_checkpoint=resume_from_checkpoint,
+        trust_cache=trust_cache, resume_from_checkpoint=resume_from_checkpoint,
         env=env, extra_args=tuple(extra_args or ()),
     )
 

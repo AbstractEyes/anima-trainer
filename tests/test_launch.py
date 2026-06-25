@@ -82,6 +82,14 @@ def test_cache_only_and_resume_flags(tmp_path: Path):
     assert "--resume_from_checkpoint" in argv and "ckpt/epoch5" in argv
 
 
+def test_trust_cache_flag(tmp_path: Path):
+    root = _fake_pipe(tmp_path)
+    assert "--trust_cache" not in L.build_plan(config_toml=_lora(tmp_path), repo_root=root).argv()
+    plan = L.build_plan(config_toml=_lora(tmp_path), repo_root=root,
+                        cache_only=True, trust_cache=True)
+    assert "--trust_cache" in plan.argv()
+
+
 def test_topology_validation(tmp_path: Path):
     root = _fake_pipe(tmp_path)
     with pytest.raises(ValueError):  # 3 stages > 2 gpus
@@ -99,6 +107,16 @@ def test_dry_run_returns_plan(tmp_path: Path):
     root = _fake_pipe(tmp_path)
     plan = L.build_plan(config_toml=_lora(tmp_path), repo_root=root, num_gpus=1)
     assert L.launch(plan, dry_run=True) is plan  # works on any OS, no exec
+
+
+def test_api_cache_dry_run_has_trust_cache_and_pushes_nothing(tmp_path: Path, monkeypatch):
+    from geolip_anima_trainer import api, cache_sync
+    monkeypatch.setattr(cache_sync, "sync_up",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("pushed on dry-run!")))
+    root = _fake_pipe(tmp_path)
+    plan = api.cache(_lora(tmp_path), repo_root=root, dry_run=True, trust_cache=True,
+                     backup_repo="u/r")            # backup gated off by dry_run -> no push
+    assert "--cache_only" in plan.argv() and "--trust_cache" in plan.argv()
 
 
 def test_launch_creates_missing_log_parent(tmp_path: Path, monkeypatch):
