@@ -108,16 +108,19 @@ def sync_up(folder: str | Path, repo_id: str, *, token: str | None = None,
         return url
     from huggingface_hub import HfApi, create_repo
     create_repo(repo_id, token=token, repo_type="dataset", private=True, exist_ok=True)
-    api = HfApi(token=token)
-    if hasattr(api, "upload_large_folder"):     # HF's path for many files: batched + resumable
-        api.upload_large_folder(
-            repo_id=repo_id, folder_path=str(folder), repo_type="dataset",
-            allow_patterns=allow_patterns, ignore_patterns=ignore_patterns, print_report=False)
-    else:
-        api.upload_folder(
-            folder_path=str(folder), repo_id=repo_id, repo_type="dataset",
-            path_in_repo=path_in_repo, allow_patterns=allow_patterns,
-            ignore_patterns=ignore_patterns, commit_message=commit_message)
+    # Use upload_folder (single atomic commit), NOT upload_large_folder. The periodic push runs WHILE
+    # diffusion-pipe is appending to the active shard; upload_large_folder hashes/uploads in one batch
+    # then re-scans + commits in a LATER batch, so the grown shard's pointer no longer matches the
+    # uploaded object -> "LFS pointer pointed to a file that does not exist" -> infinite retry. It is
+    # documented for STATIC folders only. upload_folder hashes each shard ONCE and uploads exactly the
+    # hashed `size` bytes (SliceFileObj/read_limit in lfs.py), so a growing shard uploads a consistent
+    # prefix and the commit succeeds; the few-hundred-file count (after excluding *.arrow) is well
+    # within its limits. A rare metadata.db-rewrite race just raises -> the pusher logs it and the next
+    # push (or the final one) succeeds.
+    HfApi(token=token).upload_folder(
+        folder_path=str(folder), repo_id=repo_id, repo_type="dataset",
+        path_in_repo=path_in_repo, allow_patterns=allow_patterns,
+        ignore_patterns=ignore_patterns, commit_message=commit_message)
     return url
 
 

@@ -282,7 +282,11 @@ in `external/diffusion-pipe/utils/{cache,dataset}.py`):
   from the reconstructed images on resume (the dataset fingerprint is content-based) — so a push is a few
   hundred files, not ~30k. Cost: resume re-runs the dataset metadata pass (`trust_cache` can't skip it
   without the arrow); correctness is unaffected (the preserved latents still match). Push uses
-  `HfApi.upload_large_folder` (batched + resumable) when available, else `upload_folder`.
+  **`upload_folder`** (one atomic commit; LFS uploads exactly each shard's hashed `size` bytes via
+  `SliceFileObj`, so a **growing** active shard uploads a consistent prefix). **Do NOT use
+  `upload_large_folder`** here — it hashes/uploads then re-scans + commits in a later batch, so the
+  live-written active shard's pointer no longer matches the uploaded object → `LFS pointer pointed to a
+  file that does not exist` → infinite retry (it's documented for STATIC folders only).
   `subject_buckets.reconstruct_from_index` (≈`api.reconstruct_dataset`,
   called by `cache_pull`) groups index ids by shard, concurrently refetches only the used shards,
   writes raw bytes byte-identically + `.txt` from the index → a **byte-identical tree** → same

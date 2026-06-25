@@ -413,7 +413,7 @@ anima train-before-after --lora-vlm configs/lora_vlm.toml \
   <https://huggingface.co/nomic-ai/nomic-embed-text-v1>
 - scikit-learn `AgglomerativeClustering` (average-linkage over cosine distance) —
   <https://scikit-learn.org/stable/modules/generated/sklearn.cluster.AgglomerativeClustering.html>
-- `huggingface_hub` (datasets, `snapshot_download`, `upload_large_folder`) —
+- `huggingface_hub` (dataset repos, `snapshot_download`, `upload_folder`) —
   <https://github.com/huggingface/huggingface_hub>
 - Hugging Face `datasets` (the columnar/Arrow substrate the better methodology builds on) —
   <https://github.com/huggingface/datasets>

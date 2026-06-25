@@ -69,10 +69,6 @@ def test_round_trip_byte_identity(tmp_path: Path, monkeypatch):
     class FakeApi:
         def __init__(self, token=None):
             pass
-        def upload_large_folder(self, *, repo_id, folder_path, repo_type,
-                                allow_patterns=None, ignore_patterns=None, print_report=True):
-            remote.mkdir(exist_ok=True)
-            shutil.copytree(folder_path, remote, dirs_exist_ok=True)
         def upload_folder(self, *, folder_path, repo_id, repo_type, path_in_repo=".",
                           allow_patterns=None, ignore_patterns=None, commit_message=None):
             remote.mkdir(exist_ok=True)
@@ -104,8 +100,8 @@ def test_sync_up_excludes_images_and_txt(tmp_path: Path, monkeypatch):
     class FakeApi:
         def __init__(self, token=None):
             pass
-        def upload_large_folder(self, *, repo_id, folder_path, repo_type,
-                                allow_patterns=None, ignore_patterns=None, print_report=True):
+        def upload_folder(self, *, folder_path, repo_id, repo_type, path_in_repo=".",
+                          allow_patterns=None, ignore_patterns=None, commit_message=None):
             captured["allow"], captured["ignore"] = allow_patterns, ignore_patterns
 
     monkeypatch.setattr(hf, "create_repo", lambda *a, **k: None)
