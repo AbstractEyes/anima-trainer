@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import enum
 import fnmatch
+import hashlib
 import json
 import logging
 import math
@@ -38,6 +39,8 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher, get_close_matches
 from pathlib import Path
 from typing import Callable
+
+INDEX_NAME = "index.jsonl"   # the per-image reconstruct index, written to <out_root>/
 
 
 class CaptionMode(enum.Enum):
@@ -682,6 +685,8 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
                ["id", "audit", "age_classifier_pass"]
     keep: dict = {}                 # idslug -> (vlm_caption, anime_caption|None)
     records_of: dict = {}           # idslug -> ImageRecord
+    id_of: dict = {}                # idslug -> original (un-slugged) source id   (for the reconstruct index)
+    shard_of: dict = {}             # idslug -> source shard repo-path            (so rebuild fetches only used shards)
     cap_stats: Counter = Counter()
     used_local: list[str] = []
     scanned = n_accept = next_mark = 0
@@ -727,6 +732,8 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
                     idslug = slug(ids[i])
                     keep[idslug] = (vlm, anime)
                     records_of[idslug] = rec
+                    id_of[idslug] = ids[i]          # raw id (slug is lossy) — needed to refetch from source
+                    shard_of[idslug] = shard        # repo-path (not the local cache path)
                     cap_stats["accepted"] += 1
                     n_accept += 1
                     if cfg.limit and n_accept >= cfg.limit:
@@ -796,6 +803,8 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
     # ---- PASS 2: write ONLY kept images, routed per caption mode ----
     bucket_counts: Counter = Counter()
     captions_accum: dict = defaultdict(dict)     # mixed bucket dir -> {filename: [caps]}
+    ext_of: dict = {}                            # idslug -> sniffed image ext   (for the reconstruct index)
+    sha_of: dict = {}                            # idslug -> sha256(raw bytes)   (drift detection on rebuild)
     remaining = set(final)
     n_total = len(final)
     written = 0
@@ -819,6 +828,8 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
                 if raw is None:
                     cap_stats["no_image"] += 1
                     continue
+                ext_of[idslug] = ext
+                sha_of[idslug] = hashlib.sha256(raw).hexdigest()
                 written += 1
                 if cfg.progress_every and written >= next_w:
                     print(f"[subjects] wrote {written}/{n_total} images", flush=True)
@@ -852,9 +863,41 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
         (Path(bdir_str) / "captions.json").write_text(
             json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
 
+    # ---- INDEX: per-image facts to rebuild the EXACT tree from source (no images on HF) ----
+    # Pins the non-deterministic bucket assignment + the verbatim captions, keyed by the raw source
+    # id (slug is lossy) and its shard, so reconstruct_from_index() refetches the image columnar-ally
+    # and reproduces a byte-identical tree -> the diffusion-pipe cache fingerprint still matches.
+    index_path = out_root / INDEX_NAME
+    with index_path.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "_index_meta": 1, "version": 1,
+            "repo": cfg.repo, "config": cfg.config, "split": cfg.split,
+            "caption_mode": cfg.caption_mode.value, "out_root": str(out_root),
+            "shards": sorted({shard_of[s] for s in ext_of if s in shard_of}),
+            "n_records": len(ext_of),
+        }, ensure_ascii=False) + "\n")
+        for idslug, ext in ext_of.items():
+            spec = final.get(idslug)
+            if spec is None:
+                continue
+            rec = {"id": id_of.get(idslug), "slug": idslug, "shard": shard_of.get(idslug),
+                   "ext": ext, "sha256": sha_of.get(idslug)}
+            if mixed:
+                rec["mixed_bucket"] = spec["vlm"]
+                rec["mixed_caps"] = spec["mixed_caps"]
+            else:
+                rec["vlm_bucket"] = spec["vlm"]
+                rec["vlm_cap"] = spec["vlm_cap"]
+                if "anime" in spec:
+                    rec["anime_bucket"] = spec["anime"]
+                    rec["anime_cap"] = spec["anime_cap"]
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(f"[subjects] wrote index of {len(ext_of)} images -> {index_path}", flush=True)
+
     return {
         "out_root": str(out_root),
         "caption_mode": cfg.caption_mode.value,
+        "index_path": str(index_path),
         "shards_used": len(used_local),
         "scanned": scanned,
         "accepted_images": len(keep),
@@ -867,6 +910,129 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
         "oversized_subjects": oversized,
         "merge_actions": plan.actions,
     }
+
+
+def reconstruct_from_index(out_root: str | Path, *, token: str | None = None,
+                           download_workers: int = 8, batch_size: int = 512,
+                           only_missing: bool = True, verify_sha: bool = False) -> dict:
+    """Rebuild the EXACT extracted tree from `<out_root>/index.jsonl` by columnar-refetching images
+    from the SOURCE parquet (images are NOT stored on HF — they already exist there, by row id).
+    Writes raw bytes byte-identically + the `.txt` sidecars from the index, so the diffusion-pipe
+    cache fingerprint matches and the accumulated cache resumes. `only_missing=True` skips images
+    already on disk (a cheap re-pull). Missing source rows are logged, never fatal."""
+    import pyarrow.parquet as pq
+    from huggingface_hub import hf_hub_download
+
+    out_root = Path(out_root).expanduser().resolve()
+    index_path = out_root / INDEX_NAME
+    if not index_path.is_file():
+        raise FileNotFoundError(f"no reconstruct index at {index_path}")
+
+    header, records = None, []
+    with index_path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            if obj.get("_index_meta"):
+                header = obj
+            else:
+                records.append(obj)
+    seen: set = set()                               # de-dup by slug (last-writer-wins, matches extraction)
+    records = [r for r in records if not (r["slug"] in seen or seen.add(r["slug"]))]
+    if header is None:
+        raise ValueError(f"index missing its _index_meta header: {index_path}")
+    if Path(header["out_root"]).resolve() != out_root:
+        raise ValueError(
+            f"index out_root {header['out_root']} != restore dir {out_root}: the cache fingerprint "
+            f"embeds ABSOLUTE paths — restore to the SAME path or the cache will be wiped.")
+    repo = header["repo"]
+    mixed = header.get("caption_mode") == CaptionMode.MIXED.value
+
+    def _present(r):
+        bucket = r.get("mixed_bucket") if mixed else r.get("vlm_bucket")
+        tree = "mixed" if mixed else "vlm"
+        return bucket and (out_root / tree / bucket / f"{r['slug']}{r['ext']}").exists()
+
+    need = [r for r in records if not (only_missing and _present(r))]
+    by_shard: dict = defaultdict(dict)              # shard repo-path -> {original_id: record}
+    for r in need:
+        by_shard[r["shard"]][r["id"]] = r
+    print(f"[reconstruct] {len(need)}/{len(records)} images to fetch from {len(by_shard)} shard(s)",
+          flush=True)
+
+    captions_accum: dict = defaultdict(dict)
+    stats = {"reconstructed": 0, "skipped_present": len(records) - len(need),
+             "missing_from_source": 0, "shards_fetched": 0, "sha_mismatch": 0}
+
+    shard_names = list(by_shard)
+    from concurrent.futures import ThreadPoolExecutor
+    workers = max(1, download_workers)
+    ex = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    futs = ([ex.submit(hf_hub_download, repo, s, repo_type="dataset", token=token)
+             for s in shard_names] if ex else None)
+    try:
+        for si, shard in enumerate(shard_names):
+            local = (futs[si].result() if futs
+                     else hf_hub_download(repo, shard, repo_type="dataset", token=token))
+            stats["shards_fetched"] += 1
+            wanted = by_shard[shard]
+            print(f"[reconstruct] shard {si + 1}/{len(shard_names)} · reconstructed "
+                  f"{stats['reconstructed']}", flush=True)
+            pf = pq.ParquetFile(local)
+            for batch in pf.iter_batches(batch_size=batch_size, columns=["image", "id"]):
+                if not wanted:
+                    break
+                dd = batch.to_pydict()
+                for j in range(len(dd["id"])):
+                    r = wanted.pop(dd["id"][j], None)
+                    if r is None:
+                        continue
+                    ext, raw = _img_bytes(dd["image"][j])
+                    if raw is None:
+                        stats["missing_from_source"] += 1
+                        continue
+                    if verify_sha and r.get("sha256") and hashlib.sha256(raw).hexdigest() != r["sha256"]:
+                        stats["sha_mismatch"] += 1
+                        log.warning("sha mismatch for id %r (source re-encoded?)", dd["id"][j])
+                    ext = r.get("ext") or ext               # stored ext -> stable path
+                    s = r["slug"]
+                    if mixed:
+                        bdir = out_root / "mixed" / r["mixed_bucket"]
+                        bdir.mkdir(parents=True, exist_ok=True)
+                        img = bdir / f"{s}{ext}"
+                        if img.exists():
+                            img.unlink()
+                        img.write_bytes(raw)
+                        captions_accum[str(bdir)][f"{s}{ext}"] = r["mixed_caps"]
+                    else:
+                        vb = out_root / "vlm" / r["vlm_bucket"]
+                        vb.mkdir(parents=True, exist_ok=True)
+                        primary = vb / f"{s}{ext}"
+                        if primary.exists():
+                            primary.unlink()
+                        primary.write_bytes(raw)
+                        (vb / f"{s}.txt").write_text(r["vlm_cap"], encoding="utf-8")
+                        if r.get("anime_bucket"):
+                            ab = out_root / "animetimm" / r["anime_bucket"]
+                            ab.mkdir(parents=True, exist_ok=True)
+                            _link_or_copy(primary, ab / f"{s}{ext}")
+                            (ab / f"{s}.txt").write_text(r["anime_cap"], encoding="utf-8")
+                    stats["reconstructed"] += 1
+            for rid in wanted:                              # ids absent from their shard (e.g. takedown)
+                stats["missing_from_source"] += 1
+                log.warning("id %r in index but absent from source shard %s", rid, shard)
+    finally:
+        if ex is not None:
+            ex.shutdown(wait=True, cancel_futures=True)
+
+    for bdir_str, mapping in captions_accum.items():
+        (Path(bdir_str) / "captions.json").write_text(
+            json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
+    print(f"[reconstruct] done · reconstructed {stats['reconstructed']} · "
+          f"skipped {stats['skipped_present']} · missing {stats['missing_from_source']}", flush=True)
+    return {"out_root": str(out_root), **stats}
 
 
 def build_mode_tomls(out_root: str | Path, cfg: SubjectBucketConfig, *,

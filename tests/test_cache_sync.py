@@ -93,6 +93,30 @@ def test_round_trip_byte_identity(tmp_path: Path, monkeypatch):
     assert "fp-xyz" in set(cs.read_cache_fingerprints([dst]).values())
 
 
+def test_sync_up_excludes_images_and_txt(tmp_path: Path, monkeypatch):
+    import huggingface_hub as hf
+    captured = {}
+
+    class FakeApi:
+        def __init__(self, token=None):
+            pass
+        def upload_folder(self, *, folder_path, repo_id, repo_type, path_in_repo=".",
+                          allow_patterns=None, ignore_patterns=None, commit_message=None):
+            captured["allow"], captured["ignore"] = allow_patterns, ignore_patterns
+
+    monkeypatch.setattr(hf, "create_repo", lambda *a, **k: None)
+    monkeypatch.setattr(hf, "HfApi", FakeApi)
+
+    cs.sync_up(tmp_path, "u/r", include_dataset=True)          # freeze: everything EXCEPT images/txt
+    assert "**/*.txt" in captured["ignore"]
+    assert any("png" in p for p in captured["ignore"]) and any("webp" in p for p in captured["ignore"])
+
+    cs.sync_up(tmp_path, "u/r", include_dataset=False)         # periodic: cache + index + tomls
+    assert "index.jsonl" in captured["allow"]
+    assert any("cache/anima" in p for p in captured["allow"])
+    assert "**/*.txt" in captured["ignore"]                    # never the images/captions on disk
+
+
 def test_periodic_pusher_triggers(tmp_path: Path):
     calls = []
     user_seen = []

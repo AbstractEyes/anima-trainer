@@ -269,23 +269,33 @@ in `external/diffusion-pipe/utils/{cache,dataset}.py`):
 - **The latent fingerprint** (one `fingerprint(value)` row per leaf `metadata.db`, `cache.py:45-56`)
   embeds **absolute image paths**; on mismatch the cache is **`clear()`ed** (`:50-52`, logs `[CACHE]
   Fingerprint changed`). ⇒ resume needs the dataset restored to an **identical absolute `DATA_ROOT`**
-  with byte-identical files. So we **freeze the dataset** (ship it with the cache; re-extraction could
-  re-cluster buckets → new fingerprint → wipe) and **pin `DATA_ROOT`**. `--trust_cache` (now passed
-  through `launch.py` → `argv()`; was missing) loads the restored `metadata/*.arrow` without
-  re-validation but does **not** bypass this check.
-- **Periodic push** rides `cache_monitor`'s `on_update` hook (`cache_sync.make_periodic_pusher`):
-  pushes the **cache subtree only** (frozen images uploaded once via `cache_push(include_dataset=True)`)
-  on each committed-record bump (a finalize = a new restorable checkpoint) or every `backup_interval`
-  (1800 s), **plus a guaranteed final push even if the run crashes** (the "8 h lost" case, now
-  recoverable). A failed push is logged, never kills the run. For `before_after` pass
-  `backup_root=SUBJECTS_ROOT` (the parent of vlm/+animetimm/) so periodic pushes match the freeze
-  layout — `out_root_of(one toml)` only yields that tree's root.
-- **Workflow:** session 1 = extract → `cache_push` (freeze) → `cache --backup-repo …` (periodic);
-  session N = `cache_pull` (restore dataset+partial cache) → `cache --trust-cache --backup-repo …`
-  (resume + keep pushing). `upload_folder` is incremental (only new shards re-upload). ⚠️ DATA_ROOT
-  drift is the #1 footgun. The notebook `anima_full90k_train.ipynb` §6/§8 implement the first-vs-resume
-  branch. **2× cost stands** under `before_after` (latents cached per tree over hardlinked pixels);
-  MIXED mode would halve it but changes the validated recipe — not done.
+  with byte-identical files. `--trust_cache` (now passed through `launch.py` → `argv()`; was missing)
+  loads the restored `metadata/*.arrow` without re-validation but does **not** bypass this check.
+- **DON'T store images on HF — store cache + an INDEX, refetch images from source.** Images already
+  exist in the source parquet (columnar by `id`) and are the cheap part to rebuild. So
+  `export_subject_buckets` writes `<out_root>/index.jsonl` (header + per image: raw `id`, source
+  `shard`, `ext`, `sha256`, the **pinned bucket placement**, and **verbatim captions**). `cache_sync`
+  **never uploads images or `.txt`** (`IMAGE_GLOB`+`**/*.txt` in `_DEFAULT_IGNORE`); it pushes
+  `cache/anima/**` + `index.jsonl`. `subject_buckets.reconstruct_from_index` (≈`api.reconstruct_dataset`,
+  called by `cache_pull`) groups index ids by shard, concurrently refetches only the used shards,
+  writes raw bytes byte-identically + `.txt` from the index → a **byte-identical tree** → same
+  fingerprint. **Verified offline** (`tests/test_reconstruct.py`: extract → wipe images+txt → rebuild →
+  assert byte-identical). The fingerprint depends only on path + caption text + decoded (w,h) — NOT raw
+  pixels — and the index pins the only non-deterministic step (bucket assignment). `only_missing=True`
+  makes a re-pull a no-op; missing source rows (takedowns) are logged, never fatal; a relocated
+  `out_root` hard-errors (loud, not a silent wipe).
+- **Periodic push** rides `cache_monitor`'s `on_update` hook (`cache_sync.make_periodic_pusher`): pushes
+  the **cache + index** (`include_dataset=False`, `CACHE_ONLY_GLOB`) on each committed-record bump (a
+  finalize = a new restorable checkpoint) or every `backup_interval` (1800 s), **plus a guaranteed final
+  push even if the run crashes** (the "8 h lost" case, now recoverable). A failed push is logged, never
+  kills the run. For `before_after` pass `backup_root=SUBJECTS_ROOT` (the parent of vlm/+animetimm/) so
+  pushes share one repo root — `out_root_of(one toml)` only yields that tree's root.
+- **Workflow:** session 1 = extract (writes index) → `cache_push` (store index) → `cache --backup-repo …`
+  (periodic cache+index push); session N = `cache_pull` (download cache+index → rebuild images from
+  source) → `cache --trust-cache --backup-repo …` (resume + keep pushing). `upload_folder` is
+  incremental. ⚠️ DATA_ROOT drift is the #1 footgun. The notebook `anima_full90k_train.ipynb` §6/§8
+  implement the first-vs-resume branch. **2× cache cost stands** under `before_after` (latents cached
+  per tree over hardlinked pixels); MIXED mode would halve it but changes the validated recipe — not done.
 
 ### Backend tiers (optional `[similarity]` extra)
 `make_sim_fn` picks best-available, logs the tier: **sentence-transformers**

@@ -56,7 +56,7 @@ __all__ = [
     # operations
     "download_models", "inspect_source", "export_dataset", "export_subject_buckets",
     "build_dataset_toml", "build_mode_tomls", "cache", "cache_push", "cache_pull",
-    "train", "train_before_after",
+    "reconstruct_dataset", "train", "train_before_after",
     "doctor", "DoctorReport", "WindowsTrainingRefused", "DiffusionPipeNotFound",
 ]
 
@@ -203,9 +203,11 @@ def cache(config_toml: str | Path, *, repo_root: str | Path | None = None,
 def cache_push(out_root_or_toml: str | Path, repo_id: str, *, token: str | None = None,
                include_dataset: bool = True, commit_message: str = "cache sync",
                dry_run: bool = False) -> str:
-    """Push the frozen dataset+cache tree to an HF *dataset* repo (incremental). Accepts an
-    out_root DIR or a dataset/lora toml (resolves the common-ancestor out_root). The first push
-    freezes the dataset (include_dataset=True); later pushes only re-upload the growing cache."""
+    """Push the cache + reconstruct index to an HF *dataset* repo (incremental). Accepts an out_root
+    DIR or a dataset/lora toml (resolves the common-ancestor out_root). **Images and .txt are NEVER
+    uploaded** — only `cache/anima/**` + `index.jsonl` (which carries the captions + bucket placement
+    + source id/shard) so a fresh box rebuilds the images by columnar-refetching from the source
+    parquet (cache_pull does this). Saves ~the entire image footprint on HF."""
     from . import cache_sync as _cs
     p = Path(out_root_or_toml).expanduser()
     folder = p if p.is_dir() else _cs.out_root_of(p)
@@ -216,11 +218,24 @@ def cache_push(out_root_or_toml: str | Path, repo_id: str, *, token: str | None 
 
 
 def cache_pull(out_root: str | Path, repo_id: str, *, token: str | None = None,
-               dry_run: bool = False) -> str:
-    """Pull the frozen dataset+cache tree from HF into a FIXED local out_root (deterministic
-    absolute paths so the cache fingerprint matches on resume). Returns the local path."""
+               reconstruct: bool = True, dry_run: bool = False) -> str:
+    """Pull the cache + reconstruct INDEX from HF into a FIXED local out_root, then (reconstruct=True)
+    rebuild the images byte-identically by columnar-refetching from the SOURCE parquet — the images
+    are NOT stored on HF (they already exist there by id). Restore to the SAME absolute out_root every
+    session: the cache fingerprint embeds absolute paths. Returns the local path."""
     from . import cache_sync as _cs
-    return _cs.sync_down(out_root, repo_id, token=token, dry_run=dry_run)
+    local = _cs.sync_down(out_root, repo_id, token=token, dry_run=dry_run)
+    if not dry_run and reconstruct and (Path(out_root).expanduser() / _subjects.INDEX_NAME).exists():
+        _subjects.reconstruct_from_index(out_root, token=token)
+    return local
+
+
+def reconstruct_dataset(out_root: str | Path, *, token: str | None = None,
+                        only_missing: bool = True, verify_sha: bool = False) -> dict:
+    """Rebuild the extracted image tree from `<out_root>/index.jsonl` by columnar-refetching from the
+    source parquet (no images stored on HF). Used by cache_pull; also callable standalone."""
+    return _subjects.reconstruct_from_index(out_root, token=token, only_missing=only_missing,
+                                            verify_sha=verify_sha)
 
 
 def train(config_toml: str | Path, *, repo_root: str | Path | None = None,

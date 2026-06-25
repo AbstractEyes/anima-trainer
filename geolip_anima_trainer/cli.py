@@ -192,10 +192,12 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--cache-only", action="store_true", help="push only cache/anima/** (no images)")
     cp.add_argument("--dry-run", action="store_true")
 
-    cl = sub.add_parser("cache-pull", help="pull the frozen dataset+cache tree from an HF dataset repo")
+    cl = sub.add_parser("cache-pull", help="pull cache+index from HF, then rebuild images from source")
     cl.add_argument("--out", dest="out_root", required=True, help="FIXED local dir to restore into")
     cl.add_argument("--repo-id", required=True)
     cl.add_argument("--token", default=None, help="HF token (else $HF_TOKEN / cached login)")
+    cl.add_argument("--no-reconstruct", action="store_true",
+                    help="download cache+index only; do NOT rebuild images from the source parquet")
     cl.add_argument("--dry-run", action="store_true")
     return p
 
@@ -356,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "cache-pull":
         tok = args.token or os.environ.get("HF_TOKEN")
         print("pulled ->", api.cache_pull(args.out_root, args.repo_id, token=tok,
-              dry_run=args.dry_run))
+              reconstruct=not args.no_reconstruct, dry_run=args.dry_run))
         return 0
 
     return 1
