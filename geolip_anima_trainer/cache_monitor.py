@@ -68,9 +68,13 @@ def cache_bytes(cache_roots: list[Path]) -> int:
 
 
 def count_done(cache_roots: list[Path],
-               kinds: tuple[str, ...] = ("latents_", "text_embeddings_")) -> dict[str, int]:
-    """Sum item rows across every Cache metadata.db, bucketed by kind (the parent
-    dir name starts with 'latents_' / 'text_embeddings_')."""
+               kinds: tuple[str, ...] = ("latents", "text_embeddings")) -> dict[str, int]:
+    """Sum item rows across every Cache metadata.db, bucketed by kind. The leaf cache dir is
+    diffusion-pipe's `cache_file_prefix.strip('_')` (dataset.py:89), i.e. **`latents`** and
+    **`text_embeddings_<i>`** — NO trailing underscore. Matching the old `latents_`/
+    `text_embeddings_` prefixes left `latents` (which has no trailing `_`) unmatched, so the
+    latents count was stuck at 0 forever while text (`text_embeddings_1`) still matched. Match
+    the stripped names: 'latents' and 'text_embeddings' (covers text_embeddings_1/_2/...)."""
     totals = {k: 0 for k in kinds}
     for root in cache_roots:
         for db in glob.glob(str(Path(root) / "**" / "metadata.db"), recursive=True):
@@ -239,7 +243,7 @@ def make_monitor(*, cache_roots: list[Path], dataset_dirs: list[Path],
         byte_rate.update(now, nbytes)
         mbps = byte_rate.rate() / 1e6
         d = count_done(cache_roots)
-        dl, dt = d.get("latents_", 0), d.get("text_embeddings_", 0)
+        dl, dt = d.get("latents", 0), d.get("text_embeddings", 0)
         if nbytes == 0 and dl == 0 and dt == 0:
             tail = last_log_line(log_path)
             phase = tail if tail else "loading VAE + Qwen-3 0.6B and building the dataset"

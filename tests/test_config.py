@@ -80,6 +80,27 @@ def test_compile_and_ckpt_round_trip(tmp_path: Path):
     assert loaded.run.activation_checkpointing is True
 
 
+def test_save_every_n_steps_round_trip(tmp_path: Path):
+    # long-epoch runs need step-based saving; omitted by default, emitted (+ loads back) when set
+    cfg = C.single_concept_preset("data/c", output_dir="runs/x", model=_model())
+    def _keys(toml_text):
+        return [l.strip().split("=")[0].strip() for l in toml_text.splitlines()
+                if "=" in l and not l.strip().startswith("#")]
+
+    base = C.render_train_toml(cfg, tmp_path / "a")[0].read_text(encoding="utf-8")
+    assert "save_every_n_steps" not in _keys(base)          # omitted by default (key, not the tmp-path substring)
+    cfg.run.save_every_n_steps = 2500
+    cfg.run.gradient_accumulation_steps = 4
+    lora_path, ds_path = C.render_train_toml(cfg, tmp_path / "b")
+    text = lora_path.read_text(encoding="utf-8")
+    keys = _keys(text)
+    assert "save_every_n_steps" in keys and "save_every_n_epochs" in keys  # epochs still emitted (assert holds)
+    assert "save_every_n_steps = 2500" in text
+    loaded = C.load_train_config(lora_path, ds_path)
+    assert loaded.run.save_every_n_steps == 2500
+    assert loaded.run.gradient_accumulation_steps == 4
+
+
 def test_sweep_emits_grid(tmp_path: Path):
     base = C.single_concept_preset("data/concept", output_dir="runs/x", model=_model())
     out = list(C.sweep(base, ranks=[32, 64], lrs=[1e-5, 2e-5],

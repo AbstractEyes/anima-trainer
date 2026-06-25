@@ -88,6 +88,10 @@ class RunConfig:
     eval_micro_batch_size_per_gpu: int = 4
     eval_gradient_accumulation_steps: int = 1
     save_every_n_epochs: int = 5
+    # Step-based model saving — for long epochs (e.g. the full 90k run at ~18 h/epoch, where
+    # save_every_n_epochs is far too coarse). None -> omit (diffusion-pipe needs at least ONE of
+    # save_every_n_{epochs,steps,examples}, train.py:95; we always emit epochs so the assert holds).
+    save_every_n_steps: int | None = None
     checkpoint_every_n_minutes: int = 30
     save_dtype: str = "bfloat16"
     # activation_checkpointing is a VRAM<->speed TRADE, not a free win. OFF keeps all 28 DiT
@@ -307,6 +311,8 @@ def render_lora_toml(cfg: TrainConfig) -> str:
                  "activation_checkpointing", "compile", "partition_method",
                  "caching_batch_size", "steps_per_print", "blocks_to_swap"):
         lines.append(f"{name} = {_toml_scalar(getattr(r, name))}")
+    if r.save_every_n_steps is not None:   # step-based saving (omitted -> epoch-based only)
+        lines.append(f"save_every_n_steps = {r.save_every_n_steps}")
     if r.map_num_proc is not None:    # decode-worker pool (omitted -> diffusion-pipe default)
         lines.append(f"map_num_proc = {r.map_num_proc}")
 

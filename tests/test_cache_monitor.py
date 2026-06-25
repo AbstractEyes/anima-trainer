@@ -16,11 +16,14 @@ def _make_db(path, n):
 
 
 def test_db_count_and_count_done(tmp_path):
+    # the REAL leaf dirs are 'latents' and 'text_embeddings_<i>' (diffusion-pipe strips the
+    # trailing '_' via cache_file_prefix.strip('_')) — counting must match those, not 'latents_'.
     root = tmp_path / "img" / "cache" / "anima"
-    _make_db(root / "ar_1024x1024" / "latents_" / "metadata.db", 12)
-    _make_db(root / "ar_1024x1024" / "text_embeddings_1_" / "metadata.db", 9)
+    _make_db(root / "cache_1024x1024" / "latents" / "metadata.db", 12)
+    _make_db(root / "cache_1024x1024" / "text_embeddings_1" / "metadata.db", 9)
+    _make_db(root / "cache_1024x1024" / "text_embeddings_2" / "metadata.db", 3)  # 2nd encoder sums in
     done = cm.count_done([root])
-    assert done["latents_"] == 12 and done["text_embeddings_"] == 9
+    assert done["latents"] == 12 and done["text_embeddings"] == 12
     # missing db -> 0, never raises
     assert cm._db_count(str(tmp_path / "nope.db")) == 0
 
