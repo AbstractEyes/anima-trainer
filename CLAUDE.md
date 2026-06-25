@@ -275,8 +275,15 @@ in `external/diffusion-pipe/utils/{cache,dataset}.py`):
   exist in the source parquet (columnar by `id`) and are the cheap part to rebuild. So
   `export_subject_buckets` writes `<out_root>/index.jsonl` (header + per image: raw `id`, source
   `shard`, `ext`, `sha256`, the **pinned bucket placement**, and **verbatim captions**). `cache_sync`
-  **never uploads images or `.txt`** (`IMAGE_GLOB`+`**/*.txt` in `_DEFAULT_IGNORE`); it pushes
-  `cache/anima/**` + `index.jsonl`. `subject_buckets.reconstruct_from_index` (≈`api.reconstruct_dataset`,
+  uploads **only the expensive, non-regenerable cache** — the latent/text `metadata.db` + `shard_*.bin`
+  (`CACHE_ONLY_GLOB`) + `index.jsonl` — and **excludes** images, `.txt`, SQLite `-journal`/`-wal`/`-shm`
+  (they vanish mid-upload → "not a file"), and the HF-datasets **`*.arrow` metadata** (`_DEFAULT_IGNORE`).
+  The `*.arrow` is **tens of thousands of tiny files HF throttles** and it **regenerates deterministically**
+  from the reconstructed images on resume (the dataset fingerprint is content-based) — so a push is a few
+  hundred files, not ~30k. Cost: resume re-runs the dataset metadata pass (`trust_cache` can't skip it
+  without the arrow); correctness is unaffected (the preserved latents still match). Push uses
+  `HfApi.upload_large_folder` (batched + resumable) when available, else `upload_folder`.
+  `subject_buckets.reconstruct_from_index` (≈`api.reconstruct_dataset`,
   called by `cache_pull`) groups index ids by shard, concurrently refetches only the used shards,
   writes raw bytes byte-identically + `.txt` from the index → a **byte-identical tree** → same
   fingerprint. **Verified offline** (`tests/test_reconstruct.py`: extract → wipe images+txt → rebuild →
