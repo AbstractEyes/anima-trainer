@@ -33,7 +33,7 @@ similarity = ["sentence-transformers>=2.7,<4"]
 anima = "geolip_anima_trainer.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/AbstractPhil/anima-trainer"
+Homepage = "https://github.com/AbstractEyes/anima-trainer"
 
 [tool.setuptools]
 packages = ["geolip_anima_trainer"]

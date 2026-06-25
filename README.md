@@ -121,6 +121,10 @@ templates into `./configs` to edit.
 
 ## Subject buckets (recommended for `diffusion-pretrain-set-ft1`)
 
+> 📄 **Deep dive:** [`docs/subject-bucketing.md`](docs/subject-bucketing.md) — the full write-up of the
+> paradigm: what worked, what didn't, the diffusion-pipe internals, and a proposed HF-Hub-native
+> dataset architecture that removes most of the directory-tree friction.
+
 This dataset's captions are `task_1` JSON (`{"subjects":[...],"actions":[...],"setting":...}`)
 meant to be trained **verbatim**, and its README warns that subject association must NOT be
 learned via a cross-subject shuffle. So `anima subjects` does a **columnar** pyarrow read,
