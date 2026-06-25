@@ -75,6 +75,8 @@ class SubjectBucketConfig:
     out_root: str = "datasets/anima_subjects"
     limit: int | None = 1000              # total accepted images (the first test ~1000)
     batch_size: int = 512                 # columnar record-batch size (local read)
+    download_workers: int = 8             # concurrent shard downloads (full run = 100 GB; 1 = sequential)
+    progress_every: int = 20000           # log scanned/written progress every N images (0 = quiet)
 
     # caption columns, IN PRIORITY ORDER (vlm first, animetimm second if real).
     caption_columns: tuple = ("caption_vlm_json", "caption_animetimm_json")
@@ -501,7 +503,12 @@ def _cluster_side(side: list, S, idx: dict, threshold: float) -> list:
     try:
         import numpy as np
         from sklearn.cluster import AgglomerativeClustering
-        sub = np.array([[float(S[idx[a], idx[b]]) for b in side] for a in side], "float32")
+        # Vectorized submatrix extract — a single fancy-index, NOT an O(M^2) Python double
+        # loop of numpy scalar lookups (that loop was fine at M~hundreds for the 1k run but
+        # is tens of millions of slow scalar ops at 90k scale, the main "sub bucketing is
+        # very slow" culprit).
+        sidx = np.fromiter((idx[s] for s in side), dtype=np.intp, count=len(side))
+        sub = np.asarray(S, dtype="float32")[np.ix_(sidx, sidx)]
         dist = np.clip(1.0 - sub, 0.0, 2.0)
         np.fill_diagonal(dist, 0.0)
         labels = AgglomerativeClustering(
@@ -677,45 +684,63 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
     records_of: dict = {}           # idslug -> ImageRecord
     cap_stats: Counter = Counter()
     used_local: list[str] = []
-    scanned = n_accept = 0
+    scanned = n_accept = next_mark = 0
     done = False
-    for shard in shards:
-        local = hf_hub_download(cfg.repo, shard, repo_type="dataset")
-        used_local.append(local)
-        pf = pq.ParquetFile(local)
-        for batch in pf.iter_batches(batch_size=cfg.batch_size, columns=cap_cols):
-            d = batch.to_pydict()
-            ids, vlms = d["id"], d[vlm_col]
-            animes = d[anime_col] if anime_col else [None] * len(ids)
-            audits, ages = d["audit"], d["age_classifier_pass"]
-            for i in range(len(ids)):
-                scanned += 1
-                if not _passes(audits[i], ages[i], cfg):
-                    continue
-                vlm = real_caption(vlms[i])
-                if vlm is None:
-                    cap_stats["no_vlm"] += 1
-                    continue
-                anime = real_caption(animes[i]) if anime_col else None
-                rec = extract_features(vlm, anime, prefer=cfg.prefer_attr_source,
-                                       head_noun=cfg.head_noun)
-                if rec.vlm_subject is None:
-                    cap_stats["no_subject"] += 1
-                    continue
-                if anime:
-                    cap_stats["with_anime"] += 1
-                idslug = slug(ids[i])
-                keep[idslug] = (vlm, anime)
-                records_of[idslug] = rec
-                cap_stats["accepted"] += 1
-                n_accept += 1
-                if cfg.limit and n_accept >= cfg.limit:
-                    done = True
+    # Prefetch shards CONCURRENTLY (the full config is ~100 GB; sequential download dominated
+    # wall-clock). We submit all, consume in order, and bound over-fetch on early `limit` exit to
+    # download_workers shards. The HF cache makes pass-2 re-reads free.
+    from concurrent.futures import ThreadPoolExecutor
+    workers = max(1, cfg.download_workers)
+    ex = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    futs = [ex.submit(hf_hub_download, cfg.repo, s, repo_type="dataset") for s in shards] if ex else None
+    try:
+        for si, shard in enumerate(shards):
+            local = futs[si].result() if futs else hf_hub_download(cfg.repo, shard, repo_type="dataset")
+            print(f"[subjects] shard {si + 1}/{len(shards)} ready · scanned {scanned} · accepted {n_accept}",
+                  flush=True)
+            used_local.append(local)
+            pf = pq.ParquetFile(local)
+            for batch in pf.iter_batches(batch_size=cfg.batch_size, columns=cap_cols):
+                d = batch.to_pydict()
+                ids, vlms = d["id"], d[vlm_col]
+                animes = d[anime_col] if anime_col else [None] * len(ids)
+                audits, ages = d["audit"], d["age_classifier_pass"]
+                for i in range(len(ids)):
+                    scanned += 1
+                    if cfg.progress_every and scanned >= next_mark:
+                        print(f"[subjects] scanned {scanned} · accepted {n_accept}", flush=True)
+                        next_mark = scanned + cfg.progress_every
+                    if not _passes(audits[i], ages[i], cfg):
+                        continue
+                    vlm = real_caption(vlms[i])
+                    if vlm is None:
+                        cap_stats["no_vlm"] += 1
+                        continue
+                    anime = real_caption(animes[i]) if anime_col else None
+                    rec = extract_features(vlm, anime, prefer=cfg.prefer_attr_source,
+                                           head_noun=cfg.head_noun)
+                    if rec.vlm_subject is None:
+                        cap_stats["no_subject"] += 1
+                        continue
+                    if anime:
+                        cap_stats["with_anime"] += 1
+                    idslug = slug(ids[i])
+                    keep[idslug] = (vlm, anime)
+                    records_of[idslug] = rec
+                    cap_stats["accepted"] += 1
+                    n_accept += 1
+                    if cfg.limit and n_accept >= cfg.limit:
+                        done = True
+                        break
+                if done:
                     break
             if done:
                 break
-        if done:
-            break
+    finally:
+        if ex is not None:
+            ex.shutdown(wait=True, cancel_futures=True)
+    print(f"[subjects] pass 1 done · scanned {scanned} · accepted {n_accept} "
+          f"(from {len(used_local)} shard(s))", flush=True)
 
     # ---- PLAN over the UNION of vlm (+ animetimm, unless MIXED) subjects ----
     subj_counter: Counter = Counter()
@@ -724,8 +749,11 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
             subj_counter[rec.vlm_subject] += 1
         if not mixed and rec.anime_subject:
             subj_counter[rec.anime_subject] += 1
+    print(f"[subjects] planning buckets over {len(subj_counter)} unique subjects "
+          f"({'semantic' if cfg.use_semantic else 'lexical'})...", flush=True)
     plan = (plan_buckets_semantic(subj_counter, cfg) if cfg.use_semantic
             else plan_buckets(list(subj_counter.elements()), cfg))
+    print(f"[subjects] planned {len({v for v in plan.mapping.values() if v})} buckets", flush=True)
 
     # ---- SPLIT oversized buckets, per caption stream (disjoint from grouping) ----
     override: dict = {}
@@ -769,6 +797,10 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
     bucket_counts: Counter = Counter()
     captions_accum: dict = defaultdict(dict)     # mixed bucket dir -> {filename: [caps]}
     remaining = set(final)
+    n_total = len(final)
+    written = 0
+    next_w = cfg.progress_every
+    print(f"[subjects] pass 2 · writing {n_total} images into bucket dirs...", flush=True)
     for local in used_local:
         if not remaining:
             break
@@ -787,6 +819,10 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
                 if raw is None:
                     cap_stats["no_image"] += 1
                     continue
+                written += 1
+                if cfg.progress_every and written >= next_w:
+                    print(f"[subjects] wrote {written}/{n_total} images", flush=True)
+                    next_w = written + cfg.progress_every
                 if mixed:                                      # one inode + captions.json
                     bdir = out_root / "mixed" / spec["vlm"]
                     bdir.mkdir(parents=True, exist_ok=True)

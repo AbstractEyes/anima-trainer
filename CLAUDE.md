@@ -137,6 +137,20 @@ this dataset. Read this before changing it.
    to disk (no PIL decode/re-encode). The earlier `datasets`-streaming + PNG-encode
    path was ~1 img/s; this is ~network-bound. Download shards **lazily** (stop at
    `--limit`) — the full config is >100 GB; never pre-fetch all shards.
+   - **At 90k scale it must stay fast + observable** (a real "very slow" report): shards
+     download **concurrently** (`download_workers`, default 8 — over-fetch bounded to
+     `download_workers` on early `limit` exit; full run = all shards, N at a time); every
+     phase prints `[subjects] …` progress (shard k/N, scanned, planning over N subjects,
+     wrote X/total — `print`, not `log.info`, so it shows in a notebook where the root
+     logger defaults to WARNING). `progress_every` (default 20000) sets the cadence.
+   - **The clustering hot path is vectorized.** `_cluster_side`'s submatrix extract was an
+     O(M²) **Python** double-loop of numpy *scalar* lookups (`[[float(S[idx[a],idx[b]]) …`)
+     — fine at M~hundreds (1k run) but tens of millions of slow ops at 90k. Now a single
+     `S[np.ix_(sidx, sidx)]` fancy-index. The remaining O(M²) cost is sklearn's
+     `AgglomerativeClustering` itself (C, on the M×M precomputed matrix) — watch the
+     "planning over N unique subjects" line; if N is huge that's the next wall. **Without
+     the `[similarity]` extra the backend falls to difflib, whose `sim_fn(subjects, subjects)`
+     is an O(N²) `SequenceMatcher` double-loop — death at 90k; install `[similarity]`.**
 3. **Bucket = the dominant subject** (`subjects[0]`, normalized to a head-noun via
    `normalize_subject`: lowercase, strip articles, last word, singularize).
 4. **Group the sparse tail by SEMANTIC similarity, don't drop it** (`keep_small=True`

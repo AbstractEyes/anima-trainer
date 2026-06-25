@@ -6,6 +6,26 @@ from collections import Counter
 from geolip_anima_trainer import subject_buckets as S
 
 
+def test_cluster_side_vectorized_matches_loop():
+    # the vectorized np.ix_ submatrix slice must equal the old O(M^2) python double-loop,
+    # and group identically (this was the "sub bucketing is very slow" hot path at 90k scale)
+    import numpy as np
+    rng = np.random.default_rng(0)
+    n = 40
+    sim = rng.random((n, n)).astype("float32")
+    sim = (sim + sim.T) / 2
+    np.fill_diagonal(sim, 1.0)
+    subjects = [f"s{i}" for i in range(n)]
+    idx = {s: i for i, s in enumerate(subjects)}
+    side = subjects[::2]
+    old = np.array([[float(sim[idx[a], idx[b]]) for b in side] for a in side], "float32")
+    sidx = np.fromiter((idx[s] for s in side), dtype=np.intp, count=len(side))
+    new = np.asarray(sim, dtype="float32")[np.ix_(sidx, sidx)]
+    assert np.array_equal(old, new)
+    groups = S._cluster_side(side, sim, idx, 0.9)
+    assert sum(len(g) for g in groups) == len(side)   # partition: every subject placed once
+
+
 def test_normalize_head_noun_and_singularize():
     n = S.normalize_subject
     assert n("Fire Truck") == "truck"
