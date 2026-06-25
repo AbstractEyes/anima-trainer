@@ -175,6 +175,19 @@ Key flags: `--caption-mode {before_after,separate,mixed}`, `--max-bucket-size N`
 `--semantic-backend auto|sentence-transformers|trigram|difflib`, `--no-semantic`,
 `--drop-small`. `--build-toml DIR` writes the per-mode dataset toml(s) into `DIR`.
 
+## Notebooks
+
+Two end-to-end notebooks under `notebooks/` drive the full `before_after` recipe (extract → build →
+cache → two-phase train):
+
+- **`anima_colab_prelim_train.ipynb`** — the **preliminary ~1k-image** run on Google **Colab**
+  (ephemeral: one kernel restart after install, periodic HuggingFace checkpoint backup so the LoRA
+  survives a disconnect). Start here to validate the methodology.
+- **`anima_full90k_train.ipynb`** — the **full ~90k** run on a **persistent** Blackwell box (big-disk
+  `DATA_ROOT`/`HF_HOME`, `limit=None` extraction, long-run config: `save_every_n_steps`, gradient
+  accumulation, `activation_checkpointing=true` + larger `micro_batch`, `compile=true`; run **detached**
+  via tmux/nohup and recover with `--resume_from_checkpoint` — disk is the durability, backup is optional).
+
 ## Programmatic / sweeps
 
 ```python
