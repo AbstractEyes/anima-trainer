@@ -177,26 +177,101 @@ def _has_cache(root: str | Path) -> bool:
 
 
 # =============================================================================
-# THE RUNNER
+# SHARED RUNNER GLUE  (CacheFactory + TrainerRunner both mix this in)
 # =============================================================================
-class CacheFactory:
+class _RunnerMixin:
+    """Behaviour shared by the cache factory (Colab A100) and the trainer (RTX 6000): HF auth, GPU
+    verify, model download, the subject-bucket config, state guards + persistence. Subclasses set
+    TAG/STATE_FILE/EXPECT_SM and provide their own setup()/_setup_env()/prepare_dataset()/build_configs()
+    + action. Every method here touches only config fields BOTH configs share."""
+    TAG = "runner"
+    STATE_FILE = "runner_state.json"
+    EXPECT_SM: "int | None" = None
+
+    def _need(self, key: str):
+        """Read a state key from an earlier step, with a clear error instead of a bare KeyError
+        (a fresh runtime must re-run setup()/the earlier steps first)."""
+        if key not in self.state:
+            raise RuntimeError(f"runner state has no {key!r} yet — run .setup() and the earlier steps "
+                               f"first (a fresh runtime re-runs setup() before this).")
+        return self.state[key]
+
+    def _auth(self) -> None:
+        token = get_hf_token()
+        assert token, (f"No HF_TOKEN. The {self.TAG} needs HF (push/pull the cache). Set it in Colab "
+                       f"Secrets (HF_TOKEN, WRITE scope) or export HF_TOKEN.")
+        from huggingface_hub import login, whoami
+        login(token=token, add_to_git_credential=True)
+        user = whoami(token=token).get("name")
+        self.state["hf_user"] = user
+        self.state["hf_token"] = token
+        if not self.cfg.cache_repo and user:
+            self.cfg.cache_repo = f"{user}/anima-90k-cache"
+        print(f"[{self.TAG}] HF user={user} | cache_repo={self.cfg.cache_repo}")
+
+    def _verify_gpu(self) -> dict:
+        import torch
+        ok = torch.cuda.is_available()
+        name = torch.cuda.get_device_name(0) if ok else "NONE"
+        cap = torch.cuda.get_device_capability(0) if ok else (0, 0)
+        sm = cap[0] * 10 + cap[1]
+        bf16 = bool(ok and torch.cuda.is_bf16_supported())
+        print(f"[{self.TAG}] torch {torch.__version__} | cuda {torch.version.cuda} | {name} | sm_{sm} | bf16 {bf16}")
+        assert ok, "No CUDA device — start the GPU runtime."
+        if self.EXPECT_SM and sm < self.EXPECT_SM:
+            print(f"[{self.TAG}] WARNING: sm_{sm} < expected sm_{self.EXPECT_SM} — the recipe is tuned for "
+                  f"the RTX PRO 6000 Blackwell; proceed only if you know the target.")
+        self.state["gpu"] = {"name": name, "sm": sm, "bf16": bf16}
+        return self.state["gpu"]
+
+    def _download_models(self) -> object:
+        # default beside HF_HOME on the fast disk (scratch io_root if present, else data_root).
+        dest = self.cfg.models_dir or f"{self.state.get('io_root') or self.state['data_root']}/models/anima"
+        paths = _api.download_models(dest, base="base-v1.0")
+        self.state["model_paths"] = paths
+        print(f"[{self.TAG}] model: {paths.transformer_path}")
+        return paths
+
+    def _subject_cfg(self):
+        mode = {"before_after": _api.CaptionMode.BEFORE_AFTER,
+                "separate": _api.CaptionMode.SEPARATE,
+                "mixed": _api.CaptionMode.MIXED}[self.cfg.caption_mode]
+        return _api.SubjectBucketConfig(
+            repo=self.cfg.source_repo, config=self.cfg.source_config,
+            out_root=self.state["subjects_root"], limit=self.cfg.limit,
+            require_audit_approved=True, require_age_pass=False,
+            caption_mode=mode, use_semantic=True, similarity_model=self.cfg.similarity_model,
+            min_bucket_size=self.cfg.min_bucket_size, min_final_group_size=self.cfg.min_final_group_size,
+            keep_small=True, split_oversized=True)
+
+    def _save_state(self) -> None:
+        dr = self.state.get("data_root")
+        if not dr:
+            return
+        try:
+            blob = {"config": asdict(self.cfg),
+                    "state": {k: v for k, v in self.state.items()
+                              if k not in ("hf_token", "model_paths", "subject_cfg")}}
+            Path(dr, self.STATE_FILE).write_text(json.dumps(blob, indent=2, default=str), encoding="utf-8")
+        except OSError:
+            pass
+
+
+# =============================================================================
+# THE CACHE FACTORY  (Colab A100)
+# =============================================================================
+class CacheFactory(_RunnerMixin):
     """Stateful orchestrator. Each method is one notebook cell; all are idempotent. Run them in
     order within a session — `self.state` is in-memory, so a fresh runtime (or a bare re-run of a
     later cell) must re-run `setup()` first, which re-derives everything from the env + HF. State is
     mirrored to {data_root}/factory_state.json for inspection (it is NOT auto-reloaded; secrets +
     model paths are deliberately not persisted). `run_all()` does the whole sequence in one call."""
+    TAG = "factory"
+    STATE_FILE = "factory_state.json"
 
     def __init__(self, config: "FactoryConfig | None" = None, **overrides):
         self.cfg = config or FactoryConfig.from_env(**overrides)
         self.state: dict = {}
-
-    def _need(self, key: str):
-        """Read a state key set by an earlier step, with a clear error instead of a bare KeyError
-        (a fresh runtime must re-run setup()/the earlier steps before this one)."""
-        if key not in self.state:
-            raise RuntimeError(f"factory state has no {key!r} yet — run f.setup() and the earlier steps "
-                               f"first (a fresh runtime re-runs setup() before this).")
-        return self.state[key]
 
     # ---- 1. setup: env (scratch/HF_HOME) -> auth -> gpu -> models -------------
     def setup(self) -> dict:
@@ -261,40 +336,6 @@ class CacheFactory:
             subjects_root=f"{data_root}/anima_subjects",
             hf_home=os.environ["HF_HOME"],
         )
-
-    def _auth(self) -> None:
-        token = get_hf_token()
-        assert token, ("No HF_TOKEN. A cache factory must push to HF (the scratch is ephemeral). "
-                       "Set it in Colab Secrets (HF_TOKEN, WRITE scope) or export HF_TOKEN.")
-        from huggingface_hub import login, whoami
-        login(token=token, add_to_git_credential=True)
-        user = whoami(token=token).get("name")
-        self.state["hf_user"] = user
-        self.state["hf_token"] = token
-        if not self.cfg.cache_repo and user:
-            self.cfg.cache_repo = f"{user}/anima-90k-cache"
-        print(f"[factory] HF user={user} | cache_repo={self.cfg.cache_repo}")
-
-    def _verify_gpu(self) -> dict:
-        import torch
-        ok = torch.cuda.is_available()
-        name = torch.cuda.get_device_name(0) if ok else "NONE"
-        cap = torch.cuda.get_device_capability(0) if ok else (0, 0)
-        sm = cap[0] * 10 + cap[1]
-        bf16 = bool(ok and torch.cuda.is_bf16_supported())
-        print(f"[factory] torch {torch.__version__} | cuda {torch.version.cuda} | {name} | sm_{sm} | bf16 {bf16}")
-        assert ok, "No CUDA device — start the GPU runtime."
-        self.state["gpu"] = {"name": name, "sm": sm, "bf16": bf16}
-        return self.state["gpu"]
-
-    def _download_models(self) -> object:
-        # default onto the fast scratch (io_root), not /content — keeps the 5.6 GB beside HF_HOME
-        # and inside the same disk-usage accounting.
-        dest = self.cfg.models_dir or f"{self.state['io_root']}/models/anima"
-        paths = _api.download_models(dest, base="base-v1.0")
-        self.state["model_paths"] = paths
-        print(f"[factory] model: {paths.transformer_path}")
-        return paths
 
     # ---- 2. dataset: resume from HF, or extract + store index, then prune ------
     def prepare_dataset(self) -> bool:
@@ -437,28 +478,3 @@ class CacheFactory:
                 pass
         print("[factory] status:", json.dumps(out, indent=2, default=str))
         return out
-
-    # ---- internals ------------------------------------------------------------
-    def _subject_cfg(self):
-        mode = {"before_after": _api.CaptionMode.BEFORE_AFTER,
-                "separate": _api.CaptionMode.SEPARATE,
-                "mixed": _api.CaptionMode.MIXED}[self.cfg.caption_mode]
-        return _api.SubjectBucketConfig(
-            repo=self.cfg.source_repo, config=self.cfg.source_config,
-            out_root=self.state["subjects_root"], limit=self.cfg.limit,
-            require_audit_approved=True, require_age_pass=False,
-            caption_mode=mode, use_semantic=True, similarity_model=self.cfg.similarity_model,
-            min_bucket_size=self.cfg.min_bucket_size, min_final_group_size=self.cfg.min_final_group_size,
-            keep_small=True, split_oversized=True)
-
-    def _save_state(self) -> None:
-        dr = self.state.get("data_root")
-        if not dr:
-            return
-        try:
-            blob = {"config": asdict(self.cfg),
-                    "state": {k: v for k, v in self.state.items()
-                              if k not in ("hf_token", "model_paths", "subject_cfg")}}
-            Path(dr, "factory_state.json").write_text(json.dumps(blob, indent=2, default=str), encoding="utf-8")
-        except OSError:
-            pass

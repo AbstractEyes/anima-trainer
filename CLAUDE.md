@@ -32,7 +32,9 @@ installable package **`geolip_anima_trainer`** (console command **`anima`**):
   the pod **`keepalive`/`gpu_keepalive`** (idle-reclaim guards; see "Pod keepalive" below).
 - `cache_factory.py` + `anima_colab.py` (repo root) — the **Colab A100 cache-FACTORY** runner.
   The notebook is a static thin shell; all logic is here so iterating = `git pull`, never
-  re-pasting cells. See "Colab cache factory" below.
+  re-pasting cells. Holds the shared **`_RunnerMixin`**. See "Colab cache factory" below.
+- `trainer_runner.py` — the **RTX 6000 TRAINER** runner (mirror of the factory: pull cache →
+  build → detached train → monitor/resume/backup). See "RTX 6000 trainer" below.
 - `api.py` / `cli.py` — the Python API and the `anima` CLI.
 - `templates/anima_lora.toml`, `templates/anima_dataset.toml` — packaged templates;
   copy into `./configs` with `anima init-config`.
@@ -379,11 +381,36 @@ a fresh-runtime/reset simulation: the design holds across first-run, post-restar
   full 83k (~106 GB images+cache) fits the 368 GB scratch but NOT the 235 GB persistent disk — so the
   no-scratch fallback **refuses `limit=None`** (would fill `/content` and crash mid-cache) and tells the user
   to set a smaller `limit=`/`data_root=` (a kwarg change in the existing cell, not a notebook edit).
-- **Portability footgun:** the fingerprint embeds DATA_ROOT, so the portable `/workspace/anima_data` symlink
-  is what makes the A100-built cache resume on the RTX 6000 (which uses the same path). If the symlink can't
-  be established (a real non-empty dir is there), `setup()` **warns loudly** that resume may break rather than
-  silently using the volatile scratch path. On Colab the in-kernel keepalive is the *wrong* lever (idle is
-  browser-UI based) — the HF push is the real safety net; Pro+ background execution is best-effort.
+- **Portability footgun + the `portable_abspath` fix (load-bearing):** the latent fingerprint embeds the
+  toml `[[directory]]` path **verbatim** (diffusion-pipe `glob`s it without resolving symlinks), so the
+  portable `/workspace/anima_data` symlink is what makes the A100-built cache resume on the RTX 6000.
+  ⚠️ The persisted-path writers therefore use **`build_multiconcept_dataset.portable_abspath`** (=
+  `os.path.abspath` ∘ `expanduser`), **NOT `Path.resolve()`** — `resolve()` dereferences the symlink down to
+  the *volatile scratch realpath*, which a 3-agent verification proved would (a) make `reconstruct_from_index`'s
+  out_root guard hard-error on the RTX 6000 and (b) bake the scratch path into the fingerprint → `[CACHE]
+  Fingerprint changed` → full re-cache (it also broke the A100's *own* session-to-session resume, since scratch
+  remounts under a new name each session). The four persisted sites — the toml `[[directory]]` path
+  (`build_multiconcept_dataset.py`), the index header `out_root` + the extraction out_root + the
+  `build_mode_tomls` root (`subject_buckets.py`) — all use `portable_abspath`; per-session paths (HF_HOME, TMPDIR,
+  download dest) keep `resolve()`. `tests/test_portable_paths.py` guards it (extract under a symlinked out_root →
+  the toml keeps the symlink). If the symlink can't be established, `setup()` **warns loudly**. On Colab the
+  in-kernel keepalive is the *wrong* lever (idle is browser-UI) — the HF push is the real safety net.
+
+### RTX 6000 trainer — `trainer_runner.py` + the `anima_rtx6000_train.ipynb` notebook
+The training mirror of the cache factory (same thin-shell contract). `notebooks/anima_rtx6000_train.ipynb` is a
+static shell; `TrainerRunner` (`trainer_runner.py`) holds the logic. Both runners share a **`_RunnerMixin`**
+(in `cache_factory.py`: HF auth, GPU verify, model download, `_subject_cfg`, `_need`, `_save_state`); the factory
+is `TAG="factory"`, the trainer `TAG="trainer"`/`EXPECT_SM=120`. `TrainerRunner` steps: `setup()` (DATA_ROOT
+pinned to the factory's portable `/workspace/anima_data` — **must match** or the fingerprint mismatches; HF auth;
+GPU check **warns** if sm<120; model download) → `prepare_dataset()` (`cache_pull` the factory's cache +
+reconstruct images byte-identically; **errors if no cache on HF**; prune the source parquet — the RTX 6000 disk
+is tight) → `build_configs()` (the long-run before_after tomls: `activation_checkpointing`/`compile` ON, the
+90k recipe) → `train(detached=True)` (launches the `train-before-after` CLI via `subprocess.Popen(start_new_
+session=True)` so it **survives a kernel restart**; writes `runs/train.log`) → `tail()` (newest log) /
+`resume(phase)` (`train --config … --resume` → `--resume_from_checkpoint`) / `backup()` (push the newest LoRA
+checkpoint to an HF *model* repo) / `status()` (disk + latest checkpoint + detached-child liveness via
+`os.kill(pid,0)`). Durability is inverted vs the factory: the box is **persistent**, so on-disk checkpoints are
+the lifeline and the HF LoRA backup is an optional heartbeat. `tests/test_trainer_runner.py` covers the wiring.
 
 ### Backend tiers (optional `[similarity]` extra)
 `make_sim_fn` picks best-available, logs the tier: **sentence-transformers**

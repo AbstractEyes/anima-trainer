@@ -28,6 +28,7 @@ from .api import (  # noqa: F401
 from .cache_factory import (  # noqa: F401 — the Colab cache-factory runner (light import)
     CacheFactory, FactoryConfig, find_scratch, get_hf_token,
 )
+from .trainer_runner import TrainerRunner, TrainerConfig  # noqa: F401 — the RTX 6000 trainer runner
 
 try:
     from importlib.metadata import version
@@ -50,7 +51,8 @@ __all__ = [
     "build_dataset_toml", "build_mode_tomls",
     "cache", "cache_push", "cache_pull", "reconstruct_dataset", "prune_source_cache",
     "keepalive", "gpu_keepalive", "train", "train_before_after",
-    # colab cache-factory runner
+    # colab cache-factory runner + RTX 6000 trainer runner
     "CacheFactory", "FactoryConfig", "find_scratch", "get_hf_token",
+    "TrainerRunner", "TrainerConfig",
     "doctor", "DoctorReport", "WindowsTrainingRefused", "DiffusionPipeNotFound",
 ]

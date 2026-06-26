@@ -19,8 +19,19 @@ Run:
 """
 
 import argparse
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+
+def portable_abspath(p) -> str:
+    """Absolute + normalized but WITHOUT dereferencing symlinks (unlike Path.resolve()). Persisted
+    paths — the toml [[directory]] path (baked VERBATIM into diffusion-pipe's latent fingerprint) and
+    the reconstruct index out_root — must stay portable: a DATA_ROOT symlink (e.g. the cache factory's
+    /workspace/anima_data -> volatile scratch) must be preserved, not collapsed to the scratch realpath,
+    or the fingerprint differs across boxes/sessions and the cache is wiped + re-built. resolve() would
+    collapse it; abspath() keeps /workspace/anima_data/... while still absolutizing + normalizing '..'."""
+    return os.path.abspath(os.path.expanduser(str(p)))
 
 
 # =============================================================================
@@ -89,7 +100,7 @@ def discover_concepts(root: Path, cfg: BaseConfig) -> list[dict]:
             continue                     # not a concept folder
         concepts.append({
             "name": sub.name,
-            "path": str(sub.resolve()),
+            "path": portable_abspath(sub),   # NOT .resolve() — keep a portable DATA_ROOT symlink in the toml
             "images": n_img,
             "captions": count_captions(sub, cfg),
         })

@@ -40,6 +40,8 @@ from difflib import SequenceMatcher, get_close_matches
 from pathlib import Path
 from typing import Callable
 
+from .build_multiconcept_dataset import portable_abspath   # abspath that preserves a DATA_ROOT symlink
+
 INDEX_NAME = "index.jsonl"   # the per-image reconstruct index, written to <out_root>/
 
 
@@ -668,8 +670,8 @@ def export_subject_buckets(cfg: SubjectBucketConfig) -> dict:
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
 
-    out_root = Path(cfg.out_root).expanduser().resolve()
-    out_root.mkdir(parents=True, exist_ok=True)
+    out_root = Path(portable_abspath(cfg.out_root))   # NOT resolve(): keep a portable DATA_ROOT symlink
+    out_root.mkdir(parents=True, exist_ok=True)        # (writes still follow the symlink to scratch)
 
     vlm_col = cfg.caption_columns[0]
     anime_col = cfg.caption_columns[1] if len(cfg.caption_columns) > 1 else None
@@ -923,7 +925,7 @@ def reconstruct_from_index(out_root: str | Path, *, token: str | None = None,
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
 
-    out_root = Path(out_root).expanduser().resolve()
+    out_root = Path(portable_abspath(out_root))   # NOT resolve(): match the index's portable path
     index_path = out_root / INDEX_NAME
     if not index_path.is_file():
         raise FileNotFoundError(f"no reconstruct index at {index_path}")
@@ -943,7 +945,7 @@ def reconstruct_from_index(out_root: str | Path, *, token: str | None = None,
     records = [r for r in records if not (r["slug"] in seen or seen.add(r["slug"]))]
     if header is None:
         raise ValueError(f"index missing its _index_meta header: {index_path}")
-    if Path(header["out_root"]).resolve() != out_root:
+    if Path(portable_abspath(header["out_root"])) != out_root:   # compare portable paths, not realpaths
         raise ValueError(
             f"index out_root {header['out_root']} != restore dir {out_root}: the cache fingerprint "
             f"embeds ABSOLUTE paths — restore to the SAME path or the cache will be wiped.")
@@ -1045,7 +1047,7 @@ def build_mode_tomls(out_root: str | Path, cfg: SubjectBucketConfig, *,
        BEFORE_AFTER -> TWO tomls: dataset_vlm.toml + dataset_animetimm.toml (sequential phases)
     Returns the written toml paths."""
     from . import build_multiconcept_dataset as _b
-    out_root = Path(out_root).expanduser().resolve()
+    out_root = Path(portable_abspath(out_root))   # NOT resolve(): the toml paths must stay portable
     cdir = Path(configs_dir).expanduser()
     cdir.mkdir(parents=True, exist_ok=True)
 
