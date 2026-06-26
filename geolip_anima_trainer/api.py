@@ -56,7 +56,7 @@ __all__ = [
     # operations
     "download_models", "inspect_source", "export_dataset", "export_subject_buckets",
     "build_dataset_toml", "build_mode_tomls", "cache", "cache_push", "cache_pull",
-    "reconstruct_dataset", "train", "train_before_after",
+    "reconstruct_dataset", "prune_source_cache", "train", "train_before_after",
     "doctor", "DoctorReport", "WindowsTrainingRefused", "DiffusionPipeNotFound",
 ]
 
@@ -236,6 +236,14 @@ def reconstruct_dataset(out_root: str | Path, *, token: str | None = None,
     source parquet (no images stored on HF). Used by cache_pull; also callable standalone."""
     return _subjects.reconstruct_from_index(out_root, token=token, only_missing=only_missing,
                                             verify_sha=verify_sha)
+
+
+def prune_source_cache(repo: str, *, hf_home: str | None = None, also=None) -> dict:
+    """Free disk: delete the SOURCE parquet shards cached under HF_HOME (the #1 Colab bloat — dead
+    weight once images are extracted; refetchable from the index). `also` = extra dirs whose `.cache`
+    upload-state to clear (e.g. SUBJECTS_ROOT). Returns {freed_bytes, removed}."""
+    from . import cache_sync as _cs
+    return _cs.prune_source_cache(repo, hf_home=hf_home, also=also)
 
 
 def train(config_toml: str | Path, *, repo_root: str | Path | None = None,

@@ -93,7 +93,30 @@ def test_round_trip_byte_identity(tmp_path: Path, monkeypatch):
     assert "fp-xyz" in set(cs.read_cache_fingerprints([dst]).values())
 
 
-def test_sync_up_excludes_images_and_txt(tmp_path: Path, monkeypatch):
+def test_snapshot_cache_filters_to_db_bin_index(tmp_path: Path):
+    # the snapshot is what's uploaded: ONLY the latent/text cache db+bin + index/captions, NEVER the
+    # images, .txt, the regenerable *.arrow, or SQLite journals.
+    root = tmp_path / "subjects"
+    leaf = root / "vlm" / "dog" / "cache" / "anima" / "cache_X" / "latents"
+    leaf.mkdir(parents=True)
+    (leaf / "shard_0.bin").write_bytes(b"L" * 64)
+    (leaf / "metadata.db").write_bytes(b"D" * 64)
+    (leaf / "metadata.db-journal").write_bytes(b"J")               # transient -> NEVER uploaded
+    (root / "vlm" / "dog" / "cache" / "anima" / "metadata").mkdir(parents=True, exist_ok=True)
+    (root / "vlm" / "dog" / "cache" / "anima" / "metadata" / "x.arrow").write_bytes(b"A")  # regenerable
+    (root / "index.jsonl").write_bytes(b"{}\n")
+    (root / "vlm" / "dog" / "a.png").write_bytes(b"P")             # image -> refetched, not uploaded
+    (leaf / "a.txt").write_bytes(b"T")                            # caption -> in the index, not uploaded
+
+    snap = tmp_path / "snap"
+    snap.mkdir()
+    cs._snapshot_cache(root, snap)
+    got = sorted(p.name for p in snap.rglob("*") if p.is_file())
+    assert got == ["index.jsonl", "metadata.db", "shard_0.bin"]   # exactly the pushable set
+    assert (snap / "vlm/dog/cache/anima/cache_X/latents/shard_0.bin").read_bytes() == b"L" * 64
+
+
+def test_sync_up_passes_ignore_and_cleans_snapshot(tmp_path: Path, monkeypatch):
     import huggingface_hub as hf
     captured = {}
 
@@ -102,21 +125,40 @@ def test_sync_up_excludes_images_and_txt(tmp_path: Path, monkeypatch):
             pass
         def upload_folder(self, *, folder_path, repo_id, repo_type, path_in_repo=".",
                           allow_patterns=None, ignore_patterns=None, commit_message=None):
-            captured["allow"], captured["ignore"] = allow_patterns, ignore_patterns
+            captured["ignore"] = ignore_patterns
+            captured["uploaded_from"] = folder_path
 
     monkeypatch.setattr(hf, "create_repo", lambda *a, **k: None)
     monkeypatch.setattr(hf, "HfApi", FakeApi)
-
-    cs.sync_up(tmp_path, "u/r", include_dataset=True)          # freeze: everything regenerable excluded
+    root = tmp_path / "subjects"
+    root.mkdir()
+    (root / "index.jsonl").write_bytes(b"{}\n")
+    cs.sync_up(root, "u/r")
     ig = captured["ignore"]
-    assert "**/*.txt" in ig and "**/*.arrow" in ig and "**/*-journal" in ig
-    assert any("png" in p for p in ig) and any("webp" in p for p in ig)
+    assert "**/*.arrow" in ig and "**/*-journal" in ig and "**/*.txt" in ig and any("png" in p for p in ig)
+    # the upload ran from a throwaway snapshot dir (not the live cache) and it was cleaned up
+    assert ".anima_snap_" in captured["uploaded_from"]
+    assert not list(tmp_path.glob(".anima_snap_*"))
 
-    cs.sync_up(tmp_path, "u/r", include_dataset=False)         # periodic: ONLY metadata.db + *.bin + index
-    al = captured["allow"]
-    assert "index.jsonl" in al
-    assert any(p.endswith("metadata.db") for p in al) and any(p.endswith("*.bin") for p in al)
-    assert not any("*.arrow" in p for p in al)                 # the 30k regenerable files are NOT pushed
+
+def test_prune_source_cache(tmp_path: Path):
+    hf_home = tmp_path / "hf"
+    src = hf_home / "hub" / "datasets--AbstractPhil--diffusion-pretrain-set-ft1"
+    src.mkdir(parents=True)
+    (src / "blobs").mkdir()
+    (src / "blobs" / "x").write_bytes(b"z" * 5000)
+    keep = hf_home / "hub" / "models--circlestone-labs--Anima"     # model cache must survive
+    keep.mkdir(parents=True)
+    (keep / "w").write_bytes(b"m" * 100)
+    subj = tmp_path / "subjects"
+    (subj / "vlm" / ".cache").mkdir(parents=True)
+    (subj / "vlm" / ".cache" / "state").write_bytes(b"s" * 200)
+
+    rep = cs.prune_source_cache("AbstractPhil/diffusion-pretrain-set-ft1",
+                                hf_home=str(hf_home), also=[subj])
+    assert rep["freed_bytes"] == 5200 and not src.exists()
+    assert keep.exists() and (keep / "w").exists()                 # model cache untouched
+    assert not (subj / "vlm" / ".cache").exists()
 
 
 def test_periodic_pusher_triggers(tmp_path: Path):

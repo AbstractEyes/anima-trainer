@@ -281,12 +281,18 @@ in `external/diffusion-pipe/utils/{cache,dataset}.py`):
   The `*.arrow` is **tens of thousands of tiny files HF throttles** and it **regenerates deterministically**
   from the reconstructed images on resume (the dataset fingerprint is content-based) — so a push is a few
   hundred files, not ~30k. Cost: resume re-runs the dataset metadata pass (`trust_cache` can't skip it
-  without the arrow); correctness is unaffected (the preserved latents still match). Push uses
-  **`upload_folder`** (one atomic commit; LFS uploads exactly each shard's hashed `size` bytes via
-  `SliceFileObj`, so a **growing** active shard uploads a consistent prefix). **Do NOT use
-  `upload_large_folder`** here — it hashes/uploads then re-scans + commits in a later batch, so the
-  live-written active shard's pointer no longer matches the uploaded object → `LFS pointer pointed to a
-  file that does not exist` → infinite retry (it's documented for STATIC folders only).
+  without the arrow); correctness is unaffected (the preserved latents still match). Push is a
+  **snapshot-then-`upload_large_folder`** (`cache_sync._snapshot_cache` + `sync_up`): first build a
+  **STATIC** point-in-time tree in a throwaway `.anima_snap_*` dir — finalized shards (mtime past a
+  ~120 s window) `os.link` (hardlink, zero extra disk), the volatile `metadata.db`/active shard/
+  `index.jsonl` `shutil.copy2` — then `upload_large_folder` that static tree (batched commits, so a
+  single commit of ~thousands of shard files can't 504; the snapshot was the real OOM/504 fix). The
+  snapshot is **why `upload_large_folder` is now safe** here: its hash→upload→re-scan→commit-in-a-
+  later-batch model only races a **live-written** folder (the old `upload_folder` path hit `LFS pointer
+  pointed to a file that does not exist` → infinite retry; `upload_folder` itself 504s committing ~9k
+  files at once). Uploading a frozen copy removes both failure modes; the snapshot is `rmtree`d in a
+  `finally`. (`sync_up(snapshot=False)` falls back to the old direct-`upload_folder` path for callers
+  that already pass a static tree.)
   `subject_buckets.reconstruct_from_index` (≈`api.reconstruct_dataset`,
   called by `cache_pull`) groups index ids by shard, concurrently refetches only the used shards,
   writes raw bytes byte-identically + `.txt` from the index → a **byte-identical tree** → same
@@ -301,12 +307,22 @@ in `external/diffusion-pipe/utils/{cache,dataset}.py`):
   push even if the run crashes** (the "8 h lost" case, now recoverable). A failed push is logged, never
   kills the run. For `before_after` pass `backup_root=SUBJECTS_ROOT` (the parent of vlm/+animetimm/) so
   pushes share one repo root — `out_root_of(one toml)` only yields that tree's root.
-- **Workflow:** session 1 = extract (writes index) → `cache_push` (store index) → `cache --backup-repo …`
-  (periodic cache+index push); session N = `cache_pull` (download cache+index → rebuild images from
-  source) → `cache --trust-cache --backup-repo …` (resume + keep pushing). `upload_folder` is
-  incremental. ⚠️ DATA_ROOT drift is the #1 footgun. The notebook `anima_full90k_train.ipynb` §6/§8
-  implement the first-vs-resume branch. **2× cache cost stands** under `before_after` (latents cached
-  per tree over hardlinked pixels); MIXED mode would halve it but changes the validated recipe — not done.
+- **Workflow:** session 1 = extract (writes index) → `cache_push` (store index) → **prune the source
+  parquet** → `cache --backup-repo …` (periodic cache+index push); session N = `cache_pull` (download
+  cache+index → rebuild images from source) → **prune** → `cache --trust-cache --backup-repo …` (resume
+  + keep pushing). `upload_large_folder` skips already-uploaded objects, so it stays incremental.
+  ⚠️ DATA_ROOT drift is the #1 footgun. The notebook `anima_full90k_train.ipynb` §6/§8 implement the
+  first-vs-resume branch. **2× cache cost stands** under `before_after` (latents cached per tree over
+  hardlinked pixels); MIXED mode would halve it but changes the validated recipe — not done.
+- **Prune the source parquet after extraction (`cache_sync.prune_source_cache` / `anima cache-prune`).**
+  The columnar read leaves the **whole source config (~45 GB) cached under `HF_HOME/hub/datasets--…`**;
+  once images are on disk that's dead weight (refetchable from the index), and it is **the #1 Colab disk
+  bloat** — it filled the disk mid-cache and crashed an 8 h run with `No space left on device`.
+  `prune_source_cache(repo, *, hf_home=None, also=[…])` deletes exactly that repo's hub dir (the model
+  cache `models--circlestone-labs--Anima` is **untouched**) + any `.cache` dirs under `also` roots, and
+  returns `{freed_bytes, removed}`. The notebook calls it at the end of §6; resume after an OOM is
+  `prune` → re-run §8 (`trust_cache` skips the cached latents, **no metadata re-pass needed** — the
+  `.arrow` is still on local disk; only a fresh runtime pays the metadata pass again).
 
 ### Backend tiers (optional `[similarity]` extra)
 `make_sim_fn` picks best-available, logs the tier: **sentence-transformers**

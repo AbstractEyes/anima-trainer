@@ -199,6 +199,11 @@ def build_parser() -> argparse.ArgumentParser:
     cl.add_argument("--no-reconstruct", action="store_true",
                     help="download cache+index only; do NOT rebuild images from the source parquet")
     cl.add_argument("--dry-run", action="store_true")
+
+    pr = sub.add_parser("cache-prune", help="free disk: delete the source parquet cache + upload state")
+    pr.add_argument("--repo", default="AbstractPhil/diffusion-pretrain-set-ft1",
+                    help="source dataset repo whose HF_HOME parquet cache to delete")
+    pr.add_argument("--also", default=None, help="extra dir whose .cache upload-state to clear (e.g. out_root)")
     return p
 
 
@@ -359,6 +364,11 @@ def main(argv: list[str] | None = None) -> int:
         tok = args.token or os.environ.get("HF_TOKEN")
         print("pulled ->", api.cache_pull(args.out_root, args.repo_id, token=tok,
               reconstruct=not args.no_reconstruct, dry_run=args.dry_run))
+        return 0
+
+    if args.cmd == "cache-prune":
+        rep = api.prune_source_cache(args.repo, also=([args.also] if args.also else None))
+        print(f"freed {rep['freed_bytes']/1e9:.1f} GB; removed {rep['removed']}")
         return 0
 
     return 1

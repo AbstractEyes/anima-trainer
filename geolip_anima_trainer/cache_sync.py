@@ -90,38 +90,117 @@ def read_cache_fingerprints(roots) -> dict[str, str | None]:
 # =============================================================================
 # PUSH / PULL  (mirror the notebook backup_latest; repo_type='dataset')
 # =============================================================================
+_INDEX = "index.jsonl"
+
+
+def _snapshot_cache(folder: Path, snap_root: Path, *, active_window_s: float = 120.0) -> Path:
+    """Build a STATIC point-in-time copy of the pushable cache (metadata.db + cache shard_*.bin +
+    index.jsonl + captions.json) under snap_root, so the upload never races the live writer. FINALIZED
+    shards (mtime older than active_window_s) are HARDLINKED (no extra disk); the small volatile files
+    (metadata.db / index / captions) and the actively-written shard are COPIED (a consistent prefix).
+    Regenerable *.arrow + SQLite journals are skipped. snap_root must be on the SAME filesystem."""
+    import shutil
+    import time
+    now = time.time()
+    folder = Path(folder)
+    for src in folder.rglob("*"):
+        if not src.is_file():
+            continue
+        nm = src.name
+        if nm.endswith((".arrow", "-journal", "-wal", "-shm")):
+            continue
+        rel = src.relative_to(folder)
+        is_bin = nm.endswith(".bin") and "cache" in rel.parts
+        if not (is_bin or nm in ("metadata.db", _INDEX, "captions.json")):
+            continue
+        dst = snap_root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            old = is_bin and (now - src.stat().st_mtime) >= active_window_s
+        except OSError:
+            old = False
+        if old:
+            try:
+                os.link(src, dst)            # finalized shard -> hardlink (no copy, no extra disk)
+                continue
+            except OSError:
+                pass
+        try:
+            shutil.copy2(src, dst)           # volatile / active -> consistent point-in-time copy
+        except OSError as e:                  # noqa: PERF203
+            log.warning("snapshot copy skipped %s: %s", rel, e)
+    return snap_root
+
+
 def sync_up(folder: str | Path, repo_id: str, *, token: str | None = None,
             path_in_repo: str = ".", include_dataset: bool = True,
             allow_patterns: list[str] | None = None,
             ignore_patterns: list[str] | None = None,
-            commit_message: str = "cache sync", dry_run: bool = False) -> str:
-    """Upload `folder` to an HF dataset repo (incremental — upload_folder skips unchanged files
-    by content hash). include_dataset=False restricts to the cache subtree (CACHE_ONLY_GLOB)."""
+            commit_message: str = "cache sync", dry_run: bool = False,
+            snapshot: bool = True) -> str:
+    """Upload the cache to an HF dataset repo. The push **snapshots** the cache to a STATIC tree first
+    (hardlinks for finalized shards, copies for the volatile metadata.db + the active shard) so it never
+    races diffusion-pipe's live writes, then uses **upload_large_folder** (BATCHED commits — the periodic
+    push commits ~thousands of small shard files, which a single upload_folder commit 504s on). The
+    snapshot defines the pushed set (cache `metadata.db`+`shard_*.bin` + `index.jsonl`/`captions.json`);
+    `include_dataset`/`allow_patterns` are kept for API compatibility. Its `.cache` upload state lands in
+    the throwaway snapshot dir, so it never bloats the real cache."""
     folder = Path(folder).expanduser().resolve()
-    if allow_patterns is None and not include_dataset:
-        allow_patterns = list(CACHE_ONLY_GLOB)
     if ignore_patterns is None:
         ignore_patterns = list(_DEFAULT_IGNORE)
     url = f"https://huggingface.co/datasets/{repo_id}"
     if dry_run:
-        log.info("[dry-run] would upload %s -> %s (allow=%s)", folder, url, allow_patterns)
+        log.info("[dry-run] would upload %s -> %s", folder, url)
         return url
+    import shutil
+    import tempfile
     from huggingface_hub import HfApi, create_repo
     create_repo(repo_id, token=token, repo_type="dataset", private=True, exist_ok=True)
-    # Use upload_folder (single atomic commit), NOT upload_large_folder. The periodic push runs WHILE
-    # diffusion-pipe is appending to the active shard; upload_large_folder hashes/uploads in one batch
-    # then re-scans + commits in a LATER batch, so the grown shard's pointer no longer matches the
-    # uploaded object -> "LFS pointer pointed to a file that does not exist" -> infinite retry. It is
-    # documented for STATIC folders only. upload_folder hashes each shard ONCE and uploads exactly the
-    # hashed `size` bytes (SliceFileObj/read_limit in lfs.py), so a growing shard uploads a consistent
-    # prefix and the commit succeeds; the few-hundred-file count (after excluding *.arrow) is well
-    # within its limits. A rare metadata.db-rewrite race just raises -> the pusher logs it and the next
-    # push (or the final one) succeeds.
-    HfApi(token=token).upload_folder(
-        folder_path=str(folder), repo_id=repo_id, repo_type="dataset",
-        path_in_repo=path_in_repo, allow_patterns=allow_patterns,
-        ignore_patterns=ignore_patterns, commit_message=commit_message)
+    api = HfApi(token=token)
+    snap = None
+    upload_dir = folder
+    if snapshot:
+        snap = Path(tempfile.mkdtemp(prefix=".anima_snap_", dir=str(folder.parent)))
+        upload_dir = _snapshot_cache(folder, snap)
+    try:
+        if hasattr(api, "upload_large_folder"):     # batched + resumable -> no 504 on ~thousands of files
+            api.upload_large_folder(
+                repo_id=repo_id, folder_path=str(upload_dir), repo_type="dataset",
+                allow_patterns=(None if snapshot else (allow_patterns or CACHE_ONLY_GLOB)),
+                ignore_patterns=ignore_patterns, print_report=False)
+        else:
+            api.upload_folder(
+                folder_path=str(upload_dir), repo_id=repo_id, repo_type="dataset",
+                path_in_repo=path_in_repo,
+                allow_patterns=(None if snapshot else (allow_patterns or CACHE_ONLY_GLOB)),
+                ignore_patterns=ignore_patterns, commit_message=commit_message)
+    finally:
+        if snap is not None:
+            shutil.rmtree(snap, ignore_errors=True)
     return url
+
+
+def prune_source_cache(repo: str, *, hf_home: str | None = None, also=None) -> dict:
+    """Delete the SOURCE parquet shards cached under `HF_HOME/hub/datasets--<repo>` — they are dead
+    weight after extraction (the images are on disk / refetchable from the index) and the #1 Colab disk
+    bloat. Also removes any `.cache` upload-state dirs under each path in `also` (e.g. SUBJECTS_ROOT).
+    Returns {freed_bytes, removed}. Never deletes model files or the extracted dataset."""
+    import shutil
+    hf_home = hf_home or os.environ.get("HF_HOME") or str(Path.home() / ".cache" / "huggingface")
+    targets = [Path(hf_home) / "hub" / ("datasets--" + repo.replace("/", "--"))]
+    for a in (also or []):
+        targets += list(Path(a).expanduser().rglob(".cache"))
+    freed, removed = 0, []
+    for t in targets:
+        if t.exists():
+            try:
+                freed += sum(f.stat().st_size for f in t.rglob("*") if f.is_file())
+            except OSError:
+                pass
+            shutil.rmtree(t, ignore_errors=True)
+            removed.append(str(t))
+    log.info("pruned source cache: freed %.1f GB (%s)", freed / 1e9, removed)
+    return {"freed_bytes": freed, "removed": removed}
 
 
 def make_periodic_pusher(folder, repo_id, *, token=None, interval: float = 1800.0,
