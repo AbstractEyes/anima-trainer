@@ -56,7 +56,8 @@ __all__ = [
     # operations
     "download_models", "inspect_source", "export_dataset", "export_subject_buckets",
     "build_dataset_toml", "build_mode_tomls", "cache", "cache_push", "cache_pull",
-    "reconstruct_dataset", "prune_source_cache", "train", "train_before_after",
+    "reconstruct_dataset", "prune_source_cache", "keepalive", "gpu_keepalive",
+    "train", "train_before_after",
     "doctor", "DoctorReport", "WindowsTrainingRefused", "DiffusionPipeNotFound",
 ]
 
@@ -197,7 +198,35 @@ def cache(config_toml: str | Path, *, repo_root: str | Path | None = None,
         return _launch.launch(plan, dry_run=dry_run, monitor=monitor, log_path=log_path)
     finally:
         if pusher is not None:      # final push even if the run failed (the "8h lost" case)
-            pusher()
+            from . import cache_monitor as _cm2
+            with _cm2.gpu_keepalive():   # the subprocess has exited -> keep the GPU warm so the
+                pusher()                  # final push doesn't run idle and get the pod reclaimed
+
+
+def keepalive(*, interval: float = 60.0, deadline_s: float | None = None, gpu: bool = True,
+              stop_file: str | Path | None = None, on_tick=None) -> dict:
+    """Hold a cloud GPU pod alive AFTER caching (or any long job) so it isn't idle-reclaimed in
+    the gap before training. cache()'s monitor only loops while the cache subprocess runs and
+    exits the instant it finishes — leaving the GPU idle. Run this at the end of the cache cell:
+    each tick keeps the GPU warm (a tiny CUDA op — the load-bearing signal) + keeps the kernel
+    busy + prints a heartbeat. Interrupt the cell (■) to proceed to training, or bound it with
+    deadline_s / stop_file. Covers RunPod / Lambda / generic Jupyter pods; NOT consumer Colab
+    (browser-UI idle) or vast.ai spot (preemption). Returns {ticks, elapsed, stopped_by}; never
+    raises (every I/O is guarded)."""
+    from . import cache_monitor as _cm
+    return _cm.keepalive(interval=max(float(interval), 1.0), deadline_s=deadline_s, gpu=gpu,
+                         stop_file=stop_file, on_tick=on_tick)
+
+
+def gpu_keepalive(*, interval: float = 20.0, gpu: bool = True):
+    """Context manager: keep the GPU warm on a background daemon thread for a CPU/network-bound
+    block (an HF cache push, a deepspeed relaunch) so a GPU-utilization idle-reclaimer can't kill
+    the pod while no CUDA work runs. `with anima.gpu_keepalive(): anima.cache_push(...)`. Quiet;
+    the thread never raises into the caller; stops on block exit. cache() already wraps its own
+    final push in this — use it in a notebook to also bracket the explicit cache_push + the gap
+    between phases."""
+    from . import cache_monitor as _cm
+    return _cm.gpu_keepalive(interval=max(float(interval), 1.0), gpu=gpu)
 
 
 def cache_push(out_root_or_toml: str | Path, repo_id: str, *, token: str | None = None,

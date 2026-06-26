@@ -323,6 +323,27 @@ in `external/diffusion-pipe/utils/{cache,dataset}.py`):
   returns `{freed_bytes, removed}`. The notebook calls it at the end of §6; resume after an OOM is
   `prune` → re-run §8 (`trust_cache` skips the cached latents, **no metadata re-pass needed** — the
   `.arrow` is still on local disk; only a fresh runtime pays the metadata pass again).
+- **Pod keepalive — hold the GPU pod across the cache→train gap (`cache_monitor.keepalive` /
+  `gpu_keepalive`; `anima.keepalive` / `anima.gpu_keepalive`).** The cache monitor only loops *while* the
+  `--cache_only` subprocess runs and exits the **instant** it finishes (`monitor()`'s `while proc.poll()
+  is None`), so the GPU goes idle and a cloud pod gets **idle-reclaimed right after a finished 8 h cache,
+  before training starts** (a real loss). Verified idle mechanics: **RunPod GPU Pods / Lambda / generic
+  Jupyter pods** reclaim on **GPU-utilization** and/or **kernel-session** idle — both defeated by a tiny
+  per-tick CUDA op (`_gpu_touch`, the load-bearing signal — stdout is **not** a documented idle signal
+  anywhere) + the busy loop. It does **NOT** help **consumer Google Colab** (idle = browser-UI
+  interaction only, + a 12/24 h hard cap → needs a browser auto-click) or **vast.ai interruptible** (bid
+  preemption). Two layers, both in §8 of the notebook: (1) **`keepalive(...)`** — the foreground hold at
+  the end of the cell; loops CUDA-touch + heartbeat + busy-kernel until **KeyboardInterrupt** (the ■ stop
+  button → proceed to §9), `deadline_s`, `stop_file`, or a `stop_event`. **Never raises** — every print is
+  guarded (`_safe_print` swallows a dead-socket `BrokenPipeError`/`OSError`; ASCII-only so a non-UTF-8
+  stdout can't `UnicodeEncodeError`), or a dropped notebook websocket would itself drop the pod. (2)
+  **`gpu_keepalive()`** — a context manager running a **quiet background daemon thread** of CUDA-touches,
+  to bracket the **GPU-idle windows the foreground hold starts too late for**: each phase's final HF push
+  (runs in `cache()`'s `finally` *after* the subprocess exits, monitor already dead — `cache()` wraps its
+  own `pusher()` in `gpu_keepalive` for every caller incl. the CLI), the inter-phase deepspeed reload, and
+  the explicit §8 `cache_push`. The §8 cell wraps the whole caching loop in `with anima.gpu_keepalive():`
+  and a `try/finally` so the foreground hold runs **even if a phase crashes** (inspect/resume the wedged
+  cache instead of losing the pod). `keepalive(quiet=True)` suppresses the heartbeat for the background use.
 
 ### Backend tiers (optional `[similarity]` extra)
 `make_sim_fn` picks best-available, logs the tier: **sentence-transformers**

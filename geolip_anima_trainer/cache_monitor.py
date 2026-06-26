@@ -23,6 +23,7 @@ No torch / GPU / model needed — pure stdlib (sqlite3, glob, tomllib).
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import sqlite3
 import time
@@ -299,3 +300,130 @@ def make_monitor(*, cache_roots: list[Path], dataset_dirs: list[Path],
         _tick()  # final line
 
     return monitor
+
+
+# =============================================================================
+# KEEPALIVE  (hold a cloud GPU pod alive AFTER the job finishes)
+# =============================================================================
+def _gpu_touch() -> bool:
+    """A trivial CUDA op so GPU utilization is non-zero this tick. Returns True if it ran
+    (keep doing it), False if torch/CUDA is unavailable or errored (stop trying — the CPU
+    heartbeat + busy kernel still hold the pod). Best-effort; never raises."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return False
+        x = torch.ones(1, device="cuda")
+        x.add_(1.0)
+        torch.cuda.synchronize()
+        del x
+        return True
+    except Exception:  # noqa: BLE001 — torch missing / driver hiccup -> fall back to CPU-only
+        return False
+
+
+def _safe_print(msg: str) -> None:
+    """print() that can NEVER drop out of the keepalive loop. The heartbeat is the ONE I/O the
+    loop does each tick, and on a cloud pod whose notebook websocket has dropped — exactly when
+    you most need the pod HELD — print can raise BrokenPipeError / OSError / ValueError('closed
+    file'). Swallow those (keep holding the pod silently); only KeyboardInterrupt propagates so
+    the ■ stop button still breaks the loop."""
+    try:
+        print(msg, flush=True)
+    except KeyboardInterrupt:
+        raise
+    except Exception:  # noqa: BLE001 — stdout gone -> keep holding the pod, just silently
+        pass
+
+
+def keepalive(*, interval: float = 60.0, deadline_s: float | None = None, gpu: bool = True,
+              stop_file: str | Path | None = None, stop_event=None,
+              on_tick: Callable[[dict], None] | None = None,
+              label: str = "holding pod", quiet: bool = False,
+              clock: Callable[[], float] = time.monotonic,
+              sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Hold a cloud GPU pod alive after a long job (caching, a push, or while you step away
+    before training). The monitor only loops WHILE the cache subprocess runs and exits the
+    instant it finishes — so the GPU goes idle and the pod gets reclaimed right after an 8 h
+    cache, before training starts. This is the bridge: run it at the end of the cache cell.
+
+    Cloud pods reclaim an IDLE pod. Verified mechanics: RunPod GPU Pods / Lambda / generic Jupyter
+    pods key on **GPU utilization** and/or **kernel-session activity** — the per-tick CUDA op
+    (best-effort; skipped if torch/CUDA absent) and this busy loop defeat both. (stdout is NOT a
+    documented idle signal anywhere — the heartbeat is for human legibility, not the mechanism.)
+    It does NOT help consumer **Google Colab** (idle = browser-UI interaction only, + a 12/24 h hard
+    cap) or **vast.ai interruptible** (bid preemption) — both out of any in-kernel loop's reach.
+
+    Stops on **KeyboardInterrupt** (the ■ stop button — press it to proceed to training), when
+    `deadline_s` elapses, when `stop_file` appears, or when a `threading.Event` `stop_event` is set
+    (the background-thread path used by gpu_keepalive). `quiet` suppresses the per-tick heartbeat.
+    Returns {ticks, elapsed, stopped_by}; **never raises** — every I/O is guarded so a dead stdout
+    can't drop the pod."""
+    t0 = clock()
+    ticks = 0
+    stopped = "interrupt"
+    gpu_ok = bool(gpu)
+    sf = Path(stop_file) if stop_file else None
+    try:
+        while True:
+            el = clock() - t0
+            if deadline_s is not None and el >= deadline_s:
+                stopped = "deadline"
+                break
+            if sf is not None and sf.exists():
+                stopped = "stop_file"
+                break
+            if stop_event is not None and stop_event.is_set():
+                stopped = "stop_event"
+                break
+            if gpu_ok:
+                gpu_ok = _gpu_touch()
+            if not quiet:
+                # ASCII-only + guarded: the loop's job is to NOT die, so the heartbeat must never
+                # raise (UnicodeEncodeError on a non-UTF-8 stdout, or OSError on a dead socket).
+                _safe_print(f"[keepalive] {label} | {_fmt(el)} elapsed | tick {ticks} | "
+                            f"{'gpu-warm' if gpu_ok else 'cpu-only'} -- interrupt (■) to proceed")
+            if on_tick:
+                try:
+                    on_tick({"ticks": ticks, "elapsed": el, "gpu": gpu_ok})
+                except Exception:  # noqa: BLE001 — a bad callback must not stop the keepalive
+                    pass
+            ticks += 1
+            sleep(interval)
+    except KeyboardInterrupt:
+        stopped = "interrupt"
+    try:
+        el = clock() - t0
+        if not quiet:
+            print(f"[keepalive] released | {_fmt(el)} | {ticks} ticks | {stopped}", flush=True)
+    except BaseException:  # noqa: BLE001 — releasing anyway; the exit line must never propagate
+        el = locals().get("el", 0.0)
+    return {"ticks": ticks, "elapsed": el, "stopped_by": stopped}
+
+
+@contextlib.contextmanager
+def gpu_keepalive(*, interval: float = 20.0, gpu: bool = True):
+    """Keep the GPU warm on a background daemon thread for the duration of a CPU/network-bound block
+    (an HF push, a deepspeed relaunch) so a GPU-utilization idle-reclaimer can't kill the pod while
+    no CUDA work is running. The monitor stops looping the instant the cache subprocess exits, so the
+    per-phase final push + the inter-phase model reload would otherwise run GPU-idle — wrap them in
+    this. Quiet (no per-tick heartbeat — the wrapped op has its own output); the thread never raises
+    into the caller; stops on block exit."""
+    import threading
+    stop = threading.Event()
+
+    def _run():
+        try:
+            keepalive(interval=interval, gpu=gpu, stop_event=stop, quiet=True)
+        except BaseException:  # noqa: BLE001 — a daemon guard must never surface an error
+            pass
+
+    t = threading.Thread(target=_run, name="anima-gpu-keepalive", daemon=True)
+    _safe_print("[keepalive] GPU-warm guard ON (background) -- holding the pod during the push/handoff")
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=interval + 5.0)
+        _safe_print("[keepalive] GPU-warm guard OFF")

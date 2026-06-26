@@ -157,3 +157,95 @@ def test_monitor_loop_runs_to_completion(tmp_path, capsys):
     mon(_Proc())
     out = capsys.readouterr().out
     assert "[cache]" in out and seen          # printed progress + fired callback
+
+
+# =============================================================================
+# KEEPALIVE  (hold the pod after caching; injected clock/sleep, gpu off)
+# =============================================================================
+def _counter_clock():
+    import itertools
+    it = itertools.count()
+    return lambda: float(next(it))
+
+
+def test_keepalive_deadline_stops_and_heartbeats(capsys):
+    # clock 0,1,2,3,...: t0=0; iters see el=1,2 (<3) -> 2 ticks; el=3 -> deadline break.
+    res = cm.keepalive(interval=999, deadline_s=3, gpu=False,
+                       clock=_counter_clock(), sleep=lambda s: None)
+    assert res["stopped_by"] == "deadline" and res["ticks"] == 2
+    out = capsys.readouterr().out
+    assert "[keepalive] holding pod" in out and "cpu-only" in out and "released" in out
+
+
+def test_keepalive_stop_file(tmp_path):
+    sf = tmp_path / "go_train.flag"
+    # the per-tick callback drops the sentinel after tick 0 -> the next iteration's check stops it.
+    res = cm.keepalive(interval=0, deadline_s=None, gpu=False, stop_file=sf,
+                       on_tick=lambda info: sf.write_text("x"),
+                       clock=_counter_clock(), sleep=lambda s: None)
+    assert res["stopped_by"] == "stop_file" and res["ticks"] == 1
+
+
+def test_keepalive_bad_on_tick_never_propagates():
+    def boom(info):
+        raise RuntimeError("callback blew up")
+    res = cm.keepalive(interval=0, deadline_s=2, gpu=False, on_tick=boom,
+                       clock=_counter_clock(), sleep=lambda s: None)   # must not raise
+    assert res["stopped_by"] == "deadline" and res["ticks"] >= 1
+
+
+def test_keepalive_keyboardinterrupt_releases_cleanly():
+    def interrupt(_s):
+        raise KeyboardInterrupt
+    res = cm.keepalive(interval=0, deadline_s=None, gpu=False,
+                       clock=_counter_clock(), sleep=interrupt)   # ■ stop button
+    assert res["stopped_by"] == "interrupt" and res["ticks"] == 1
+
+
+def test_keepalive_gpu_touch_stops_retrying_when_unavailable(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(cm, "_gpu_touch", lambda: (calls.append(1), False)[1])  # unavailable
+    res = cm.keepalive(interval=0, deadline_s=3, gpu=True,
+                       clock=_counter_clock(), sleep=lambda s: None)
+    assert res["ticks"] == 2 and len(calls) == 1          # tried once, then stuck to cpu-only
+    assert "cpu-only" in capsys.readouterr().out
+
+
+def test_keepalive_stop_event(monkeypatch):
+    import threading
+    ev = threading.Event()
+    # set the event after the first tick -> the next iteration's check stops the loop.
+    res = cm.keepalive(interval=0, deadline_s=None, gpu=False, stop_event=ev,
+                       on_tick=lambda info: ev.set(),
+                       clock=_counter_clock(), sleep=lambda s: None)
+    assert res["stopped_by"] == "stop_event" and res["ticks"] == 1
+
+
+def test_keepalive_quiet_suppresses_heartbeat(capsys):
+    res = cm.keepalive(interval=0, deadline_s=3, gpu=False, quiet=True,
+                       clock=_counter_clock(), sleep=lambda s: None)
+    out = capsys.readouterr().out
+    assert res["ticks"] == 2 and "[keepalive]" not in out   # silent per-tick AND no release line
+
+
+def test_keepalive_survives_dead_stdout(monkeypatch):
+    # a dropped notebook socket: every print raises OSError. The loop's job is to NOT die -> it must
+    # keep holding the pod (reach the deadline) instead of letting the heartbeat escape the loop.
+    import builtins
+    real = builtins.print
+    def boom(*a, **k):
+        raise OSError("Broken pipe")
+    monkeypatch.setattr(builtins, "print", boom)
+    res = cm.keepalive(interval=0, deadline_s=3, gpu=False,
+                       clock=_counter_clock(), sleep=lambda s: None)  # must NOT raise
+    monkeypatch.setattr(builtins, "print", real)
+    assert res["stopped_by"] == "deadline" and res["ticks"] == 2
+
+
+def test_gpu_keepalive_context_manager(monkeypatch):
+    import time
+    calls = []
+    monkeypatch.setattr(cm, "_gpu_touch", lambda: (calls.append(1), True)[1])
+    with cm.gpu_keepalive(interval=0.005, gpu=True):   # background daemon thread warms the GPU
+        time.sleep(0.05)
+    assert calls                                       # touched the GPU at least once, then stopped on exit
