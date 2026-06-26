@@ -25,6 +25,9 @@ from .api import (  # noqa: F401
     rebalance, render_dataset_toml, render_lora_toml, render_train_toml,
     single_concept_preset, sweep, train, train_before_after, validate, validate_bridge,
 )
+from .cache_factory import (  # noqa: F401 — the Colab cache-factory runner (light import)
+    CacheFactory, FactoryConfig, find_scratch, get_hf_token,
+)
 
 try:
     from importlib.metadata import version
@@ -47,5 +50,7 @@ __all__ = [
     "build_dataset_toml", "build_mode_tomls",
     "cache", "cache_push", "cache_pull", "reconstruct_dataset", "prune_source_cache",
     "keepalive", "gpu_keepalive", "train", "train_before_after",
+    # colab cache-factory runner
+    "CacheFactory", "FactoryConfig", "find_scratch", "get_hf_token",
     "doctor", "DoctorReport", "WindowsTrainingRefused", "DiffusionPipeNotFound",
 ]

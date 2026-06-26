@@ -28,7 +28,11 @@ installable package **`geolip_anima_trainer`** (console command **`anima`**):
 - `subject_similarity.py` — 3-tier similarity backend (sentence-transformers →
   numpy char-trigram → difflib) behind the optional `[similarity]` extra.
 - `cache_monitor.py` — **`anima cache --progress`**: live %-done + ETA from the cache
-  SQLite `metadata.db` COUNT(*) (the cache is sharded blobs, not per-image files).
+  SQLite `metadata.db` COUNT(*) (the cache is sharded blobs, not per-image files). Also holds
+  the pod **`keepalive`/`gpu_keepalive`** (idle-reclaim guards; see "Pod keepalive" below).
+- `cache_factory.py` + `anima_colab.py` (repo root) — the **Colab A100 cache-FACTORY** runner.
+  The notebook is a static thin shell; all logic is here so iterating = `git pull`, never
+  re-pasting cells. See "Colab cache factory" below.
 - `api.py` / `cli.py` — the Python API and the `anima` CLI.
 - `templates/anima_lora.toml`, `templates/anima_dataset.toml` — packaged templates;
   copy into `./configs` with `anima init-config`.
@@ -344,6 +348,42 @@ in `external/diffusion-pipe/utils/{cache,dataset}.py`):
   the explicit §8 `cache_push`. The §8 cell wraps the whole caching loop in `with anima.gpu_keepalive():`
   and a `try/finally` so the foreground hold runs **even if a phase crashes** (inspect/resume the wedged
   cache instead of losing the pod). `keepalive(quiet=True)` suppresses the heartbeat for the background use.
+
+### Colab cache factory — `cache_factory.py` + `anima_colab.py` + the THIRD notebook
+`notebooks/anima_colab_cache_factory.ipynb` builds the full-set cache on a **Colab A100** (the cache step is
+decode/CPU-bound + low-VRAM, so an 80 GB A100 with a big **local-scratch NVMe** is an ideal cache factory)
+and pushes it to HF for the RTX 6000 to pull + train. **Design constraint (load-bearing):** Colab can't
+hot-swap a notebook — every session is a fresh notebook + runtime and editing means re-pasting cells. So the
+notebook is a **static thin shell** (clone → `anima_colab.install` → a few `CacheFactory` calls) and ALL
+logic lives in the repo; iterating = `git pull` (step 1 pulls every run), never a notebook edit. Verified by
+a fresh-runtime/reset simulation: the design holds across first-run, post-restart re-run, and full-reset-resume.
+- **`anima_colab.py` is at the REPO ROOT, stdlib-only** — it must import on a *bare* Colab before the
+  package's deps exist (importing the package needs them), so it can't be a package submodule. `install()` is
+  idempotent via a `.anima_colab_installed` marker (skips after the one restart; re-installs on a fresh
+  runtime) and returns `True` iff a restart is needed. A deps-changing pull needs `install(force=True)`.
+- **`import geolip_anima_trainer` is now hf/torch-free at import** (the one eager hf import, in
+  `download_anima.py`, was made lazy). This is load-bearing: `CacheFactory.setup()` sets `HF_HOME` onto the
+  scratch SSD **before** the first `huggingface_hub` import (hf fixes its hub-cache dir from `HF_HOME` at its
+  *first* import), so the cache lands on the 368 GB NVMe, not the 235 GB persistent disk.
+- **`CacheFactory`** methods (each = one notebook cell, idempotent, run in order): `setup()` (autodetect
+  scratch via `find_scratch`; put `HF_HOME`/`TMPDIR`/`DATA_ROOT` on it; **symlink a portable
+  `/workspace/anima_data` → scratch** so the latent fingerprint's absolute paths match the training box;
+  HF auth; GPU check; model download) → `prepare_dataset()` (resume via `cache_pull`, else
+  `export_subject_buckets` + store index; prune the source parquet) → `build_configs()` (the two
+  before_after tomls + a lora toml per phase) → `run_cache()` (both phases, periodic + final HF push, wrapped
+  in `gpu_keepalive`, per-phase `try/except` so a crash still pushes). `run_all()` chains them; `status()`
+  shows disk + cached counts + phase errors. State is in-memory (mirrored to `factory_state.json` for
+  inspection, **not** auto-reloaded) — a reset re-runs `setup()` first; cold-calling a later method raises a
+  clear "run setup() first" error (not a bare `KeyError`).
+- **Scratch is EPHEMERAL** (wiped on disconnect) → the periodic HF push is the durability, not the disk. The
+  full 83k (~106 GB images+cache) fits the 368 GB scratch but NOT the 235 GB persistent disk — so the
+  no-scratch fallback **refuses `limit=None`** (would fill `/content` and crash mid-cache) and tells the user
+  to set a smaller `limit=`/`data_root=` (a kwarg change in the existing cell, not a notebook edit).
+- **Portability footgun:** the fingerprint embeds DATA_ROOT, so the portable `/workspace/anima_data` symlink
+  is what makes the A100-built cache resume on the RTX 6000 (which uses the same path). If the symlink can't
+  be established (a real non-empty dir is there), `setup()` **warns loudly** that resume may break rather than
+  silently using the volatile scratch path. On Colab the in-kernel keepalive is the *wrong* lever (idle is
+  browser-UI based) — the HF push is the real safety net; Pro+ background execution is best-effort.
 
 ### Backend tiers (optional `[similarity]` extra)
 `make_sim_fn` picks best-available, logs the tier: **sentence-transformers**

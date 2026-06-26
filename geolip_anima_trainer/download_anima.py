@@ -23,8 +23,6 @@ Then paste the printed paths into anima_lora.toml's [model] block.
 import argparse
 from pathlib import Path
 
-from huggingface_hub import hf_hub_download
-
 REPO_ID = "circlestone-labs/Anima"
 
 # Map a short --base choice to the actual repo filename.
@@ -41,7 +39,12 @@ VAE          = "split_files/vae/qwen_image_vae.safetensors"
 
 
 def fetch(repo_filename: str, dest: Path) -> str:
-    """Download one repo file into `dest`, preserving no nesting. Returns local path."""
+    """Download one repo file into `dest`, preserving no nesting. Returns local path.
+
+    huggingface_hub is imported HERE, not at module top, so `import geolip_anima_trainer`
+    stays hf-free — the hub cache dir is fixed from HF_HOME at hf's FIRST import, so a caller
+    that sets HF_HOME (e.g. onto a big scratch disk) before the first download still wins."""
+    from huggingface_hub import hf_hub_download
     # local_dir keeps the repo's internal subfolders; we resolve the real path after.
     local_path = hf_hub_download(
         repo_id=REPO_ID,
