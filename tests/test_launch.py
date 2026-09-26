@@ -136,3 +136,32 @@ def test_launch_creates_missing_log_parent(tmp_path: Path, monkeypatch):
     rc = L.launch(plan, log_path=log_path)        # monitor=None + log_path set -> the fixed branch
     assert rc == 0
     assert log_path.parent.is_dir() and log_path.exists()
+
+
+def _lora_with_samples(tmp_path: Path, *, stages=1) -> Path:
+    p = _lora(tmp_path, stages=stages)
+    p.write_text(p.read_text(encoding="utf-8") + "\n[samples]\nprompts = ['a pool']\n", encoding="utf-8")
+    return p
+
+
+def test_samples_warn_when_pipe_has_no_previews(tmp_path: Path, caplog):
+    root = _fake_pipe(tmp_path)
+    with caplog.at_level("WARNING", logger="anima.launch"):
+        L.build_plan(config_toml=_lora_with_samples(tmp_path), repo_root=root, num_gpus=2)
+    assert any("utils/previews.py" in r.getMessage() for r in caplog.records)
+
+
+def test_samples_quiet_when_pipe_has_previews(tmp_path: Path, caplog):
+    root = _fake_pipe(tmp_path)
+    utils = root / "external" / "diffusion-pipe" / "utils"
+    utils.mkdir()
+    (utils / "previews.py").write_text("# fake\n", encoding="utf-8")
+    with caplog.at_level("WARNING", logger="anima.launch"):
+        L.build_plan(config_toml=_lora_with_samples(tmp_path), repo_root=root, num_gpus=2)
+    assert not any("previews" in r.getMessage() for r in caplog.records)
+
+
+def test_samples_refuse_pipeline_parallel(tmp_path: Path):
+    root = _fake_pipe(tmp_path)
+    with pytest.raises(ValueError, match="samples"):
+        L.build_plan(config_toml=_lora_with_samples(tmp_path, stages=2), repo_root=root, num_gpus=2)

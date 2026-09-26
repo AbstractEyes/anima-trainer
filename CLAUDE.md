@@ -412,6 +412,17 @@ checkpoint to an HF *model* repo) / `status()` (disk + latest checkpoint + detac
 `os.kill(pid,0)`). Durability is inverted vs the factory: the box is **persistent**, so on-disk checkpoints are
 the lifeline and the HF LoRA backup is an optional heartbeat. `tests/test_trainer_runner.py` covers the wiring.
 
+### Training previews — `SamplesConfig` → `[samples]`
+`TrainConfig.samples = SamplesConfig(prompts=[...])` renders a `[samples]` table into the lora toml
+(prompts as TOML basic strings, so quotes/unicode are safe); `None` (default) renders nothing. The trainer
+side lives in the **AbstractEyes diffusion-pipe fork** (`utils/previews.py`): at every save (and once at step
+0) each data-parallel rank renders its share of the prompts with the in-training weights into
+`<run>/samples/<save>/NN_<slug>.png` + TensorBoard; errors are printed and skipped, never fatal. Upstream
+tdrussell diffusion-pipe (the default `external/diffusion-pipe`) ignores the table, so `build_plan` warns when
+the located diffusion-pipe has no `utils/previews.py`, and refuses `[samples]` with `pipeline_stages > 1`.
+`validate()` checks the settings (sizes multiple of 16, steps ≥ 1, cfg/shift > 0). Tests:
+`tests/test_config.py` (round trip, awkward prompts, validation) + `tests/test_launch.py` (warning, refusal).
+
 ### Backend tiers (optional `[similarity]` extra)
 `make_sim_fn` picks best-available, logs the tier: **sentence-transformers**
 (`all-MiniLM-L6-v2`, ~90 MB; or `--similarity-model nomic-ai/nomic-embed-text-v1` =

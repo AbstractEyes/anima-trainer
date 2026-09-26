@@ -119,3 +119,42 @@ def test_fft_variant_omits_adapter(tmp_path: Path):
     lora_path, _ = C.render_train_toml(cfg, tmp_path)
     parsed = tomllib.loads(lora_path.read_text(encoding="utf-8"))
     assert "adapter" not in parsed
+
+
+def test_samples_absent_by_default(tmp_path: Path):
+    cfg = C.single_concept_preset("data/c", output_dir="r", model=_model())
+    lora_path, _ = C.render_train_toml(cfg, tmp_path)
+    assert "samples" not in tomllib.loads(lora_path.read_text(encoding="utf-8"))
+    assert C.load_train_config(lora_path).samples is None
+
+
+def test_samples_round_trip_with_awkward_prompts(tmp_path: Path):
+    prompts = ["it's a lighthouse", 'a "quoted" sign', "ünïcode café, 東京", "back\\slash"]
+    cfg = C.single_concept_preset("data/c", output_dir="r", model=_model())
+    cfg.samples = C.SamplesConfig(prompts=prompts, negative_prompt="blurry, it's bad",
+                                  width=768, steps=20, cfg=5, seed=7)
+    lora_path, _ = C.render_train_toml(cfg, tmp_path)
+    parsed = tomllib.loads(lora_path.read_text(encoding="utf-8"))["samples"]
+    assert parsed["prompts"] == prompts
+    assert parsed["negative_prompt"] == "blurry, it's bad"
+    assert (parsed["width"], parsed["height"], parsed["steps"], parsed["seed"]) == (768, 1024, 20, 7)
+    assert parsed["cfg"] == 5.0 and parsed["shift"] == 3.0 and parsed["before_first_step"] is True
+    back = C.load_train_config(lora_path)
+    assert back.samples == C.SamplesConfig(prompts=prompts, negative_prompt="blurry, it's bad",
+                                           width=768, steps=20, cfg=5.0, seed=7)
+    assert "samples" not in vars(back.run)     # the table never leaks into the run keys
+
+
+def test_validate_rejects_bad_samples():
+    for bad in (dict(width=1000), dict(steps=0), dict(cfg=0), dict(seed=True), dict(prompts=["ok", " "])):
+        cfg = C.single_concept_preset("data/c", output_dir="r", model=_model())
+        cfg.samples = C.SamplesConfig(**{"prompts": ["a pool"], **bad})
+        with pytest.raises(C.ConfigError):
+            C.validate(cfg)
+    cfg = C.single_concept_preset("data/c", output_dir="r", model=_model())
+    cfg.samples = C.SamplesConfig(prompts=["a pool"])
+    cfg.run.pipeline_stages = 2
+    with pytest.raises(C.ConfigError):
+        C.validate(cfg)
+    cfg.run.pipeline_stages = 1
+    C.validate(cfg)

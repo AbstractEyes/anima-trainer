@@ -22,6 +22,7 @@ The Anima invariants that MUST NOT be lost are encoded in validate():
 
 from __future__ import annotations
 
+import json
 import logging
 import tomllib
 from copy import deepcopy
@@ -71,6 +72,23 @@ class OptimizerConfig:
     betas: tuple[float, float] = (0.9, 0.99)
     weight_decay: float = 0.01
     eps: float = 1e-8
+
+
+@dataclass
+class SamplesConfig:
+    """[samples] — training previews: the prompts are rendered at every save (and once before the
+    first step) into <run>/samples/<save>/ and TensorBoard. Needs a diffusion-pipe that ships
+    utils/previews.py (the AbstractEyes fork); upstream diffusion-pipe ignores the table.
+    TrainConfig.samples = None (the default) renders no table."""
+    prompts: list[str] = field(default_factory=list)
+    negative_prompt: str = ""        # used when cfg > 1
+    width: int = 1024                # multiples of 16
+    height: int = 1024
+    steps: int = 30
+    cfg: float = 4.0                 # the Anima card recommends CFG 4-5 for the base model
+    shift: float = 3.0               # matches ComfyUI's Anima sampling shift
+    seed: int = 42                   # prompt i starts from seed + i at every save
+    before_first_step: bool = True   # one render of the untouched model at step 0
 
 
 @dataclass
@@ -170,6 +188,7 @@ class TrainConfig:
     # Where the dataset toml will be written; becomes `dataset =` in the lora toml.
     dataset_toml_path: str = "configs/anima_dataset.toml"
     eval_dataset: DatasetConfig | None = None
+    samples: SamplesConfig | None = None   # training previews; None -> no [samples] table
 
 
 # =============================================================================
@@ -208,8 +227,13 @@ def load_train_config(lora_toml: str | Path,
     adapter = (AdapterConfig(**_take(lora["adapter"], AdapterConfig))
                if "adapter" in lora else None)
     optimizer = OptimizerConfig(**_take(lora.get("optimizer", {}), OptimizerConfig))
+    samples = None
+    if "samples" in lora:
+        samples = SamplesConfig(**_take(lora["samples"], SamplesConfig))
+        if isinstance(samples.prompts, str):
+            samples.prompts = [samples.prompts]
     run_keys = {k: v for k, v in lora.items()
-                if k not in ("model", "adapter", "optimizer", "dataset")}
+                if k not in ("model", "adapter", "optimizer", "dataset", "samples")}
     run = RunConfig(**_take(run_keys, RunConfig))
 
     ds_path = dataset_toml or lora.get("dataset")
@@ -217,7 +241,8 @@ def load_train_config(lora_toml: str | Path,
         else DatasetConfig()
     return TrainConfig(run=run, model=model, adapter=adapter, optimizer=optimizer,
                        dataset=dataset,
-                       dataset_toml_path=str(ds_path) if ds_path else "")
+                       dataset_toml_path=str(ds_path) if ds_path else "",
+                       samples=samples)
 
 
 # =============================================================================
@@ -232,6 +257,11 @@ def _toml_scalar(v: Any) -> str:
     if isinstance(v, (list, tuple)):
         return "[" + ", ".join(_toml_scalar(x) for x in v) + "]"
     return repr(v)
+
+
+def _toml_str(v: str) -> str:
+    """A TOML basic string (JSON escaping is valid TOML), safe for prompts with quotes or unicode."""
+    return json.dumps(v, ensure_ascii=False)
 
 
 def render_dataset_toml(cfg: DatasetConfig) -> str:
@@ -295,6 +325,11 @@ _LLM_ADAPTER_NOTE = """\
 #   (1e-6 .. 5e-6 ceiling, never higher) and A/B against the frozen baseline.
 #   If general quality drops or other concepts regress, revert to 0. Frozen wins ties."""
 
+_SAMPLES_NOTE = """\
+# Training previews: these prompts are rendered with the in-training weights at every save
+# (and once before the first step) into <output_dir>/<run>/samples/<save>/ and TensorBoard.
+# Needs a diffusion-pipe with utils/previews.py (the AbstractEyes fork); upstream ignores it."""
+
 
 def render_lora_toml(cfg: TrainConfig) -> str:
     """Render a TrainConfig to anima_lora.toml text, canonical comments baked in."""
@@ -344,6 +379,20 @@ def render_lora_toml(cfg: TrainConfig) -> str:
               f"betas = {_toml_scalar(list(o.betas))}",
               f"weight_decay = {o.weight_decay}",
               f"eps = {_toml_scalar(o.eps)}", ""]
+
+    s = cfg.samples
+    if s is not None and s.prompts:
+        lines += ["[samples]", _SAMPLES_NOTE, "prompts = ["]
+        lines += [f"    {_toml_str(p)}," for p in s.prompts]
+        lines += ["]",
+                  f"negative_prompt = {_toml_str(s.negative_prompt)}",
+                  f"width = {s.width}",
+                  f"height = {s.height}",
+                  f"steps = {s.steps}",
+                  f"cfg = {_toml_scalar(float(s.cfg))}",
+                  f"shift = {_toml_scalar(float(s.shift))}",
+                  f"seed = {s.seed}",
+                  f"before_first_step = {_toml_scalar(s.before_first_step)}", ""]
     return "\n".join(lines)
 
 
@@ -539,6 +588,26 @@ def validate(cfg: TrainConfig, *, strict: bool = True) -> TrainConfig:
     # -- topology -------------------------------------------------------------
     if cfg.run.pipeline_stages < 1:
         errs.append("pipeline_stages must be >= 1.")
+
+    # -- training previews ----------------------------------------------------
+    s = cfg.samples
+    if s is not None and s.prompts:
+        def _int(v: Any) -> bool:
+            return isinstance(v, int) and not isinstance(v, bool)
+        if not all(isinstance(p, str) and p.strip() for p in s.prompts):
+            errs.append("samples.prompts must be non-empty strings.")
+        for label, v in (("width", s.width), ("height", s.height)):
+            if not _int(v) or v <= 0 or v % 16:
+                errs.append(f"samples.{label}={v!r} must be a positive multiple of 16.")
+        if not _int(s.steps) or s.steps < 1:
+            errs.append(f"samples.steps={s.steps!r} must be >= 1.")
+        if not _int(s.seed):
+            errs.append(f"samples.seed={s.seed!r} must be an integer.")
+        if s.cfg <= 0 or s.shift <= 0:
+            errs.append("samples.cfg and samples.shift must be > 0.")
+        if cfg.run.pipeline_stages != 1:
+            errs.append("samples (training previews) need pipeline_stages = 1: every rank must "
+                        "hold the whole model to render.")
 
     # -- train/eval resolution consistency (shared latent cache) -------------
     if cfg.eval_dataset and cfg.eval_dataset.resolutions != cfg.dataset.resolutions:

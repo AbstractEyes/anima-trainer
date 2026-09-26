@@ -115,6 +115,22 @@ weight_decay = 0.01
 eps = 1e-8
 
 # =============================================================================
+# TRAINING PREVIEWS (optional): uncomment to render these prompts with the in-training
+# weights at every save (and once before the first step) into
+# <output_dir>/<run>/samples/<save>/ and TensorBoard. Needs a diffusion-pipe that ships
+# utils/previews.py (the AbstractEyes fork); upstream diffusion-pipe ignores the table.
+# [samples]
+# prompts = ['a lighthouse on a cliff at dusk', 'an empty office at night']
+# negative_prompt = 'worst quality, low quality, blurry, jpeg artifacts'
+# width = 1024
+# height = 1024
+# steps = 30
+# cfg = 4.0
+# shift = 3.0
+# seed = 42
+# before_first_step = true
+
+# =============================================================================
 # FULL FINE-TUNE VARIANT (you have the VRAM for it on a 2B model):
 #   1. Delete/comment the entire [adapter] table above.
 #   2. Drop optimizer lr to ~1e-5 (or 5e-6) — base model, light touch.

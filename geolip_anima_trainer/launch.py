@@ -18,6 +18,7 @@ rather than --num-gpus which grabs the first N visible devices.
 
 from __future__ import annotations
 
+import logging
 import os
 import platform
 import shlex
@@ -26,6 +27,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("anima.launch")
 
 
 class WindowsTrainingRefused(RuntimeError):
@@ -219,6 +222,16 @@ def build_plan(
         raise ValueError(f"pipeline_stages={stages} exceeds world size {world}")
     if world % stages != 0:
         raise ValueError(f"world size {world} not divisible by pipeline_stages={stages}")
+
+    # Training previews ([samples]) render on every rank with the whole model, and only a
+    # diffusion-pipe that ships utils/previews.py knows the table (upstream silently ignores it).
+    if (toml.get("samples") or {}).get("prompts"):
+        if stages != 1:
+            raise ValueError("[samples] training previews need pipeline_stages = 1")
+        if not (train_py.parent / "utils" / "previews.py").is_file():
+            log.warning("[samples] is set, but %s has no utils/previews.py: this diffusion-pipe "
+                        "ignores the table and renders no previews (use the AbstractEyes fork).",
+                        train_py.parent)
 
     env = dict(extra_env or {})
     if not expandable_segments:
