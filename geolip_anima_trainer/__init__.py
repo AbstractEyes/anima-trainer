@@ -1,5 +1,6 @@
 """geolip_anima_trainer — bridge + orchestration to finetune CircleStone Anima
-(2B DiT) with tdrussell/diffusion-pipe.
+(2B DiT) with tdrussell/diffusion-pipe, and Sana (diffusers format) with the
+AbstractEyes diffusion-pipe fork.
 
 See PRELIM_PLAN.md / CLAUDE.md for the domain brief. Public API:
 
@@ -10,20 +11,21 @@ See PRELIM_PLAN.md / CLAUDE.md for the domain brief. Public API:
     anima.build_dataset_toml(...)   # balanced dataset.toml
     anima.single_concept_preset(...)  # composable TrainConfig
     anima.train(..., dry_run=True)  # diffusion-pipe deepspeed launch
+    anima.sana_model(anima.download_sana("models/sana"))  # a Sana [model] block
 """
 
 from __future__ import annotations
 
 from .api import (  # noqa: F401
-    AdapterConfig, CaptionMode, ConfigError, DatasetConfig, DatasetTomlConfig,
+    MODEL_TYPES, AdapterConfig, CaptionMode, ConfigError, DatasetConfig, DatasetTomlConfig,
     DirectoryConfig, DiffusionPipeNotFound, DoctorReport, ExportConfig, ModelConfig,
-    ModelPaths, OptimizerConfig, RunConfig, SubjectBucketConfig, TrainConfig,
+    ModelPaths, OptimizerConfig, RunConfig, SamplesConfig, SubjectBucketConfig, TrainConfig,
     WindowsTrainingRefused, apply_overrides, build_dataset_toml, build_mode_tomls,
-    cache, cache_pull, cache_push, doctor, download_models, export_dataset,
+    cache, cache_pull, cache_push, doctor, download_models, download_sana, export_dataset,
     export_subject_buckets, reconstruct_dataset, prune_source_cache, keepalive, gpu_keepalive,
     inspect_source, load_dataset_config, load_train_config, multi_concept_preset,
-    rebalance, render_dataset_toml, render_lora_toml, render_train_toml,
-    single_concept_preset, sweep, train, train_before_after, validate, validate_bridge,
+    preset_optimizer, rebalance, render_dataset_toml, render_lora_toml, render_train_toml,
+    sana_model, single_concept_preset, sweep, train, train_before_after, validate, validate_bridge,
 )
 from .cache_factory import (  # noqa: F401 — the Colab cache-factory runner (light import)
     CacheFactory, FactoryConfig, find_scratch, get_hf_token,
@@ -39,15 +41,16 @@ except Exception:  # noqa: BLE001 — not installed (e.g. running from source)
 __all__ = [
     "__version__",
     # config engine
-    "ModelConfig", "AdapterConfig", "OptimizerConfig", "RunConfig",
+    "MODEL_TYPES", "ModelConfig", "AdapterConfig", "OptimizerConfig", "RunConfig", "SamplesConfig",
     "DatasetConfig", "DirectoryConfig", "TrainConfig", "ConfigError", "ModelPaths",
     "ExportConfig", "DatasetTomlConfig", "SubjectBucketConfig", "CaptionMode",
     "load_train_config", "load_dataset_config", "render_train_toml",
     "render_lora_toml", "render_dataset_toml", "apply_overrides", "rebalance",
-    "single_concept_preset", "multi_concept_preset", "sweep",
+    "single_concept_preset", "multi_concept_preset", "preset_optimizer", "sweep",
     "validate", "validate_bridge",
     # operations
-    "download_models", "inspect_source", "export_dataset", "export_subject_buckets",
+    "download_models", "download_sana", "sana_model",
+    "inspect_source", "export_dataset", "export_subject_buckets",
     "build_dataset_toml", "build_mode_tomls",
     "cache", "cache_push", "cache_pull", "reconstruct_dataset", "prune_source_cache",
     "keepalive", "gpu_keepalive", "train", "train_before_after",

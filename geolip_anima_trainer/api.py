@@ -23,16 +23,17 @@ import logging
 
 from . import build_multiconcept_dataset as _build
 from . import download_anima as _dl
+from . import download_sana as _dl_sana
 from . import hf_to_diffusion_pipe as _bridge
 from . import launch as _launch
 from . import subject_buckets as _subjects
 
 log = logging.getLogger("anima.api")
 from .config import (  # re-exported "elemental construction" surface
-    AdapterConfig, ConfigError, DatasetConfig, DirectoryConfig, ModelConfig,
-    OptimizerConfig, RunConfig, TrainConfig,
+    MODEL_TYPES, AdapterConfig, ConfigError, DatasetConfig, DirectoryConfig, ModelConfig,
+    OptimizerConfig, RunConfig, SamplesConfig, TrainConfig,
     apply_overrides, load_dataset_config, load_train_config,
-    multi_concept_preset, rebalance, render_dataset_toml, render_lora_toml,
+    multi_concept_preset, preset_optimizer, rebalance, render_dataset_toml, render_lora_toml,
     render_train_toml, single_concept_preset, sweep, validate, validate_bridge,
 )
 from .doctor import DoctorReport, doctor
@@ -45,16 +46,17 @@ CaptionMode = _subjects.CaptionMode
 
 __all__ = [
     # config engine
-    "ModelConfig", "AdapterConfig", "OptimizerConfig", "RunConfig",
+    "MODEL_TYPES", "ModelConfig", "AdapterConfig", "OptimizerConfig", "RunConfig", "SamplesConfig",
     "DatasetConfig", "DirectoryConfig", "TrainConfig", "ConfigError",
     "load_train_config", "load_dataset_config", "render_train_toml",
     "render_lora_toml", "render_dataset_toml", "apply_overrides", "rebalance",
-    "single_concept_preset", "multi_concept_preset", "sweep",
+    "single_concept_preset", "multi_concept_preset", "preset_optimizer", "sweep",
     "validate", "validate_bridge",
     # bridge configs
     "ExportConfig", "DatasetTomlConfig", "SubjectBucketConfig", "CaptionMode", "ModelPaths",
     # operations
-    "download_models", "inspect_source", "export_dataset", "export_subject_buckets",
+    "download_models", "download_sana", "sana_model",
+    "inspect_source", "export_dataset", "export_subject_buckets",
     "build_dataset_toml", "build_mode_tomls", "cache", "cache_push", "cache_pull",
     "reconstruct_dataset", "prune_source_cache", "keepalive", "gpu_keepalive",
     "train", "train_before_after",
@@ -86,6 +88,21 @@ def download_models(dest: str | Path, base: str = "base-v1.0") -> ModelPaths:
         vae_path=_dl.fetch(_dl.VAE, dest),
         llm_path=_dl.fetch(_dl.TEXT_ENCODER, dest),
     )
+
+
+def download_sana(dest: str | Path, variant: str = _dl_sana.DEFAULT_VARIANT) -> str:
+    """Fetch one diffusers-format Sana checkpoint (precision variants skipped) into dest/<repo>.
+    Returns the folder for ModelConfig(type='sana', diffusers_path=...); the dataset resolution
+    is the variant's native size (_dl_sana.SANA_REPOS[variant][1])."""
+    dest = Path(dest).expanduser().resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    return _dl_sana.fetch(_dl_sana.SANA_REPOS[variant][0], dest)
+
+
+def sana_model(diffusers_path: str | Path, *, shift: float = 3.0) -> ModelConfig:
+    """The [model] block for a Sana run (bf16; shift 3.0 = the checkpoints' own sampling shift).
+    Needs the AbstractEyes diffusion-pipe fork (build_plan refuses a checkout without it)."""
+    return ModelConfig(type="sana", diffusers_path=str(diffusers_path), shift=shift)
 
 
 # =============================================================================

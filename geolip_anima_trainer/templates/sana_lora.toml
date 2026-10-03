@@ -1,0 +1,104 @@
+# =============================================================================
+# sana_lora.toml  —  diffusion-pipe training config for Sana (diffusers format)
+# Trainer: the AbstractEyes diffusion-pipe fork — model type 'sana' lives in its
+#   models/sana.py (upstream tdrussell/diffusion-pipe does not have it; `anima train`
+#   refuses a checkout without it). Point ANIMA_DIFFUSION_PIPE at the fork.
+# Model: one diffusers-format Sana folder (`anima download --model sana`).
+#   Licences: the Sana checkpoints are Apache-2.0; the bundled Gemma-2-2B-IT text
+#   encoder is under Google's Gemma Terms of Use + Prohibited Use Policy.
+# Objective: a LoRA on the Sana transformer (text encoder + autoencoder frozen).
+# -----------------------------------------------------------------------------
+# Run:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     deepspeed --num_gpus=1 train.py --deepspeed --config configs/sana_lora.toml
+# Output LoRA is saved in diffusers format (transformer.<module>.lora_A/B.weight):
+#   pipe.load_lora_weights('<run>/epochN', weight_name='adapter_model.safetensors')
+# =============================================================================
+
+# ---- top-level run settings -------------------------------------------------
+output_dir = '/data/diffusion_pipe_runs/sana_lora'   # CHANGE: a new subdir is made per run
+dataset    = 'configs/sana_dataset.toml'             # CHANGE: path to the dataset toml
+
+# Epochs high; pick the best saved checkpoint by eval loss / previews.
+epochs = 100
+
+# Sana 600M at 512 px is small: micro batch 4 is a light start, raise it freely.
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1                  # single GPU / data parallel
+gradient_accumulation_steps = 1
+gradient_clipping = 1.0
+warmup_steps = 50
+
+# ---- eval (optional but useful for picking a checkpoint) --------------------
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 4
+eval_gradient_accumulation_steps = 1
+
+# ---- checkpointing / saving -------------------------------------------------
+save_every_n_epochs = 5
+checkpoint_every_n_minutes = 30      # full training-state checkpoint for --resume_from_checkpoint
+save_dtype = 'bfloat16'
+
+activation_checkpointing = false     # VRAM <-> speed trade; Sana 600M rarely needs it
+compile = false
+partition_method = 'parameters'
+caching_batch_size = 8               # images per VAE forward while caching; keep small
+# map_num_proc = 24                  # image-decode workers while caching = your box's core count
+steps_per_print = 10
+blocks_to_swap = 0
+
+# =============================================================================
+[model]
+type = 'sana'
+# The diffusers folder, e.g. Efficient-Large-Model/Sana_600M_512px_diffusers.
+# The autoencoder and the Gemma-2 text encoder load in bf16; captions are encoded as
+# the diffusers SanaPipeline encodes prompts (its instruction prefix, the 300-token
+# selection; an empty caption = the pipeline's unconditional prompt).
+diffusers_path = '/data/models/sana/Sana_600M_512px_diffusers'   # CHANGE
+dtype = 'bfloat16'
+# Training timesteps: logit-normal (the default), shifted by the checkpoints' own
+# sampling shift (scheduler_config.json flow_shift = 3.0).
+shift = 3.0
+
+# =============================================================================
+[adapter]
+type = 'lora'
+# LoRA goes on every Linear layer inside the transformer blocks (self- and
+# cross-attention projections; the feed-forward is convolutional and stays frozen).
+rank = 32
+dtype = 'bfloat16'
+# init_from_existing = '/data/diffusion_pipe_runs/sana_lora/<run>/epoch20'  # to continue a LoRA
+
+# =============================================================================
+[optimizer]
+# Plain Adam, weight decay 0 (wired as 'adam' in the AbstractEyes fork). 1e-4 is the
+# learning rate of the diffusers Sana LoRA example (examples/dreambooth/README_sana.md).
+type = 'adam'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.0
+eps = 1e-8
+
+# =============================================================================
+# TRAINING PREVIEWS (optional): uncomment to render these prompts with the in-training
+# weights at every save (and once before the first step) into
+# <output_dir>/<run>/samples/<save>/ and TensorBoard. 20 steps / guidance 4.5 are the
+# stock pipeline's defaults; sizes must be multiples of 32. The previews sample with a
+# flow-matching Euler scheduler (the stock pipeline uses DPM-Solver), so they match its
+# images closely but not exactly.
+# [samples]
+# prompts = ['a lighthouse on a cliff at dusk', 'a bowl of fruit on a kitchen counter']
+# negative_prompt = ''
+# width = 512
+# height = 512
+# steps = 20
+# cfg = 4.5
+# shift = 3.0
+# seed = 42
+# before_first_step = true
+
+# =============================================================================
+# FULL FINE-TUNE VARIANT: delete the [adapter] table and drop lr to ~1e-5. The
+# whole transformer state dict is saved as model.safetensors.
+# =============================================================================

@@ -2,7 +2,8 @@
 
 Bridge + orchestration to finetune **CircleStone Anima** (2B anime text-to-image DiT)
 with **[tdrussell/diffusion-pipe](https://github.com/tdrussell/diffusion-pipe)** — the
-only trainer that natively supports Anima.
+only trainer that natively supports Anima. It also trains **Sana** (diffusers format)
+through the AbstractEyes diffusion-pipe fork; see [Sana](#sana-diffusers-format).
 
 Anima's DiT backbone is NVIDIA Cosmos-Predict2-2B. This package reads an HF
 `datasets`-format parquet repo (columnar, via pyarrow) into the image + `.txt`-sidecar
@@ -210,6 +211,54 @@ for tag, cfg_path in anima.sweep(base, ranks=[32, 64], lrs=[1e-5, 2e-5], runs_ro
 
 `anima.validate()` enforces the Anima invariants (frozen adapter, tag-order, bf16,
 no fp8/flash-attn/block-swap). See `CLAUDE.md` for the full domain brief and rules.
+
+## Sana (diffusers format)
+
+The same tooling trains LoRAs for **[Sana](https://github.com/NVlabs/Sana)** (NVlabs; Xie et al.
+2024, [arXiv 2410.10629](https://arxiv.org/abs/2410.10629)): a linear-attention DiT with a 32x
+autoencoder and a Gemma-2-2B text encoder; the 600M model at 512 px is small enough for quick
+experiments. Sana's trainer side is model type **`sana`** in the
+**[AbstractEyes diffusion-pipe fork](https://github.com/AbstractEyes/diffusion-pipe)**
+(`models/sana.py`); upstream diffusion-pipe does not have it, and `anima train` / `anima cache`
+refuse a checkout without it. Point `ANIMA_DIFFUSION_PIPE` at the fork, or clone it as
+`external/diffusion-pipe`.
+
+```bash
+anima download --model sana --dest models/sana --variant 600m-512   # prints diffusers_path + the native resolution
+anima init-config --model sana                                      # configs/sana_lora.toml + sana_dataset.toml
+anima validate --config configs/sana_lora.toml
+ANIMA_DIFFUSION_PIPE=/path/to/AbstractEyes/diffusion-pipe \
+  anima train --config configs/sana_lora.toml --num-gpus 1          # --dry-run prints the command anywhere
+```
+
+```python
+import geolip_anima_trainer as anima
+model = anima.sana_model(anima.download_sana("models/sana", variant="600m-512"))
+cfg = anima.single_concept_preset("datasets/my_concept", output_dir="runs/sana", model=model, resolution=512)
+anima.render_train_toml(cfg, "configs/sana")
+```
+
+What differs from Anima:
+- **One folder.** `[model] diffusers_path` points at a diffusers-format checkpoint (transformer +
+  DC-AE autoencoder + Gemma-2 + tokenizer). `anima download --model sana` fetches one of the checked
+  repos and skips the duplicate fp16/bf16/int4 weight files the loader never reads.
+- **Captions** are natural language. The fork encodes them exactly as the diffusers `SanaPipeline`
+  encodes prompts (lowercased, its instruction prefix, the 300-token selection; an empty caption is the
+  pipeline's unconditional prompt), checked on the 600M 512px checkpoint: text embeddings identical,
+  the transformer layer chain identical up to fp32 rounding, a training preview matching the stock
+  pipeline's image.
+- **Resolution** is the checkpoint's native size (512 or 1024); `validate()` warns otherwise, and preview
+  sizes must be multiples of 32.
+- **Presets**: plain Adam (weight decay 0) at 1e-4, the learning rate of the diffusers Sana LoRA example;
+  `shift = 3.0`, the checkpoints' own sampling shift. No LLM adapter (`llm_adapter_lr` is Anima-only).
+- **Output**: LoRAs are saved in diffusers format;
+  `pipe.load_lora_weights("<run>/epochN", weight_name="adapter_model.safetensors")`.
+- **Status**: the parity checks above ran on Windows against the diffusers pipeline; LoRA training itself
+  (deepspeed, Linux) has not yet been run end to end.
+
+> **Licences.** The Sana diffusers checkpoints are Apache-2.0; the bundled Gemma-2-2B-IT text encoder
+> is under Google's [Gemma Terms of Use](https://ai.google.dev/gemma/terms) and
+> [Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy).
 
 ## Targets at a glance
 | | Local (smoke-test) | Training target |

@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "geolip-anima-trainer"
 version = "0.1.0"
-description = "Bridge + orchestration to finetune CircleStone Anima (2B DiT) with tdrussell/diffusion-pipe."
+description = "Bridge + orchestration to finetune CircleStone Anima (2B DiT) with tdrussell/diffusion-pipe, and Sana with the AbstractEyes fork."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }   # the tooling code; the Anima MODEL/weights are non-commercial (see README)
 authors = [{ name = "AbstractPhil" }]
-keywords = ["anima", "diffusion-pipe", "lora", "finetuning", "text-to-image"]
+keywords = ["anima", "sana", "diffusion-pipe", "lora", "finetuning", "text-to-image"]
 
 # LIGHT BRIDGE DEPS ONLY. torch is deliberately absent — it must come from the
 # CUDA wheel index, not PyPI (see requirements-torch.txt / README). tomllib is

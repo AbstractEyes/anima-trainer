@@ -43,6 +43,12 @@ _CLONE_REMEDY = (
     "git clone --recurse-submodules "
     "https://github.com/tdrussell/diffusion-pipe external/diffusion-pipe"
 )
+# Model types that only the AbstractEyes fork ships (upstream diffusion-pipe lacks them).
+_FORK_ONLY_MODELS = {"sana": "models/sana.py"}
+_FORK_REMEDY = (
+    "git clone --recurse-submodules https://github.com/AbstractEyes/diffusion-pipe <dir>\n"
+    "  then point ANIMA_DIFFUSION_PIPE at <dir> (or clone it as external/diffusion-pipe)"
+)
 
 
 # =============================================================================
@@ -222,6 +228,14 @@ def build_plan(
         raise ValueError(f"pipeline_stages={stages} exceeds world size {world}")
     if world % stages != 0:
         raise ValueError(f"world size {world} not divisible by pipeline_stages={stages}")
+
+    # A model type only the fork ships: fail here, not minutes into the deepspeed launch.
+    model_type = str((toml.get("model") or {}).get("type", ""))
+    fork_file = _FORK_ONLY_MODELS.get(model_type)
+    if fork_file and not (train_py.parent / fork_file).is_file():
+        raise DiffusionPipeNotFound(
+            f"model type '{model_type}' needs {fork_file}, which {train_py.parent} does not have "
+            f"(upstream diffusion-pipe lacks it). Use the AbstractEyes fork:\n  " + _FORK_REMEDY)
 
     # Training previews ([samples]) render on every rank with the whole model, and only a
     # diffusion-pipe that ships utils/previews.py knows the table (upstream silently ignores it).

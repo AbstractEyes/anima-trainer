@@ -412,6 +412,25 @@ checkpoint to an HF *model* repo) / `status()` (disk + latest checkpoint + detac
 `os.kill(pid,0)`). Durability is inverted vs the factory: the box is **persistent**, so on-disk checkpoints are
 the lifeline and the HF LoRA backup is an optional heartbeat. `tests/test_trainer_runner.py` covers the wiring.
 
+### Sana — model type `sana` (the AbstractEyes diffusion-pipe fork)
+Second supported model (2026-10-03). Trainer side = the fork's `models/sana.py` (upstream has no Sana):
+one diffusers folder in `[model] diffusers_path`; captions encoded as the diffusers `SanaPipeline` encodes
+prompts (lowercased, its complex-human-instruction prefix, first token + last 299; an empty caption = its
+unconditional prompt; the text encoder always runs with autocast off so previews see the cached training
+text). Checked on Sana_600M_512px against the diffusers pipeline: text identical on like-for-like batches,
+layer chain identical without the fork's contiguous copies (rounding only with them), one preview image
+through the fork's sampler matching the stock pipeline. LoRA training itself is not yet run (needs Linux).
+Package side: `ModelConfig(type='sana', diffusers_path=..., shift=3.0)` (`api.sana_model`); `render_lora_toml`
+writes the Sana `[model]` block (no llm keys) and a Sana header; `validate()` model-aware (no LLM adapter,
+preview sizes multiple of 32, a warning when the dataset resolution != transformer sample_size x 32);
+`preset_optimizer` = plain Adam wd 0 at 1e-4 (diffusers' Sana LoRA example rate) — 'adam' is wired in the
+fork; `build_plan` raises `DiffusionPipeNotFound` when the toml's model type is `sana` and the located
+diffusion-pipe has no `models/sana.py`; `download_sana.py` (+ `anima download --model sana --variant ...`)
+fetches a checked repo without its fp16/bf16/int4 duplicates; templates `sana_lora.toml` /
+`sana_dataset.toml` (`anima init-config --model sana`). Licences: Sana checkpoints Apache-2.0; Gemma-2 under
+the Gemma Terms of Use. Tests: `tests/test_config.py` (Sana block), `tests/test_launch.py` (the fork check).
+Run the suite as `python -m pytest tests` (a bare `pytest` from the root also collects `external/` scripts).
+
 ### Training previews — `SamplesConfig` → `[samples]`
 `TrainConfig.samples = SamplesConfig(prompts=[...])` renders a `[samples]` table into the lora toml
 (prompts as TOML basic strings, so quotes/unicode are safe); `None` (default) renders nothing. The trainer

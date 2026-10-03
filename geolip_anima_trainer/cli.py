@@ -4,7 +4,7 @@ cli.py — the `anima` console command (argparse, stdlib only).
 
 Subcommands map 1:1 onto api.py:
     anima doctor      env diagnostics (read-only)
-    anima download    fetch the 3 Anima model files
+    anima download    fetch the 3 Anima model files (--model sana: one Sana diffusers folder)
     anima inspect     probe an HF config before extracting
     anima export      stream parquet -> img + .txt dirs
     anima build       balanced dataset.toml from concept folders
@@ -35,7 +35,7 @@ def _parse_ids(s: str | None) -> list[int] | None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="anima",
-        description="CircleStone Anima finetune bridge + diffusion-pipe orchestration.")
+        description="CircleStone Anima (and Sana) finetune bridge + diffusion-pipe orchestration.")
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG logging.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -45,9 +45,13 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--config", default=None, help="optional lora.toml to sanity-check")
 
     # download
-    g = sub.add_parser("download", help="download the 3 Anima model files")
-    g.add_argument("--dest", default="models/anima")
-    g.add_argument("--base", default="base-v1.0", choices=list(api._dl.BASE_CHOICES))
+    g = sub.add_parser("download", help="download the 3 Anima model files (or one Sana folder)")
+    g.add_argument("--model", default="anima", choices=list(api.MODEL_TYPES))
+    g.add_argument("--dest", default=None, help="default models/<model>")
+    g.add_argument("--base", default="base-v1.0", choices=list(api._dl.BASE_CHOICES),
+                   help="Anima: which diffusion checkpoint")
+    g.add_argument("--variant", default=api._dl_sana.DEFAULT_VARIANT,
+                   choices=list(api._dl_sana.SANA_REPOS), help="Sana: which checkpoint")
 
     # inspect
     i = sub.add_parser("inspect", help="probe an HF config (read-only)")
@@ -128,6 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
     # init-config
     ic = sub.add_parser("init-config", help="copy packaged toml templates into ./configs")
     ic.add_argument("--out", default="configs")
+    ic.add_argument("--model", default="anima", choices=list(api.MODEL_TYPES))
 
     # validate
     va = sub.add_parser("validate", help="load + validate a lora.toml")
@@ -218,7 +223,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if rep.ok else 1
 
     if args.cmd == "download":
-        paths = api.download_models(args.dest, base=args.base)
+        dest = args.dest or f"models/{args.model}"
+        if args.model == "sana":
+            path = api.download_sana(dest, variant=args.variant)
+            native = api._dl_sana.SANA_REPOS[args.variant][1]
+            print("\n# ---- paste into sana_lora.toml [model] ----")
+            print(f"diffusers_path = '{path}'")
+            print(f"# and in sana_dataset.toml: resolutions = [{native}]")
+            return 0
+        paths = api.download_models(dest, base=args.base)
         print("\n# ---- paste into anima_lora.toml [model] ----")
         print(f"transformer_path = '{paths.transformer_path}'")
         print(f"vae_path         = '{paths.vae_path}'")
@@ -292,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
         from importlib import resources
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
-        for name in ("anima_lora.toml", "anima_dataset.toml"):
+        for name in (f"{args.model}_lora.toml", f"{args.model}_dataset.toml"):
             src = resources.files("geolip_anima_trainer").joinpath("templates", name)
             with resources.as_file(src) as p:
                 shutil.copy(p, out / name)
@@ -302,9 +315,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "validate":
         cfg = api.load_train_config(args.config, args.dataset)
         api.validate(cfg)
-        print(f"OK: {args.config} is a valid TrainConfig "
-              f"(adapter={'FFT' if cfg.adapter is None else f'rank {cfg.adapter.rank}'}, "
-              f"lr={cfg.optimizer.lr}, llm_adapter_lr={cfg.model.llm_adapter_lr}).")
+        extra = "" if cfg.model.type == "sana" else f", llm_adapter_lr={cfg.model.llm_adapter_lr}"
+        print(f"OK: {args.config} is a valid TrainConfig (model={cfg.model.type}, "
+              f"adapter={'FFT' if cfg.adapter is None else f'rank {cfg.adapter.rank}'}, "
+              f"lr={cfg.optimizer.lr}{extra}).")
         return 0
 
     if args.cmd == "sweep":

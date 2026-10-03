@@ -1,0 +1,39 @@
+# =============================================================================
+# sana_dataset.toml  —  dataset config for Sana finetuning
+# Referenced by sana_lora.toml via `dataset = 'configs/sana_dataset.toml'`
+# -----------------------------------------------------------------------------
+# One [[directory]] per concept: image files + matching .txt captions. With several
+# concepts, set num_repeats so each contributes a comparable number of samples per
+# epoch (`anima build` computes them).
+# -----------------------------------------------------------------------------
+# Caching: on first run, latents (the DC-AE autoencoder, 32x per side) and text
+# embeds (Gemma-2) are cached to a `cache/` folder inside each image directory.
+# Delete it (or pass --regenerate_cache) if you change resolution or swap models.
+# =============================================================================
+
+# The checkpoint's native size: 512 for the *_512px models, 1024 for *_1024px
+# (`anima download --model sana` prints it). Image sides round to multiples of 32.
+resolutions = [512]
+
+# Aspect-ratio bucketing so non-square images aren't center-cropped.
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 7
+
+# Images only (no video) -> single frame bucket.
+frame_buckets = [1]
+
+# -- Captions ------------------------------------------------------------------
+# Sana reads natural-language captions through Gemma-2 (sentences, not tag lists).
+# The encoder lowercases them and prepends the pipeline's instruction prefix itself,
+# exactly as at inference; write the caption only. Shuffling would scramble the
+# sentences, so leave it off.
+shuffle_caption = false
+
+[[directory]]
+path = '/data/datasets/sana/concept'   # CHANGE
+caption_extension = '.txt'
+num_repeats = 1
+
+# Add one block per additional concept.

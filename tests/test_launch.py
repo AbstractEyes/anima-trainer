@@ -165,3 +165,22 @@ def test_samples_refuse_pipeline_parallel(tmp_path: Path):
     root = _fake_pipe(tmp_path)
     with pytest.raises(ValueError, match="samples"):
         L.build_plan(config_toml=_lora_with_samples(tmp_path, stages=2), repo_root=root, num_gpus=2)
+
+
+def _sana_lora(tmp_path: Path) -> Path:
+    p = _lora(tmp_path)
+    p.write_text(p.read_text(encoding="utf-8") + "\n[model]\ntype = 'sana'\ndiffusers_path = 'x'\n",
+                 encoding="utf-8")
+    return p
+
+
+def test_sana_needs_the_fork(tmp_path: Path):
+    # upstream diffusion-pipe has no models/sana.py: refuse before deepspeed starts
+    root = _fake_pipe(tmp_path)
+    with pytest.raises(L.DiffusionPipeNotFound, match="models/sana.py"):
+        L.build_plan(config_toml=_sana_lora(tmp_path), repo_root=root, num_gpus=1)
+    models = root / "external" / "diffusion-pipe" / "models"
+    models.mkdir()
+    (models / "sana.py").write_text("# fake\n", encoding="utf-8")
+    plan = L.build_plan(config_toml=_sana_lora(tmp_path), repo_root=root, num_gpus=1)
+    assert plan.argv()[0] == "deepspeed"

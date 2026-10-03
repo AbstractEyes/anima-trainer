@@ -158,3 +158,78 @@ def test_validate_rejects_bad_samples():
         C.validate(cfg)
     cfg.run.pipeline_stages = 1
     C.validate(cfg)
+
+
+# ---- Sana (model type 'sana', the AbstractEyes diffusion-pipe fork) --------
+def _sana() -> C.ModelConfig:
+    return C.ModelConfig(type="sana", diffusers_path="models/sana/Sana_600M_512px_diffusers", shift=3.0)
+
+
+def test_sana_preset_defaults():
+    cfg = C.single_concept_preset("data/c", output_dir="r", model=_sana(), resolution=512)
+    assert (cfg.optimizer.type, cfg.optimizer.lr, cfg.optimizer.weight_decay) == ("adam", 1e-4, 0.0)
+    assert cfg.dataset.resolutions == [512] and cfg.model.llm_adapter_lr == 0.0
+
+
+def test_sana_round_trip(tmp_path: Path):
+    cfg = C.single_concept_preset("data/c", output_dir="r", model=_sana(), resolution=512)
+    lora_path, ds_path = C.render_train_toml(cfg, tmp_path)
+    parsed = tomllib.loads(lora_path.read_text(encoding="utf-8"))
+    assert parsed["model"] == {"type": "sana", "diffusers_path": "models/sana/Sana_600M_512px_diffusers",
+                               "dtype": "bfloat16", "shift": 3.0}
+    assert "Sana reads natural-language captions" in ds_path.read_text(encoding="utf-8")
+    loaded = C.load_train_config(lora_path, ds_path)
+    assert loaded.model == cfg.model and loaded.optimizer == cfg.optimizer
+
+
+def test_anima_model_block_has_no_sana_keys(tmp_path: Path):
+    cfg = C.single_concept_preset("data/c", output_dir="r", model=_model())
+    parsed = tomllib.loads(C.render_train_toml(cfg, tmp_path)[0].read_text(encoding="utf-8"))
+    assert set(parsed["model"]) == {"type", "transformer_path", "vae_path", "llm_path", "dtype", "llm_adapter_lr"}
+
+
+def test_validate_sana_rules():
+    cfg = C.single_concept_preset("data/c", output_dir="r", model=_sana(), resolution=512)
+    cfg.model.llm_adapter_lr = 1e-6                       # an Anima-only knob
+    with pytest.raises(C.ConfigError, match="no LLM adapter"):
+        C.validate(cfg)
+    cfg.model.llm_adapter_lr = 0.0
+    cfg.samples = C.SamplesConfig(prompts=["a pool"], width=528, height=512)   # 16-multiple, not 32
+    with pytest.raises(C.ConfigError, match="multiple of 32"):
+        C.validate(cfg)
+    cfg.samples.width = 512
+    C.validate(cfg)
+    cfg.model.type = "bogus"
+    with pytest.raises(C.ConfigError, match="supported types"):
+        C.validate(cfg)
+
+
+def test_sana_native_resolution_warning(tmp_path: Path, caplog):
+    folder = tmp_path / "Sana_600M_512px_diffusers"
+    (folder / "transformer").mkdir(parents=True)
+    (folder / "transformer" / "config.json").write_text('{"sample_size": 16}', encoding="utf-8")
+    model = C.ModelConfig(type="sana", diffusers_path=str(folder), shift=3.0)
+    with caplog.at_level("WARNING", logger="anima.config"):
+        C.single_concept_preset("data/c", output_dir="r", model=model, resolution=512)
+    assert not any("native size" in r.getMessage() for r in caplog.records)
+    with caplog.at_level("WARNING", logger="anima.config"):
+        C.single_concept_preset("data/c", output_dir="r", model=model, resolution=1024)
+    assert any("trained at 512 px" in r.getMessage() for r in caplog.records)
+
+
+def test_packaged_sana_templates_load_and_validate():
+    from importlib import resources
+    root = resources.files("geolip_anima_trainer").joinpath("templates")
+    with resources.as_file(root.joinpath("sana_lora.toml")) as lp, \
+            resources.as_file(root.joinpath("sana_dataset.toml")) as dp:
+        cfg = C.load_train_config(lp, dp)
+    assert cfg.model.type == "sana" and cfg.model.shift == 3.0
+    assert cfg.optimizer.type == "adam" and cfg.optimizer.lr == 1e-4
+    assert cfg.dataset.resolutions == [512] and len(cfg.dataset.directories) == 1
+    C.validate(cfg)
+
+
+def test_init_config_copies_the_sana_templates(tmp_path: Path):
+    from geolip_anima_trainer import cli
+    assert cli.main(["init-config", "--out", str(tmp_path), "--model", "sana"]) == 0
+    assert (tmp_path / "sana_lora.toml").is_file() and (tmp_path / "sana_dataset.toml").is_file()
