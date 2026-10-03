@@ -559,9 +559,12 @@ class SanaRunner(_RunnerMixin):
             print(f"[sana] (upload failed: {e})", flush=True)
 
     def _publish_index(self, repo: "_HubRepo", metas: dict) -> None:
-        done = {k: m for k, m in metas.items() if m.get("status") == "done"}
+        """The repo README from EVERY folder's meta.json (re-read now: other folders may have been added while
+        this sequence ran), this session's newer metas winning."""
+        merged = {**repo.metas(), **metas}
+        done = {k: m for k, m in merged.items() if m.get("status") == "done"}
         reads = sx.sequence_reads(done)
-        repo.put("README.md", sx.render_repo_readme(list(metas.values()), reads), "README: the experiment index")
+        repo.put("README.md", sx.render_repo_readme(list(merged.values()), reads), "README: the experiment index")
 
     def _baseline(self) -> dict:
         """The held-out cells rendered WITHOUT a LoRA (once per session; every arm is paired against them)."""

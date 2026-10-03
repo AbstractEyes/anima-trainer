@@ -200,6 +200,21 @@ def test_run_sequence_end_to_end(runner):
     assert not pipe.loaded                                   # every LoRA unloaded after its evaluation
 
 
+def test_index_keeps_folders_added_while_the_sequence_runs(runner):
+    s, repo, pipe, calls = runner
+    real_put = repo.put
+
+    def put(path, data, msg):                      # another writer adds a folder mid-sequence
+        real_put(path, data, msg)
+        if path.endswith("e004_lora_mood_up/meta.json") and b'"done"' in (data if isinstance(data, bytes) else data.encode()):
+            real_put("experiments/e001_flavor_test/meta.json",
+                     json.dumps({"id": "e001_flavor_test", "title": "t", "status": "done", "summary": "DIAL"}).encode(), "x")
+
+    repo.put = put
+    s.run_sequence(["e004_lora_mood_up"])
+    assert "e001_flavor_test" in repo.files_["README.md"].decode()
+
+
 def test_rerun_skips_done_arms_and_runs_the_rest(runner):
     s, repo, pipe, calls = runner
     s.run_sequence(["e004_lora_mood_up"])
