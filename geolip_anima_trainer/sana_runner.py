@@ -715,15 +715,17 @@ class SanaRunner(_RunnerMixin):
 
         # ---- files: eval/ + sheets ----
         ev = arm / "eval"
-        (ev / "final.json").write_text(json.dumps({"baseline_scores": b["scores"], "cells": per_cell,
-                                                   "read": final}, indent=1), encoding="utf-8")
+        baseline = {"mood_score": float(np.mean(b["scores"])),
+                    "pixels": {k: float(np.mean([p[k] for p in b["pixels"]])) for k in b["pixels"][0]}}
+        (ev / "final.json").write_text(json.dumps({"baseline_scores": b["scores"], "baseline": baseline,
+                                                   "cells": per_cell, "read": final}, indent=1), encoding="utf-8")
         (ev / "epochs.json").write_text(json.dumps(rows, indent=1), encoding="utf-8")
         first_seed = self.cfg.eval_seeds[0]
         idx = [i for i, (_, s) in enumerate(cells) if s == first_seed]
         _grid([[b["images"][i], final_imgs[0.5][i], final_imgs[1.0][i]] for i in idx], ev / "sheet_final.jpg")
         _grid([[b["images"][i]] + [by_epoch[n][i] for n, _ in epochs] for i in idx[:4]], ev / "sheet_epochs.jpg")
         meta = sx.arm_meta(spec, "done", recipe=recipe, epochs=rows, final=final, final_diffs=final_diffs,
-                           first_epoch_beyond_3se=first, train_seconds=round(train_s),
+                           baseline=baseline, first_epoch_beyond_3se=first, train_seconds=round(train_s),
                            summary=self._summary(spec, final, metas),
                            finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
         done = _folder_files(ev, f"{base}/eval")

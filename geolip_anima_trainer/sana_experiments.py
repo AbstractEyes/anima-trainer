@@ -311,6 +311,14 @@ def render_arm_readme(spec: ArmSpec, recipe: dict, meta: dict | None = None) -> 
             frac = r.get("frac_pos", r.get("frac_neg"))
             out.append(f"| {r['epoch']} | {r['scale']} | {_fmt(r['mean'])} +- {r['se']:.3f} | "
                        f"{'' if frac is None else f'{frac:.0%}'} | {r['content_kept']:.3f} |")
+        px_rows = ([("no LoRA", meta["baseline"])] if meta.get("baseline") else []) + \
+                  [(f"epoch {r['epoch']}, scale {r['scale']}", r) for r in meta.get("epochs", [])]
+        if px_rows and all("pixels" in v for _, v in px_rows):
+            out += ["", "| images | mood score | luma | saturation | warmth | contrast |", "|---|---|---|---|---|---|"]
+            for name, v in px_rows:
+                p = v["pixels"]
+                out.append(f"| {name} | {_fmt(v['mood_score'])} | {p['luma']:.3f} | {p['sat']:.3f} | "
+                           f"{p['warmth']:.3f} | {p['contrast']:.3f} |")
         out += ["", "![no LoRA, scale 0.5, scale 1](eval/sheet_final.jpg)", "",
                 "Rows: the held-out scenes at seed 101. Columns: no LoRA, the final LoRA at 0.5, at 1.", "",
                 "![the effect across training](eval/sheet_epochs.jpg)", "",
