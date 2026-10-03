@@ -35,6 +35,9 @@ installable package **`geolip_anima_trainer`** (console command **`anima`**):
   re-pasting cells. Holds the shared **`_RunnerMixin`**. See "Colab cache factory" below.
 - `trainer_runner.py` — the **RTX 6000 TRAINER** runner (mirror of the factory: pull cache →
   build → detached train → monitor/resume/backup). See "RTX 6000 trainer" below.
+- `sana_runner.py` — the **Sana Colab** runner behind `notebooks/sana_colab_train.ipynb` (fork
+  bootstrap → self-rendered mood set → configs → train → diffusers-load evaluation → backup).
+  See "Sana — model type `sana`" below.
 - `api.py` / `cli.py` — the Python API and the `anima` CLI.
 - `templates/anima_lora.toml`, `templates/anima_dataset.toml` — packaged templates;
   copy into `./configs` with `anima init-config`.
@@ -429,7 +432,28 @@ diffusion-pipe has no `models/sana.py`; `download_sana.py` (+ `anima download --
 fetches a checked repo without its fp16/bf16/int4 duplicates; templates `sana_lora.toml` /
 `sana_dataset.toml` (`anima init-config --model sana`). Licences: Sana checkpoints Apache-2.0; Gemma-2 under
 the Gemma Terms of Use. Tests: `tests/test_config.py` (Sana block), `tests/test_launch.py` (the fork check).
-Run the suite as `python -m pytest tests` (a bare `pytest` from the root also collects `external/` scripts).
+Run the suite as `python -m pytest tests` (a bare `pytest` from the root also collects `external/` scripts) with
+the repo's `.venv` (the system Python lacks HF `datasets`, and the untracked `datasets/` data folder at the root
+then imports as a namespace package and fails `tests/test_dp_compat.py`).
+
+**Colab runner** (`sana_runner.py` + `notebooks/sana_colab_train.ipynb`, same thin-shell contract as the
+Anima runners): the bootstrap `anima_colab.install(REPO, dp_url=anima_colab.DP_FORK_URL, similarity=False)`
+clones the fork BESIDE upstream at `external/diffusion-pipe-fork` (`anima_colab.dp_dir`), pulls it on later
+runs, installs its requirements under its own marker (`.anima_colab_installed_fork`) and sets
+`ANIMA_DIFFUSION_PIPE`; `SanaRunner.setup()` re-points the variable after the restart (`_point_at_fork`
+refuses a checkout without `models/sana.py`). Steps: `setup()` (data under `/content/sana_data`; the HF token
+is OPTIONAL — public models — and only feeds `backup()`, default repo `<user>/sana-mood-lora`, private) →
+`prepare_dataset()` (source `'mood'`: the stock pipeline at the card's dtypes renders 24 subjects × 8 seeds of
+two upbeat templates, captioned `"a photo of <subject>"`; every 4th of the 32 subjects held out; `'folder'`:
+any images + `.txt` folder) → `build_configs()` (rank 32, the Sana optimizer preset, 10 epochs, micro-batch 4,
+warmup 20, save + previews of 4 held-out prompts every 2 epochs) → `train()` (BLOCKING by default: the plan
+runs with a log file and `_follow` prints it into the cell, since a Colab cell does not always show a child's
+stdout; `detached=True` + `tail()` for long runs) → `evaluate()` (refuses while a detached train is alive; no
+LoRA, then `load_lora_weights` + `set_adapters` at 0.5 and 1 on held-out subjects × 4 seeds; the CLIP-L mood
+judge = 100 × (mean cosine to 3 upbeat phrases − to 3 downbeat phrases); verdict FLAVOR LORA / NO EFFECT /
+MIXED per `mood_outcome`; `eval/eval.json` + `eval/sheet.jpg`) → `backup()`. `tests/test_sana_runner.py`
+covers the set, the verdict rule, the fork lookup, the config wiring, the train plan, the log follower and
+the bootstrap.
 
 ### Training previews — `SamplesConfig` → `[samples]`
 `TrainConfig.samples = SamplesConfig(prompts=[...])` renders a `[samples]` table into the lora toml

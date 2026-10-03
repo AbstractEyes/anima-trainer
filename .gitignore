@@ -225,3 +225,4 @@ runs/
 external/
 configs/sweep/
 **/cache/
+.anima_colab_installed*

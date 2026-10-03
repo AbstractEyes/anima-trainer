@@ -192,6 +192,9 @@ cache → two-phase train):
   `DATA_ROOT`/`HF_HOME`, `limit=None` extraction, long-run config: `save_every_n_steps`, gradient
   accumulation, `activation_checkpointing=true` + larger `micro_batch`, `compile=true`; run **detached**
   via tmux/nohup and recover with `--resume_from_checkpoint` — disk is the durability, backup is optional).
+- **`sana_colab_train.ipynb`** — a **Sana LoRA** on Colab with no dataset needed: the stock model renders
+  its own upbeat training set captioned neutrally, and the saved LoRA is loaded back through diffusers and
+  scored on held-out subjects. See [Sana](#sana-diffusers-format) and `notebooks/README.md`.
 
 ## Programmatic / sweeps
 
@@ -253,8 +256,11 @@ What differs from Anima:
   `shift = 3.0`, the checkpoints' own sampling shift. No LLM adapter (`llm_adapter_lr` is Anima-only).
 - **Output**: LoRAs are saved in diffusers format;
   `pipe.load_lora_weights("<run>/epochN", weight_name="adapter_model.safetensors")`.
+- **Colab**: `notebooks/sana_colab_train.ipynb` + `geolip_anima_trainer.sana_runner.SanaRunner` run a
+  whole LoRA end to end (install with the fork, data, configs, training, a diffusers load of the LoRA,
+  an evaluation on held-out prompts, an optional private HF backup).
 - **Status**: the parity checks above ran on Windows against the diffusers pipeline; LoRA training itself
-  (deepspeed, Linux) has not yet been run end to end.
+  (deepspeed, Linux) has not yet been run end to end. The Colab notebook is the first run.
 
 > **Licences.** The Sana diffusers checkpoints are Apache-2.0; the bundled Gemma-2-2B-IT text encoder
 > is under Google's [Gemma Terms of Use](https://ai.google.dev/gemma/terms) and
