@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-sana_runner.py — the repo-side runner for a Sana LoRA run on a Colab GPU (the RTX PRO 6000), the Sana
+sana_runner.py — the repo-side runner for Sana LoRA experiments on a Colab GPU (the RTX PRO 6000), the Sana
 counterpart of trainer_runner.TrainerRunner. Same thin-shell contract: the notebook
 (notebooks/sana_colab_train.ipynb) is a handful of `s.<step>()` calls and ALL logic lives here, so
 iterating = `git pull`, never re-pasting cells.
@@ -9,17 +9,22 @@ Sana trains through model type 'sana' in the AbstractEyes diffusion-pipe fork. T
 (`anima_colab.install(dp_url=anima_colab.DP_FORK_URL)`) clones the fork beside upstream at
 external/diffusion-pipe-fork and points ANIMA_DIFFUSION_PIPE at it; setup() re-points it after a restart.
 
-DATA. source='mood' (the default) needs no dataset: the stock model renders its own training set,
-upbeat images captioned with the NEUTRAL prompt "a photo of <subject>", so the LoRA can only lower its
-loss by making neutral prompts look upbeat. That is the trained counterpart of steering the text
-conditioning toward a mood (cf. Concept Sliders, Gandikota et al. 2023, arXiv 2311.12092). A quarter of
-the subjects are held out of training, and evaluate() measures the effect on them, loading the saved
-LoRA through diffusers (which also proves the LoRA file loads). source='folder' trains on any folder of
-images + .txt captions instead.
+THE SEQUENCE (run_sequence): the LoRA arms of sana_experiments.SEQUENCE, one after another on one card. Every
+arm gets its own folder in the experiments repo (default AbstractPhil/geolip-beatrix-sana, see
+sana_experiments.py): its README and meta.json, the config, the training-set list, EVERY saved epoch (uploaded
+as it is saved), the trainer's previews, the evaluation and the log. All training sets and the no-LoRA
+baseline are rendered before any LoRA is loaded; a rerun skips the arms the repo already lists as done.
+
+DATA. The stock model renders its own training sets: images of one flavor (upbeat / downbeat / neutral)
+captioned with the NEUTRAL prompt "a photo of <subject>", so a LoRA can only lower its loss by making neutral
+prompts carry that flavor (the trained counterpart of steering the text conditioning; cf. Concept Sliders,
+Gandikota et al. 2023, arXiv 2311.12092). A quarter of the subjects are held out of training; the evaluation
+loads each saved LoRA through diffusers and scores the held-out subjects. source='folder' (single runs) trains
+on any folder of images + .txt captions instead.
 
     from geolip_anima_trainer.sana_runner import SanaRunner
     s = SanaRunner()                       # kwargs / ANIMA_* env to tune
-    s.setup(); s.prepare_dataset(); s.build_configs(); s.train(); s.evaluate(); s.backup()
+    s.setup(); s.run_sequence()            # or the single run: prepare_dataset / build_configs / train / evaluate
 """
 
 from __future__ import annotations
@@ -31,10 +36,12 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field, fields
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import api as _api
 from . import launch as _launch
+from . import sana_experiments as sx
 from .cache_factory import _RunnerMixin, get_hf_token
 from .trainer_runner import _pid_alive
 
@@ -53,7 +60,7 @@ SUBJECTS = [
 ]
 HELD_OUT = [i for i in range(len(SUBJECTS)) if i % 4 == 3]          # 8 subjects never trained on
 TRAIN = [i for i in range(len(SUBJECTS)) if i % 4 != 3]             # 24 training subjects
-UPBEAT_TEMPLATES = ["a cheerful, upbeat photo of {s}", "{s}, joyful and uplifting mood"]
+UPBEAT_TEMPLATES = sx.FLAVOR_TEMPLATES["up"]
 NEUTRAL_TEMPLATE = "a photo of {s}"
 # The mood judge: 100 x (mean CLIP cosine to the upbeat phrases - the same to the downbeat phrases).
 UP_PHRASES = ["a cheerful, upbeat image", "a happy, joyful scene", "a bright, uplifting photo"]
@@ -67,35 +74,18 @@ GEN_STEPS, GEN_CFG = 20, 4.5          # the stock pipeline's defaults
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 
 
-def mood_items(seeds_per_subject: int = 8) -> list[dict]:
-    """The training set plan for source='mood': each training subject x seed -> an upbeat prompt
-    (the two templates alternating) captioned with the neutral prompt. Pure (no GPU)."""
-    items = []
-    for si in TRAIN:
-        s = SUBJECTS[si]
-        for k in range(seeds_per_subject):
-            items.append({"name": f"{si:02d}_{k:02d}", "seed": 1000 + k,
-                          "prompt": UPBEAT_TEMPLATES[k % 2].format(s=s),
-                          "caption": NEUTRAL_TEMPLATE.format(s=s)})
-    return items
+def mood_items(seeds_per_subject: int = 8, flavor: str = "up", seed_base: int = 1000) -> list[dict]:
+    """A training set plan: each training subject x seed -> a prompt of `flavor` (its two templates
+    alternating) captioned with the neutral prompt. Pure (no GPU)."""
+    return sx.items_for(SUBJECTS, TRAIN, flavor, seeds_per_subject=seeds_per_subject, seed_base=seed_base,
+                        caption_template=NEUTRAL_TEMPLATE)
 
 
 def mood_outcome(diffs: list[float]) -> dict:
     """The read fixed before the first run, on paired (LoRA minus no LoRA) mood-score differences:
     FLAVOR LORA = mean > 0, >= 75% positive and mean > 3 SE; NO EFFECT = |mean| <= 2 SE or < 60%
     positive; anything else MIXED."""
-    import statistics
-    n = len(diffs)
-    mean = statistics.fmean(diffs) if n else 0.0
-    se = (statistics.stdev(diffs) / n ** 0.5) if n > 1 else 0.0
-    frac = sum(d > 0 for d in diffs) / n if n else 0.0
-    if mean > 0 and frac >= 0.75 and mean > 3 * se:
-        verdict = "FLAVOR LORA"
-    elif abs(mean) <= 2 * se or frac < 0.60:
-        verdict = "NO EFFECT"
-    else:
-        verdict = "MIXED"
-    return {"mean": mean, "se": se, "frac_pos": frac, "n": n, "OUTCOME": verdict}
+    return sx.arm_outcome(diffs, 1)
 
 
 def _stock_pipeline(diffusers_path: str):
@@ -129,20 +119,83 @@ def _pixel_stats(img) -> dict:
             "contrast": float(luma.std())}
 
 
+def _grid(rows: list[list], path: Path, *, tile: int = 256) -> Path:
+    """A contact sheet: rows of PIL images (None = blank)."""
+    from PIL import Image
+    ncol = max(len(r) for r in rows)
+    canvas = Image.new("RGB", (tile * ncol, tile * len(rows)), "white")
+    for i, r in enumerate(rows):
+        for j, im in enumerate(r):
+            if im is not None:
+                canvas.paste(im.resize((tile, tile)), (j * tile, i * tile))
+    canvas.save(path, quality=88)
+    return path
+
+
+def _epoch_dirs(output_dir: "str | Path") -> list[tuple[int, Path]]:
+    """(N, dir) for every saved epochN of the NEWEST run under output_dir, sorted by N."""
+    p = Path(output_dir)
+    runs = [d for d in p.iterdir() if d.is_dir()] if p.is_dir() else []
+    runs = [d for d in runs if any(d.glob("epoch*/adapter_model.safetensors"))]
+    if not runs:
+        return []
+    run = max(runs, key=lambda d: d.stat().st_mtime)
+    out = []
+    for e in run.glob("epoch*"):
+        if e.is_dir() and (e / "adapter_model.safetensors").is_file() and e.name[5:].isdigit():
+            out.append((int(e.name[5:]), e))
+    return sorted(out)
+
+
+class _HubRepo:
+    """Uploads into one HF *model* repo (the experiments repo). Every call is one commit."""
+
+    def __init__(self, repo_id: str, token: "str | None"):
+        if not token:
+            raise RuntimeError(f"uploading to {repo_id} needs an HF token with WRITE access: add HF_TOKEN to Colab "
+                               f"Secrets (and give this notebook access), then re-run setup().")
+        from huggingface_hub import HfApi
+        self.repo_id, self.api = repo_id, HfApi(token=token)
+
+    def files(self) -> list[str]:
+        return self.api.list_repo_files(self.repo_id, repo_type="model")
+
+    def metas(self) -> dict:
+        """Every experiments/<id>/meta.json in the repo, keyed by id."""
+        from huggingface_hub import hf_hub_download
+        out = {}
+        for f in self.files():
+            parts = f.split("/")
+            if len(parts) == 3 and parts[0] == "experiments" and parts[2] == "meta.json":
+                p = hf_hub_download(self.repo_id, f, repo_type="model", token=self.api.token)
+                out[parts[1]] = json.loads(Path(p).read_text(encoding="utf-8"))
+        return out
+
+    def put(self, path_in_repo: str, data: "bytes | str", msg: str) -> None:
+        self.api.upload_file(path_or_fileobj=data.encode("utf-8") if isinstance(data, str) else data,
+                             path_in_repo=path_in_repo, repo_id=self.repo_id, repo_type="model", commit_message=msg)
+
+    def put_folder(self, folder: "str | Path", path_in_repo: str, msg: str, **kw) -> None:
+        if Path(folder).is_dir() and any(Path(folder).iterdir()):
+            self.api.upload_folder(folder_path=str(folder), path_in_repo=path_in_repo, repo_id=self.repo_id,
+                                   repo_type="model", commit_message=msg, **kw)
+
+
 @dataclass
 class SanaConfig:
-    """Everything the Sana run needs, overridable from the notebook (kwargs) or env (ANIMA_*)."""
+    """Everything the Sana runs need, overridable from the notebook (kwargs) or env (ANIMA_*)."""
     repo_root: str = field(default_factory=lambda: os.environ.get("ANIMA_REPO", "/content/anima-trainer"))
-    data_root: str | None = None                 # None -> /content/sana_data (the run is short; Colab disk)
+    data_root: str | None = None                 # None -> /content/sana_data (Colab disk; the repo is the durability)
     hf_home: str | None = None                   # None -> {data_root}/hf_cache
     variant: str = "600m-512"                    # download_sana.SANA_REPOS key
     diffusers_path: str | None = None            # an existing local Sana folder (skips the download)
+    repo_id: str = sx.DEFAULT_REPO               # the experiments repo (public): one folder per experiment
     # data
-    source: str = "mood"                         # 'mood' (the model renders its own set) | 'folder'
+    source: str = "mood"                         # single runs: 'mood' (the model renders its own set) | 'folder'
     dataset_dir: str | None = None               # source='folder': images + .txt captions
-    seeds_per_subject: int = 8                   # mood: 24 training subjects x 8 = 192 images
-    gen_batch: int = 8
-    # recipe
+    seeds_per_subject: int = 8                   # 24 training subjects x 8 = 192 images
+    gen_batch: int = 16
+    # recipe (the sequence's arms override lr / data per arm)
     rank: int = 32
     lr: float = 1e-4                             # the diffusers Sana LoRA example's rate
     epochs: int = 10
@@ -151,11 +204,10 @@ class SanaConfig:
     save_every_n_epochs: int = 2
     num_gpus: int = 1
     preview_prompts: list[str] | None = None     # None -> mood: 4 held-out neutral prompts; folder: none
-    # evaluation (mood): held-out subjects x these seeds; the LoRA at these scales (0 = no LoRA loaded)
+    # evaluation: held-out subjects x these seeds; the LoRA at these scales (0 = no LoRA loaded)
     eval_seeds: list[int] = field(default_factory=lambda: [101, 202, 303, 404])
     eval_scales: list[float] = field(default_factory=lambda: [0.0, 0.5, 1.0])
-    # HF *model* repo (private) for the LoRA + the evaluation; None -> {hf_user}/sana-mood-lora
-    # (source='folder': {hf_user}/sana-lora) when a token is present
+    # single runs: an HF *model* repo for backup(); None -> a folder experiments/adhoc_<time>/ of repo_id
     backup_repo: str | None = None
 
     @classmethod
@@ -167,6 +219,8 @@ class SanaConfig:
             env["backup_repo"] = os.environ["ANIMA_BACKUP_REPO"]
         if os.environ.get("ANIMA_SANA_VARIANT"):
             env["variant"] = os.environ["ANIMA_SANA_VARIANT"]
+        if os.environ.get("ANIMA_SANA_REPO"):
+            env["repo_id"] = os.environ["ANIMA_SANA_REPO"]
         valid = {f.name for f in fields(cls)}
         bad = set(overrides) - valid
         if bad:
@@ -188,6 +242,9 @@ class SanaRunner(_RunnerMixin):
         if self.cfg.variant not in _api._dl_sana.SANA_REPOS:
             raise ValueError(f"variant must be one of {list(_api._dl_sana.SANA_REPOS)}, got {self.cfg.variant!r}")
         self.state: dict = {}
+        self._pipe = None                        # the stock pipeline, resident for renders + evaluations
+        self._judge_fns = None                   # the CLIP judge, resident
+        self._base = None                        # the no-LoRA renders of the held-out cells
 
     # ---- 1. setup: env -> (optional) auth -> gpu -> the fork -> the model ---------------
     def setup(self) -> dict:
@@ -198,7 +255,7 @@ class SanaRunner(_RunnerMixin):
         self._download_model()
         self._save_state()
         print(f"[sana] setup done | DATA_ROOT={self.state['data_root']} | model={self.state['diffusers_path']} "
-              f"| native {self.state['resolution']} px")
+              f"| native {self.state['resolution']} px | experiments -> {self.cfg.repo_id}")
         return self.state
 
     def _setup_env(self) -> None:
@@ -214,19 +271,17 @@ class SanaRunner(_RunnerMixin):
         print(f"[sana] DATA_ROOT={data_root} | HF_HOME={hf_home}")
 
     def _auth_optional(self) -> None:
-        """The Sana repos and the CLIP judge are public: a token is only needed for backup()."""
+        """The Sana repos and the CLIP judge are public; the token is for the uploads (run_sequence / backup)."""
         token = get_hf_token()
         self.state["hf_token"] = token
         if not token:
-            print("[sana] no HF_TOKEN (fine: the models are public; backup() needs one)")
+            print(f"[sana] no HF_TOKEN: the models are public, but run_sequence() uploads to {self.cfg.repo_id} "
+                  f"and needs a WRITE token in Colab Secrets")
             return
         from huggingface_hub import login, whoami
         login(token=token, add_to_git_credential=False)
-        user = whoami(token=token).get("name")
-        self.state["hf_user"] = user
-        if not self.cfg.backup_repo and user:
-            self.cfg.backup_repo = f"{user}/sana-mood-lora" if self.cfg.source == "mood" else f"{user}/sana-lora"
-        print(f"[sana] HF user={user} | backup_repo={self.cfg.backup_repo} (private)")
+        self.state["hf_user"] = whoami(token=token).get("name")
+        print(f"[sana] HF user={self.state['hf_user']}")
 
     def _point_at_fork(self) -> str:
         """Sana lives in the AbstractEyes fork: prefer $ANIMA_DIFFUSION_PIPE, else the bootstrap's
@@ -254,7 +309,45 @@ class SanaRunner(_RunnerMixin):
         self.state.update(diffusers_path=str(path), resolution=int(res))
         return str(path)
 
-    # ---- 2. the training data -------------------------------------------------------------
+    # ---- resident GPU pieces --------------------------------------------------------------------
+    def _eval_pipe(self):
+        if self._pipe is None:
+            self._pipe = _stock_pipeline(self._need("diffusers_path"))
+        return self._pipe
+
+    def _render(self, prompts: list[str], seeds: list[int]) -> list:
+        pipe, res, b = self._eval_pipe(), self._need("resolution"), self.cfg.gen_batch
+        out = []
+        for i in range(0, len(prompts), b):
+            out += _generate(pipe, prompts[i:i + b], seeds[i:i + b], res)
+        return out
+
+    def _judge(self):
+        if self._judge_fns is None:
+            self._judge_fns = self._clip_judge()
+        return self._judge_fns
+
+    def _score(self, imgs: list):
+        """(features, mood scores) for a list of images."""
+        f_img, f_up, f_down = self._judge()
+        feats = f_img(imgs)
+        return feats, 100.0 * ((feats @ f_up.T).mean(1) - (feats @ f_down.T).mean(1))
+
+    def _cells(self) -> tuple[list[tuple[int, int]], list[str], list[int]]:
+        cells = [(si, seed) for si in HELD_OUT for seed in self.cfg.eval_seeds]
+        return cells, [NEUTRAL_TEMPLATE.format(s=SUBJECTS[si]) for si, _ in cells], [s for _, s in cells]
+
+    def _assert_stock(self) -> None:
+        """No LoRA may be loaded while stock images are rendered (training sets, the baseline)."""
+        pipe = self._eval_pipe()
+        try:
+            loaded = {k: v for k, v in pipe.get_list_adapters().items() if v}
+        except Exception:  # noqa: BLE001 — no peft: nothing can be loaded
+            loaded = {}
+        if loaded:
+            raise RuntimeError(f"a LoRA is still loaded ({loaded}); refusing to render stock images")
+
+    # ---- 2. the training data (single runs) ---------------------------------------------------------
     def prepare_dataset(self) -> str:
         dr = self._need("data_root")
         if self.cfg.source == "folder":
@@ -271,58 +364,82 @@ class SanaRunner(_RunnerMixin):
             print(f"[sana] dataset: {d} ({len(paired)} captioned images)")
             self._save_state()
             return str(d)
-
-        res = self._need("resolution")
-        out = Path(dr) / "datasets" / "mood_upbeat"
-        out.mkdir(parents=True, exist_ok=True)
-        items = mood_items(self.cfg.seeds_per_subject)
-        todo = [it for it in items if not (out / f"{it['name']}.png").is_file()]
-        if todo:
-            pipe = _stock_pipeline(self._need("diffusers_path"))
-            for i in range(0, len(todo), self.cfg.gen_batch):
-                chunk = todo[i:i + self.cfg.gen_batch]
-                imgs = _generate(pipe, [c["prompt"] for c in chunk], [c["seed"] for c in chunk], res)
-                for it, img in zip(chunk, imgs):
-                    img.save(out / f"{it['name']}.png")
-                    (out / f"{it['name']}.txt").write_text(it["caption"], encoding="utf-8")
-                print(f"[sana] rendered {min(i + self.cfg.gen_batch, len(todo))}/{len(todo)} training images", flush=True)
-            del pipe
-            self._free_cuda()
-        else:
-            print(f"[sana] all {len(items)} training images already rendered (skip)")
-        self.state.update(dataset_dir=str(out), n_images=len(items))
+        self._need("resolution")
+        out = self._render_dataset("up", 1000)
+        self.state.update(dataset_dir=str(out), n_images=len(mood_items(self.cfg.seeds_per_subject)))
         self._save_state()
-        print(f"[sana] dataset: {out} ({len(items)} upbeat images captioned neutrally; "
+        print(f"[sana] dataset: {out} ({self.state['n_images']} upbeat images captioned neutrally; "
               f"{len(HELD_OUT)} subjects held out for evaluate())")
         return str(out)
 
+    def _render_dataset(self, flavor: str, seed_base: int) -> Path:
+        """{data_root}/datasets/<flavor>_<seed_base>/images (+ items.jsonl and sheet.jpg beside it, never
+        inside the image folder the trainer scans). Skips images already rendered."""
+        root = Path(self._need("data_root")) / "datasets" / f"{flavor}_{seed_base}"
+        img_dir = root / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        items = mood_items(self.cfg.seeds_per_subject, flavor, seed_base)
+        (root / "items.jsonl").write_text("".join(json.dumps(it) + "\n" for it in items), encoding="utf-8")
+        todo = [it for it in items if not (img_dir / f"{it['name']}.png").is_file()]
+        if todo:
+            self._assert_stock()
+            for i in range(0, len(todo), self.cfg.gen_batch):
+                chunk = todo[i:i + self.cfg.gen_batch]
+                for it, img in zip(chunk, self._render([c["prompt"] for c in chunk], [c["seed"] for c in chunk])):
+                    img.save(img_dir / f"{it['name']}.png")
+                    (img_dir / f"{it['name']}.txt").write_text(it["caption"], encoding="utf-8")
+            print(f"[sana] rendered {len(todo)} {flavor} training images (seeds {seed_base}+) -> {img_dir}", flush=True)
+        if not (root / "sheet.jpg").is_file():
+            from PIL import Image
+            firsts = [Image.open(img_dir / f"{it['name']}.png") for it in items[::self.cfg.seeds_per_subject]]
+            _grid([firsts[r * 6:(r + 1) * 6] for r in range(4)], root / "sheet.jpg", tile=192)
+        return img_dir
+
     # ---- 3. the training config ----------------------------------------------------------------
-    def build_configs(self) -> str:
-        dr = self._need("data_root")
+    def _render_config(self, dataset_dir: str, output_dir: str, configs_dir: str, *, lr: float,
+                       held_out_previews: bool) -> "tuple[Path, Path]":
         res = self._need("resolution")
         model = _api.sana_model(self._need("diffusers_path"))
         prompts = self.cfg.preview_prompts
-        if prompts is None and self.cfg.source == "mood":
+        if prompts is None and held_out_previews:
             prompts = [NEUTRAL_TEMPLATE.format(s=SUBJECTS[i]) for i in HELD_OUT[:4]]
         samples = _api.SamplesConfig(prompts=list(prompts), negative_prompt="", width=res, height=res,
                                      steps=GEN_STEPS, cfg=GEN_CFG, shift=3.0, seed=42) if prompts else None
         opt = _api.preset_optimizer(model)
-        opt.lr = self.cfg.lr
+        opt.lr = lr
         cfg = _api.TrainConfig(
-            run=_api.RunConfig(output_dir=f"{dr}/runs/sana_lora", epochs=self.cfg.epochs,
+            run=_api.RunConfig(output_dir=output_dir, epochs=self.cfg.epochs,
                                micro_batch_size_per_gpu=self.cfg.micro_batch, warmup_steps=self.cfg.warmup_steps,
                                save_every_n_epochs=self.cfg.save_every_n_epochs, eval_before_first_step=False),
             model=model, adapter=_api.AdapterConfig(rank=self.cfg.rank), optimizer=opt,
-            dataset=_api.DatasetConfig(resolutions=[res],
-                                       directories=[_api.DirectoryConfig(path=self._need("dataset_dir"))]),
+            dataset=_api.DatasetConfig(resolutions=[res], directories=[_api.DirectoryConfig(path=str(dataset_dir))]),
             samples=samples)
-        lora, ds = _api.render_train_toml(cfg, f"{dr}/configs")
+        return _api.render_train_toml(cfg, configs_dir)
+
+    def build_configs(self) -> str:
+        dr = self._need("data_root")
+        lora, ds = self._render_config(self._need("dataset_dir"), f"{dr}/runs/sana_lora", f"{dr}/configs", lr=self.cfg.lr,
+                                       held_out_previews=self.cfg.source == "mood")
         n = int(self.state.get("n_images") or 0)
         steps = -(-n // (self.cfg.micro_batch * self.cfg.num_gpus)) * self.cfg.epochs if n else None
-        self.state.update(lora_toml=str(lora), dataset_toml=str(ds), output_dir=cfg.run.output_dir)
+        self.state.update(lora_toml=str(lora), dataset_toml=str(ds), output_dir=f"{dr}/runs/sana_lora")
         self._save_state()
         print(f"[sana] config: {lora}" + (f" | {n} images x {self.cfg.epochs} epochs = ~{steps} steps" if steps else ""))
         return str(lora)
+
+    def _recipe(self, lr: float) -> dict:
+        n = len(TRAIN) * self.cfg.seeds_per_subject
+        spe = -(-n // (self.cfg.micro_batch * self.cfg.num_gpus))
+        return {"base model": "Sana 600M 512px (stock, Apache-2.0)",
+                "adapter": f"LoRA rank {self.cfg.rank} (alpha = rank) on every linear layer of the 28 transformer blocks",
+                "optimizer": f"Adam, no weight decay, learning rate {lr:g}, {self.cfg.warmup_steps} linear warmup steps, then constant",
+                "batch": f"{self.cfg.micro_batch} images per step",
+                "length": f"{self.cfg.epochs} epochs x {spe} steps = {spe * self.cfg.epochs} steps",
+                "saves": f"every {self.cfg.save_every_n_epochs} epochs, each with previews of 4 held-out prompts",
+                "resolution": f"{self._need('resolution')} x {self._need('resolution')}",
+                "timestep shift": "3.0 (the checkpoint's own)", "precision": "bf16 (the LoRA is saved in bf16)",
+                "evaluation": f"8 held-out scenes x seeds {', '.join(map(str, self.cfg.eval_seeds))}, "
+                              f"{GEN_STEPS} steps, guidance {GEN_CFG}"}
 
     # ---- 4. train: blocking by default (minutes), its log followed into the cell -------------------
     def train(self, *, detached: bool = False, dry_run: bool = False):
@@ -345,21 +462,28 @@ class SanaRunner(_RunnerMixin):
         return rc
 
     @staticmethod
-    def _follow(log: str):
-        """A launch() monitor that prints the trainer's log into the cell as it grows (a Colab cell
-        does not always show a child process's own output)."""
+    def _follow(log: str, on_tick=None, tick_s: float = 60.0):
+        """A launch() monitor that prints the trainer's log into the cell as it grows (a Colab cell does not
+        always show a child process's own output), calling on_tick() every tick_s seconds (uploads)."""
         def monitor(proc) -> None:
+            last = time.monotonic()
             try:
                 with open(log, "r", encoding="utf-8", errors="replace") as f:
                     while True:
                         line = f.readline()
                         if line:
                             print(line, end="", flush=True)
-                        elif proc.poll() is not None:
+                            continue
+                        if proc.poll() is not None:
                             print(f.read(), end="", flush=True)
                             return
-                        else:
-                            time.sleep(1.0)
+                        if on_tick is not None and time.monotonic() - last >= tick_s:
+                            last = time.monotonic()
+                            try:
+                                on_tick()
+                            except Exception as e:  # noqa: BLE001 — an upload hiccup must not stop the run
+                                print(f"[sana] upload during training failed ({e}); it is retried at the end", flush=True)
+                        time.sleep(1.0)
             except KeyboardInterrupt:
                 print(f"\n[sana] stopped following; the trainer (pid {proc.pid}) keeps running — s.tail() to watch")
                 raise
@@ -384,7 +508,184 @@ class SanaRunner(_RunnerMixin):
         info = self.state.get("train")
         return bool(isinstance(info, dict) and info.get("pid") and _pid_alive(info["pid"]))
 
-    # ---- 5. evaluate: load the saved LoRA through diffusers ------------------------------------
+    # ---- 5. THE SEQUENCE ----------------------------------------------------------------------------
+    def run_sequence(self, arms: "list[str] | None" = None, *, stop_on_error: bool = True) -> dict:
+        """Run the arms of sana_experiments.SEQUENCE in order (or the named subset), each into its own folder of
+        cfg.repo_id. Arms the repo already lists as done are skipped (a rerun resumes). Returns the metas."""
+        self._need("diffusers_path")
+        repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
+        specs = [a for a in sx.SEQUENCE if arms is None or a.id in arms]
+        unknown = set(arms or []) - {a.id for a in sx.SEQUENCE}
+        if unknown:
+            raise ValueError(f"unknown arm(s) {sorted(unknown)}; the sequence is {sx.SEQUENCE_IDS}")
+        metas = repo.metas()
+        try:                                     # the write check, before any GPU minute is spent
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        todo = [a for a in specs if metas.get(a.id, {}).get("status") != "done"]
+        print(f"[sana] sequence -> {self.cfg.repo_id}: {len(todo)} to run "
+              f"({', '.join(a.id for a in todo) or 'none'}); done already: "
+              f"{', '.join(k for k, m in metas.items() if m.get('status') == 'done') or 'none'}", flush=True)
+        if not todo:
+            return metas
+        t0 = time.time()
+        for key in dict.fromkeys((a.flavor, a.seed_base) for a in todo):   # every training set, stock, first
+            self._render_dataset(*key)
+        self._baseline()                                                      # the shared no-LoRA cells
+        print(f"[sana] training sets + baseline ready in {time.time() - t0:.0f} s", flush=True)
+        for spec in todo:
+            try:
+                metas[spec.id] = self._run_arm(spec, repo, metas)
+            except Exception as e:  # noqa: BLE001
+                metas[spec.id] = sx.arm_meta(spec, "failed", error=f"{type(e).__name__}: {e}"[:500])
+                self._safe(lambda: repo.put(f"experiments/{spec.id}/meta.json", sx.dumps(metas[spec.id]), f"{spec.id}: failed"))
+                self._safe(lambda: repo.put(f"experiments/{spec.id}/README.md",
+                                            sx.render_arm_readme(spec, self._recipe(spec.lr), metas[spec.id]), f"{spec.id}: failed"))
+                self._safe(lambda: self._publish_index(repo, metas))
+                print(f"[sana] {spec.id} FAILED: {e}", flush=True)
+                if stop_on_error:
+                    raise
+            self._safe(lambda: self._publish_index(repo, metas))
+        reads = sx.sequence_reads({k: m for k, m in metas.items() if m.get("status") == "done"})
+        print("[sana] reads across the sequence:", json.dumps(reads, indent=1, default=float), flush=True)
+        return metas
+
+    @staticmethod
+    def _safe(fn) -> None:
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            print(f"[sana] (upload failed: {e})", flush=True)
+
+    def _publish_index(self, repo: "_HubRepo", metas: dict) -> None:
+        done = {k: m for k, m in metas.items() if m.get("status") == "done"}
+        reads = sx.sequence_reads(done)
+        repo.put("README.md", sx.render_repo_readme(list(metas.values()), reads), "README: the experiment index")
+
+    def _baseline(self) -> dict:
+        """The held-out cells rendered WITHOUT a LoRA (once per session; every arm is paired against them)."""
+        if self._base is None:
+            self._assert_stock()
+            cells, prompts, seeds = self._cells()
+            imgs = self._render(prompts, seeds)
+            feats, scores = self._score(imgs)
+            self._base = {"images": imgs, "feats": feats, "scores": [float(x) for x in scores],
+                          "pixels": [_pixel_stats(im) for im in imgs]}
+            print(f"[sana] baseline: {len(imgs)} held-out cells, mean mood score {sum(self._base['scores']) / len(imgs):+.3f}",
+                  flush=True)
+        return self._base
+
+    def _run_arm(self, spec: "sx.ArmSpec", repo: "_HubRepo", metas: dict) -> dict:
+        import numpy as np
+        dr = Path(self._need("data_root"))
+        arm = dr / "experiments" / spec.id
+        base = f"experiments/{spec.id}"
+        img_dir = dr / "datasets" / spec.data_key / "images"
+        out_dir, cfg_dir, log = arm / "runs", arm / "config", arm / "logs" / "train.log"
+        for d in (out_dir, cfg_dir, log.parent, arm / "eval"):
+            d.mkdir(parents=True, exist_ok=True)
+        recipe = self._recipe(spec.lr)
+        lora_toml, _ = self._render_config(str(img_dir), str(out_dir), str(cfg_dir), lr=spec.lr, held_out_previews=True)
+        print(f"\n[sana] ===== {spec.id}: {spec.title} =====", flush=True)
+        repo.put(f"{base}/meta.json", sx.dumps(sx.arm_meta(spec, "running", recipe=recipe)), f"{spec.id}: started")
+        repo.put(f"{base}/README.md", sx.render_arm_readme(spec, recipe), f"{spec.id}: README")
+        repo.put_folder(cfg_dir, f"{base}/config", f"{spec.id}: config")
+        repo.put_folder(img_dir.parent, f"{base}/data", f"{spec.id}: training-set list + sheet",
+                        allow_patterns=["items.jsonl", "sheet.jpg"])
+
+        uploaded: set = set()
+
+        def ship_epochs(final: bool = False) -> None:
+            eps = _epoch_dirs(out_dir)
+            for n, d in (eps if final else eps[:-1]):          # the newest may still be writing
+                if n not in uploaded:
+                    repo.put_folder(d, f"{base}/lora/epoch{n}", f"{spec.id}: epoch {n}")
+                    uploaded.add(n)
+
+        self._point_at_fork()
+        plan = _launch.build_plan(config_toml=str(lora_toml), num_gpus=self.cfg.num_gpus)
+        t0 = time.time()
+        try:
+            _launch.launch(plan, log_path=str(log), monitor=self._follow(str(log), on_tick=ship_epochs))
+        finally:
+            self._safe(lambda: repo.put_folder(log.parent, f"{base}/logs", f"{spec.id}: log"))
+        train_s = time.time() - t0
+        ship_epochs(final=True)
+        epochs = _epoch_dirs(out_dir)
+        if not epochs:
+            raise RuntimeError(f"training finished but saved no LoRA under {out_dir}")
+        self._safe(lambda: repo.put_folder(epochs[-1][1].parent / "samples", f"{base}/samples", f"{spec.id}: previews"))
+
+        # ---- evaluation: every saved epoch at scale 1, the final one also at 0.5 ----
+        cells, prompts, seeds = self._cells()
+        b = self._baseline()
+        pipe = self._eval_pipe()
+        final_n = epochs[-1][0]
+        rows, per_cell, by_epoch, final_imgs = [], {}, {}, {}
+        for n, d in epochs:
+            name = f"{spec.id.split('_')[0]}_ep{n}"
+            pipe.load_lora_weights(str(d), weight_name="adapter_model.safetensors", adapter_name=name)
+            for sc in ([0.5, 1.0] if n == final_n else [1.0]):
+                pipe.set_adapters([name], adapter_weights=[sc])
+                imgs = self._render(prompts, seeds)
+                feats, scores = self._score(imgs)
+                diffs = [float(s - s0) for s, s0 in zip(scores, b["scores"])]
+                keep = [float(x) for x in (feats * b["feats"]).sum(-1)]
+                px = [_pixel_stats(im) for im in imgs]
+                rd = sx.arm_outcome(diffs, spec.direction)
+                rows.append({"epoch": n, "scale": sc, **rd, "content_kept": float(np.mean(keep)),
+                             "mood_score": float(np.mean(scores)),
+                             "pixels": {k: float(np.mean([p[k] for p in px])) for k in px[0]}})
+                if sc == 1.0:
+                    by_epoch[n] = imgs
+                if n == final_n:
+                    final_imgs[sc] = imgs
+                    per_cell[str(sc)] = [{"subject": SUBJECTS[si], "seed": s, "score": float(v), "diff": dd, "content_kept": k}
+                                         for (si, s), v, dd, k in zip(cells, scores, diffs, keep)]
+                print(f"[sana] {spec.id} epoch {n} scale {sc}: effect {rd['mean']:+.3f} +- {rd['se']:.3f} -> "
+                      f"{rd['OUTCOME']} | content kept {np.mean(keep):.3f}", flush=True)
+            pipe.unload_lora_weights()
+        final = next(r for r in rows if r["epoch"] == final_n and r["scale"] == 1.0)
+        final_diffs = [c["diff"] for c in per_cell["1.0"]]
+        first = next((r["epoch"] for r in rows if r["scale"] == 1.0 and abs(r["mean"]) > 3 * r["se"]
+                      and (spec.direction == 0 or r["mean"] * spec.direction > 0)), None)
+
+        # ---- files: eval/ + sheets ----
+        ev = arm / "eval"
+        (ev / "final.json").write_text(json.dumps({"baseline_scores": b["scores"], "cells": per_cell,
+                                                   "read": final}, indent=1), encoding="utf-8")
+        (ev / "epochs.json").write_text(json.dumps(rows, indent=1), encoding="utf-8")
+        first_seed = self.cfg.eval_seeds[0]
+        idx = [i for i, (_, s) in enumerate(cells) if s == first_seed]
+        _grid([[b["images"][i], final_imgs[0.5][i], final_imgs[1.0][i]] for i in idx], ev / "sheet_final.jpg")
+        _grid([[b["images"][i]] + [by_epoch[n][i] for n, _ in epochs] for i in idx[:4]], ev / "sheet_epochs.jpg")
+        meta = sx.arm_meta(spec, "done", recipe=recipe, epochs=rows, final=final, final_diffs=final_diffs,
+                           first_epoch_beyond_3se=first, train_seconds=round(train_s),
+                           summary=self._summary(spec, final, metas),
+                           finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        repo.put_folder(ev, f"{base}/eval", f"{spec.id}: evaluation")
+        repo.put(f"{base}/meta.json", sx.dumps(meta), f"{spec.id}: done")
+        repo.put(f"{base}/README.md", sx.render_arm_readme(spec, recipe, meta), f"{spec.id}: result")
+        print(f"[sana] {spec.id} done: {meta['summary']}", flush=True)
+        try:
+            from IPython.display import Image as _Img, display
+            display(_Img(filename=str(ev / "sheet_final.jpg")))
+        except Exception:  # noqa: BLE001
+            pass
+        return meta
+
+    @staticmethod
+    def _summary(spec: "sx.ArmSpec", final: dict, metas: dict) -> str:
+        eff = f"{final['mean']:+.2f} +- {final['se']:.2f}"
+        if spec.direction == 0:
+            ref = metas.get("e004_lora_mood_up", {}).get("final")
+            tail = f"; {sx.control_read(final['mean'], ref['mean'])} against e004" if ref else ""
+            return f"control: mood effect {eff} at scale 1{tail}"
+        frac = final.get("frac_pos", final.get("frac_neg"))
+        return f"{final['OUTCOME']}: mood effect {eff} at scale 1, {frac:.0%} of 32 held-out cells the expected way"
+
+    # ---- 6. evaluate (single runs): load the saved LoRA through diffusers ---------------------------
     def evaluate(self, prompts: "list[str] | None" = None, *, lora_dir: "str | None" = None) -> dict:
         """mood: the held-out subjects x eval_seeds, no LoRA, then the LoRA at each eval scale.
         folder: the same for `prompts` (default: the preview prompts). Both prove the LoRA loads through
@@ -396,49 +697,38 @@ class SanaRunner(_RunnerMixin):
         lora = Path(lora_dir) if lora_dir else self.latest_lora()
         if lora is None or not (lora / "adapter_model.safetensors").is_file():
             raise RuntimeError(f"no saved LoRA ({lora}) — train() first (runs/sana_lora/*/epochN/adapter_model.safetensors)")
-        res = self._need("resolution")
         out = Path(self._need("data_root")) / "eval"
         out.mkdir(parents=True, exist_ok=True)
         if self.cfg.source == "mood" and prompts is None:
-            cells = [(si, seed) for si in HELD_OUT for seed in self.cfg.eval_seeds]
-            plist = [NEUTRAL_TEMPLATE.format(s=SUBJECTS[si]) for si, _ in cells]
+            cells, plist, seeds = self._cells()
         else:
             plist0 = prompts or self.cfg.preview_prompts
             if not plist0:
                 raise RuntimeError("evaluate() for source='folder' needs prompts= (or preview_prompts)")
             cells = [(i, seed) for i in range(len(plist0)) for seed in self.cfg.eval_seeds]
-            plist = [plist0[i] for i, _ in cells]
-        seeds = [seed for _, seed in cells]
+            plist, seeds = [plist0[i] for i, _ in cells], [seed for _, seed in cells]
         scales = sorted({float(s) for s in self.cfg.eval_scales if s > 0})
         if not scales:
             raise RuntimeError("eval_scales needs at least one scale above 0")
 
-        pipe = _stock_pipeline(self._need("diffusers_path"))
-        images: dict = {}
-
-        def _render(tag: float) -> None:
-            imgs = []
-            for i in range(0, len(plist), self.cfg.gen_batch):
-                imgs += _generate(pipe, plist[i:i + self.cfg.gen_batch], seeds[i:i + self.cfg.gen_batch], res)
-            images[tag] = imgs
-
-        _render(0.0)                                             # no LoRA loaded: the stock model
+        pipe = self._eval_pipe()
+        self._assert_stock()
+        images = {0.0: self._render(plist, seeds)}               # no LoRA loaded: the stock model
         pipe.load_lora_weights(str(lora), weight_name="adapter_model.safetensors", adapter_name="trained")
         for sc in scales:
             pipe.set_adapters(["trained"], adapter_weights=[sc])
-            _render(sc)
-        del pipe
-        self._free_cuda()
+            images[sc] = self._render(plist, seeds)
+        pipe.unload_lora_weights()
 
         top = scales[-1]
         px_change = max(float(np.abs(np.asarray(a, dtype=np.int16) - np.asarray(b, dtype=np.int16)).max())
                         for a, b in zip(images[0.0], images[top]))
         reads: dict = {"lora": str(lora), "lora_loads": bool(px_change > 0), "max_pixel_change": px_change}
-
-        f_img, f_up, f_down = self._clip_judge()
-        feats = {tag: f_img(imgs) for tag, imgs in images.items()}
-        score = {tag: (100.0 * ((f @ f_up.T).mean(1) - (f @ f_down.T).mean(1))).tolist() for tag, f in feats.items()}
-        keep = {tag: (feats[tag] * feats[0.0]).sum(-1).tolist() for tag in feats}
+        feats, score = {}, {}
+        for tag, imgs in images.items():
+            feats[tag], s = self._score(imgs)
+            score[tag] = [float(x) for x in s]
+        keep = {tag: [float(x) for x in (feats[tag] * feats[0.0]).sum(-1)] for tag in feats}
         stats = {tag: [_pixel_stats(im) for im in imgs] for tag, imgs in images.items()}
         reads["curve"] = {str(t): float(np.mean(v)) for t, v in sorted(score.items())}
         reads["content_kept"] = {str(t): float(np.mean(v)) for t, v in sorted(keep.items())}
@@ -451,7 +741,9 @@ class SanaRunner(_RunnerMixin):
                   "scores": {str(k): v for k, v in score.items()},
                   "content_kept": {str(k): v for k, v in keep.items()}, "reads": reads}
         (out / "eval.json").write_text(json.dumps(ledger, indent=1), encoding="utf-8")
-        sheet = self._sheet(images, cells, out / "sheet.jpg")
+        first_seed = cells[0][1]
+        idx = [i for i, (_, s) in enumerate(cells) if s == first_seed][:6]
+        sheet = _grid([[images[t][i] for t in sorted(images)] for i in idx], out / "sheet.jpg")
         self.state["eval"] = {"ledger": str(out / "eval.json"), "sheet": str(sheet), "reads": reads}
         self._save_state()
         self._print_reads(reads)
@@ -487,20 +779,6 @@ class SanaRunner(_RunnerMixin):
         return image, text(UP_PHRASES), text(DOWN_PHRASES)
 
     @staticmethod
-    def _sheet(images: dict, cells, path: Path, *, rows: int = 6, tile: int = 256) -> Path:
-        """Rows = the first `rows` prompts at the first eval seed; columns = no LoRA, then each scale."""
-        from PIL import Image
-        first_seed = cells[0][1]
-        idx = [i for i, (_, seed) in enumerate(cells) if seed == first_seed][:rows]
-        tags = sorted(images)
-        canvas = Image.new("RGB", (tile * len(tags), tile * len(idx)), "white")
-        for r, i in enumerate(idx):
-            for c, tag in enumerate(tags):
-                canvas.paste(images[tag][i].resize((tile, tile)), (c * tile, r * tile))
-        canvas.save(path, quality=88)
-        return path
-
-    @staticmethod
     def _print_reads(reads: dict) -> None:
         print(f"[sana] LoRA {reads['lora']} | loads through diffusers: {reads['lora_loads']} "
               f"(max pixel change {reads['max_pixel_change']:.0f})")
@@ -516,44 +794,28 @@ class SanaRunner(_RunnerMixin):
                      f"text direction at strength 2 +{ref['text_direction_strength_2']:.2f})")
         print(line)
 
-    @staticmethod
-    def _free_cuda() -> None:
-        import gc
-        gc.collect()
-        try:
-            import torch
-            torch.cuda.empty_cache()
-        except Exception:  # noqa: BLE001
-            pass
-
-    # ---- 6. backup / monitor / status ------------------------------------------------------------
+    # ---- 7. backup / monitor / status ------------------------------------------------------------
     def backup(self) -> "str | None":
-        """Push the newest LoRA epoch dir + the evaluation to the (private) HF *model* backup_repo."""
-        repo, token = self.cfg.backup_repo, self.state.get("hf_token")
-        lora = self.latest_lora()
-        if not (repo and token and lora):
-            print("[sana] backup needs an HF_TOKEN (Colab Secrets), a backup_repo and a saved LoRA -> skip")
+        """Single runs: push the newest LoRA epoch dir + the evaluation to backup_repo, or else to a folder
+        experiments/adhoc_<source>_<UTC time>/ of the experiments repo."""
+        token, lora = self.state.get("hf_token"), self.latest_lora()
+        if not (token and lora):
+            print("[sana] backup needs an HF_TOKEN (Colab Secrets) and a saved LoRA -> skip")
             return None
-        from huggingface_hub import HfApi, create_repo
-        api = HfApi(token=token)
-        create_repo(repo, token=token, repo_type="model", private=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
+        repo_id = self.cfg.backup_repo or self.cfg.repo_id
+        base = "" if self.cfg.backup_repo else f"experiments/adhoc_{self.cfg.source}_{stamp}/"
+        if self.cfg.backup_repo:
+            from huggingface_hub import create_repo
+            create_repo(repo_id, token=token, repo_type="model", private=True, exist_ok=True)
+        repo = _HubRepo(repo_id, token)
         rel = f"{lora.parent.name}/{lora.name}"
-        api.upload_folder(folder_path=str(lora), repo_id=repo, repo_type="model", path_in_repo=f"runs/{rel}",
-                          ignore_patterns=["global_step*/*", "global_step*/**"], commit_message=f"LoRA :: {rel}")
-        ev = Path(self.state.get("data_root", ""), "eval")
-        if ev.is_dir():
-            api.upload_folder(folder_path=str(ev), repo_id=repo, repo_type="model", path_in_repo=f"runs/{rel}/eval",
-                              commit_message=f"evaluation :: {rel}")
-        base = None if self.cfg.diffusers_path else _api._dl_sana.SANA_REPOS[self.cfg.variant][0]
-        card = ("---\nlicense: apache-2.0\n" + (f"base_model: {base}\n" if base else "")
-                + "tags: [sana, lora, diffusers]\n---\n# Sana LoRA (trained with diffusion-pipe)\n\n"
-                "A LoRA for the Sana transformer, saved in diffusers format:\n\n```python\n"
-                "pipe.load_lora_weights(folder, weight_name='adapter_model.safetensors')\n```\n\n"
-                "Sana's weights are Apache-2.0; its Gemma-2-2B-IT text encoder is under the Gemma Terms of Use.\n")
-        api.upload_file(path_or_fileobj=card.encode("utf-8"), path_in_repo="README.md", repo_id=repo,
-                        repo_type="model", commit_message="model card")
-        print(f"[sana] backed up -> https://huggingface.co/{repo}/tree/main/runs/{rel}")
-        return rel
+        repo.put_folder(lora, f"{base}lora/{lora.name}", f"LoRA :: {rel}",
+                        ignore_patterns=["global_step*/*", "global_step*/**"])
+        repo.put_folder(lora.parent / "samples", f"{base}samples", "previews")
+        repo.put_folder(Path(self.state.get("data_root", ""), "eval"), f"{base}eval", f"evaluation :: {rel}")
+        print(f"[sana] backed up -> https://huggingface.co/{repo_id}/tree/main/{base}")
+        return base or rel
 
     def tail(self, n: int = 40) -> None:
         log = Path(self.state.get("data_root", ""), "runs", "train.log")
@@ -567,10 +829,9 @@ class SanaRunner(_RunnerMixin):
 
     def status(self) -> dict:
         dr = self.state.get("data_root")
-        out: dict = {"data_root": dr, "model": self.state.get("diffusers_path"),
+        out: dict = {"data_root": dr, "model": self.state.get("diffusers_path"), "repo": self.cfg.repo_id,
                      "dataset": self.state.get("dataset_dir"), "n_images": self.state.get("n_images"),
                      "config": self.state.get("lora_toml"), "latest_lora": str(self.latest_lora() or ""),
-                     "backup_repo": self.cfg.backup_repo,
                      "eval": (self.state.get("eval") or {}).get("reads", {}).get("read")}
         if isinstance(self.state.get("train"), dict):
             out["train_alive"] = self._training_alive()
@@ -580,7 +841,7 @@ class SanaRunner(_RunnerMixin):
         return out
 
     def run_all(self) -> dict:
-        """setup -> prepare_dataset -> build_configs -> train (blocking) -> evaluate -> backup."""
+        """The single run: setup -> prepare_dataset -> build_configs -> train (blocking) -> evaluate -> backup."""
         self.setup()
         self.prepare_dataset()
         self.build_configs()
