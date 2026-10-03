@@ -70,8 +70,28 @@ SEQUENCE: list[ArmSpec] = [
             changed="learning rate 5e-5 (half)", question="How does the effect depend on the learning rate?"),
     ArmSpec("e009_lora_mood_up_lr_2e-4", "Mood LoRA at double the learning rate", "up", lr=2e-4,
             changed="learning rate 2e-4 (double)", question="How does the effect depend on the learning rate?"),
+    # the second draw: the same design on e007's independent draw of images (seeds 2000-2007); e007 is its reference
+    ArmSpec("e010_lora_neutral_control_draw2", "Control LoRA, second draw: the model's own neutral images", "neutral",
+            seed_base=2000, direction=0, date="2026-10-03",
+            changed="the training images are the stock model's neutral renders, from the second draw (seeds 2000-2007); "
+                    "read against e007",
+            question="On a second, independent draw of images: does fine-tuning on the model's own images move the mood "
+                     "by itself?"),
+    ArmSpec("e011_lora_mood_down_draw2", "Mood LoRA, mirrored, second draw: downbeat images", "down",
+            seed_base=2000, direction=-1,
+            changed="the training images are downbeat renders, from the second draw (seeds 2000-2007)",
+            question="On a second draw of images: does the recipe push the mood down when the images are downbeat?"),
+    ArmSpec("e012_lora_mood_up_lr_5e-5_draw2", "Mood LoRA at half the learning rate, second draw", "up",
+            seed_base=2000, lr=5e-5, changed="learning rate 5e-5 (half), on e007's images",
+            question="On a second draw of images: how does the effect depend on the learning rate?"),
+    ArmSpec("e013_lora_mood_up_lr_2e-4_draw2", "Mood LoRA at double the learning rate, second draw", "up",
+            seed_base=2000, lr=2e-4, changed="learning rate 2e-4 (double), on e007's images",
+            question="On a second draw of images: how does the effect depend on the learning rate?"),
 ]
 SEQUENCE_IDS = [a.id for a in SEQUENCE]
+# each arm's role inside its draw of training images: (flavor, learning rate)
+DRAW_ROLES = {"up": ("up", 1e-4), "neutral": ("neutral", 1e-4), "down": ("down", 1e-4),
+              "lr_half": ("up", 5e-5), "lr_double": ("up", 2e-4)}
 
 
 def items_for(subjects: list[str], train_idx: list[int], flavor: str, *, seeds_per_subject: int = 8,
@@ -138,29 +158,62 @@ def replicate_read(a: dict, b: dict) -> str:
     return "REPLICATES" if both and close else ("BOTH WORK, SIZES DIFFER" if both else "DOES NOT REPLICATE")
 
 
-def sequence_reads(metas: dict) -> dict:
-    """The cross-arm reads over whatever arms are done (keyed by arm id; each meta carries 'final' and 'final_diffs')."""
+def roles_of_draw(metas: dict, seed_base: int) -> dict:
+    """{role: meta} for the done LoRA arms trained on the draw of images starting at seed_base."""
+    out = {}
+    for m in metas.values():
+        s = m.get("spec") or {}
+        if m.get("kind") != "lora" or s.get("seed_base") != seed_base or "final" not in m:
+            continue
+        for role, (flavor, lr) in DRAW_ROLES.items():
+            if s.get("flavor") == flavor and abs(float(s.get("lr", 0.0)) - lr) < 1e-12:
+                out[role] = m
+    return out
+
+
+def draw_reads(roles: dict) -> dict:
+    """The cross-arm reads inside one draw of training images."""
     out: dict = {}
-    ref = metas.get("e004_lora_mood_up")
-    ctl = metas.get("e005_lora_neutral_control")
+    ref, ctl, down = roles.get("up"), roles.get("neutral"), roles.get("down")
     if ref and ctl:
         out["control"] = control_read(ctl["final"]["mean"], ref["final"]["mean"])
         out["net_of_control"] = net_of_control(ref["final_diffs"], ctl["final_diffs"])
-    down = metas.get("e006_lora_mood_down")
     if ref and down:
         out["mirror"] = {"up_mean": ref["final"]["mean"], "down_mean": down["final"]["mean"],
                          "down_outcome": down["final"]["OUTCOME"]}
-    rep = metas.get("e007_lora_mood_up_reseed")
-    if ref and rep:
-        out["replicate"] = replicate_read(ref["final"], rep["final"])
     lr = {}
-    for aid in ("e008_lora_mood_up_lr_5e-5", "e004_lora_mood_up", "e009_lora_mood_up_lr_2e-4"):
-        m = metas.get(aid)
+    for role in ("lr_half", "up", "lr_double"):
+        m = roles.get(role)
         if m:
             lr[str(m["spec"]["lr"])] = {"final_mean": m["final"]["mean"], "final_se": m["final"]["se"],
                                         "first_epoch_beyond_3se": m.get("first_epoch_beyond_3se")}
     if len(lr) > 1:
         out["lr_dose"] = lr
+    return out
+
+
+def sequence_reads(metas: dict) -> dict:
+    """The cross-arm reads over whatever arms are done (keyed by arm id; each meta carries 'final' and
+    'final_diffs'): per draw of training images, the replicate of the upbeat arm across draws, and SETTLED /
+    UNSETTLED for every read present on two draws (the same verdict on both = SETTLED)."""
+    out: dict = {}
+    draws = sorted({(m.get("spec") or {}).get("seed_base") for m in metas.values()
+                    if m.get("kind") == "lora" and "final" in m} - {None})
+    per = {d: draw_reads(roles_of_draw(metas, d)) for d in draws}
+    for d in draws:
+        if per[d]:
+            out[f"draw_{d}"] = per[d]
+    ups = [roles_of_draw(metas, d).get("up") for d in draws]
+    ups = [u for u in ups if u]
+    if len(ups) >= 2:
+        out["replicate"] = replicate_read(ups[0]["final"], ups[1]["final"])
+    if len(draws) >= 2:
+        a, b = per[draws[0]], per[draws[1]]
+        verdict = {"control": lambda r: r["control"], "net_of_control": lambda r: r["net_of_control"]["OUTCOME"],
+                   "mirror": lambda r: r["mirror"]["down_outcome"]}
+        settled = {k: ("SETTLED" if f(a) == f(b) else "UNSETTLED") for k, f in verdict.items() if k in a and k in b}
+        if settled:
+            out["settled"] = settled
     return out
 
 
@@ -203,25 +256,44 @@ def render_reads(reads: dict | None) -> str:
     """The cross-arm reads in plain words (empty until two related arms are done)."""
     if not reads:
         return ""
-    out = ["## Reads across the LoRA sequence (rules fixed before the runs)"]
-    if "control" in reads:
-        out.append(f"- The control LoRA (e005, the model's own neutral images) against the upbeat LoRA (e004): "
-                   f"**{reads['control']}** (quiet = at most a third of e004's effect).")
-    if "net_of_control" in reads:
-        n = reads["net_of_control"]
-        out.append(f"- e004 minus e005, cell by cell: {_fmt(n['mean'])} +- {n['se']:.3f}, {n['frac_pos']:.0%} of "
-                   f"{n['n']} cells positive: **{n['OUTCOME']}**.")
-    if "mirror" in reads:
-        m = reads["mirror"]
-        out.append(f"- The mirror (e006, downbeat images): effect {_fmt(m['down_mean'])} against e004's "
-                   f"{_fmt(m['up_mean'])}: **{m['down_outcome']}** in the downward direction.")
+    draws = sorted(int(k.split("_")[1]) for k in reads if k.startswith("draw_"))
+    out = ["## Reads across the LoRA sequence (rules fixed before the runs)",
+           "Each draw is one independent set of training images (seeds N to N+7); its upbeat LoRA at learning rate 1e-4 "
+           "is the reference the control, the mirror and the learning rates are read against.", "",
+           "| read | " + " | ".join(f"draw {d}-{d + 7}" for d in draws) + " |",
+           "|---|" + "---|" * len(draws)]
+
+    def cell(d, key):
+        r = reads.get(f"draw_{d}", {})
+        if key == "control" and "control" in r:
+            return f"**{r['control']}**"
+        if key == "net" and "net_of_control" in r:
+            n = r["net_of_control"]
+            return f"{_fmt(n['mean'])} +- {n['se']:.3f}, {n['frac_pos']:.0%} positive: **{n['OUTCOME']}**"
+        if key == "mirror" and "mirror" in r:
+            m = r["mirror"]
+            return f"{_fmt(m['down_mean'])} (upbeat {_fmt(m['up_mean'])}): **{m['down_outcome']}** downward"
+        return ""
+
+    for key, label in (("control", "control LoRA (own neutral images) against the upbeat LoRA"),
+                       ("net", "upbeat minus control, cell by cell"), ("mirror", "downbeat LoRA")):
+        out.append(f"| {label} | " + " | ".join(cell(d, key) for d in draws) + " |")
     if "replicate" in reads:
-        out.append(f"- A fresh draw of upbeat images (e007) against e004: **{reads['replicate']}**.")
-    if "lr_dose" in reads:
-        out += ["", "| learning rate | final effect (mean +- SE) | first epoch beyond 3 SE |", "|---|---|---|"]
-        for lr, v in sorted(reads["lr_dose"].items(), key=lambda kv: float(kv[0])):
-            out.append(f"| {float(lr):g} | {_fmt(v['final_mean'])} +- {v['final_se']:.3f} | "
-                       f"{v['first_epoch_beyond_3se'] or 'none'} |")
+        out += ["", f"- The upbeat LoRA on the two draws: **{reads['replicate']}**."]
+    for k, v in (reads.get("settled") or {}).items():
+        name = {"control": "the control", "net_of_control": "upbeat minus control", "mirror": "the mirror"}[k]
+        out.append(f"- {name}: **{v}** across the two draws.")
+    lrs = sorted({lr for d in draws for lr in reads.get(f"draw_{d}", {}).get("lr_dose", {})}, key=float)
+    if lrs:
+        out += ["", "| learning rate | " + " | ".join(f"draw {d}-{d + 7}: final effect, first epoch beyond 3 SE"
+                                                    for d in draws) + " |", "|---|" + "---|" * len(draws)]
+        for lr in lrs:
+            vals = []
+            for d in draws:
+                v = reads.get(f"draw_{d}", {}).get("lr_dose", {}).get(lr)
+                vals.append(f"{_fmt(v['final_mean'])} +- {v['final_se']:.3f}, {v['first_epoch_beyond_3se'] or 'none'}"
+                            if v else "")
+            out.append(f"| {float(lr):g} | " + " | ".join(vals) + " |")
     return "\n".join(out) + "\n"
 
 
@@ -300,7 +372,7 @@ def render_arm_readme(spec: ArmSpec, recipe: dict, meta: dict | None = None) -> 
            f"seeds {spec.seed_base}-{spec.seed_base + 7}, the two {FLAVOR_WORDS[spec.flavor]} templates alternating), "
            "each captioned with the neutral prompt \"a photo of <scene>\". Eight more scenes are held out for the "
            "evaluation. The item list is in `data/items.jsonl`.", "",
-           f"Changed from the reference recipe (e004): {spec.changed}.", "",
+           f"Changed from the reference recipe (e004; on the second draw of images, e007): {spec.changed}.", "",
            "## Recipe", "| setting | value |", "|---|---|", rec, "",
            "## The rule (fixed before the run)", rule, "", JUDGE_TEXT, ""]
     if meta and meta.get("status") == "done":

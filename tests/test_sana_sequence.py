@@ -38,18 +38,51 @@ def test_cross_arm_reads():
 
 def test_sequence_is_gate_ordered_and_varies_one_thing():
     assert sx.SEQUENCE_IDS[0] == "e004_lora_mood_up" and sx.SEQUENCE_IDS[1] == "e005_lora_neutral_control"
-    ref = sx.SEQUENCE[0]
-    for a in sx.SEQUENCE[1:]:
-        diffs = [k for k in ("flavor", "seed_base", "lr") if getattr(a, k) != getattr(ref, k)]
-        assert len(diffs) == 1, (a.id, diffs)
+    refs = {a.seed_base: a for a in sx.SEQUENCE if a.flavor == "up" and a.lr == 1e-4}   # one reference per draw
+    assert sorted(refs) == [1000, 2000] and refs[2000].id == "e007_lora_mood_up_reseed"
+    for a in sx.SEQUENCE:
+        ref = refs[a.seed_base]
+        diffs = [k for k in ("flavor", "lr") if getattr(a, k) != getattr(ref, k)]
+        assert len(diffs) == (0 if a is ref else 1), (a.id, diffs)
+    roles = {}
+    for a in sx.SEQUENCE:                                   # every draw carries every role exactly once
+        role = next(r for r, (fl, lr) in sx.DRAW_ROLES.items() if fl == a.flavor and lr == a.lr)
+        roles.setdefault(a.seed_base, []).append(role)
+    assert all(sorted(v) == sorted(sx.DRAW_ROLES) for v in roles.values())
     assert len(set(sx.SEQUENCE_IDS)) == len(sx.SEQUENCE_IDS)
+
+
+def _done(spec, mean, diffs, first=2):
+    return sx.arm_meta(spec, "done", final={"mean": mean, "se": 0.1, "OUTCOME": "FLAVOR LORA" if mean > 0.5 else
+                                            ("FLAVOR LORA" if spec.direction < 0 and mean < -0.5 else "CONTROL")},
+                       final_diffs=diffs, first_epoch_beyond_3se=first)
+
+
+def test_sequence_reads_per_draw_and_settled():
+    by_id = {a.id: a for a in sx.SEQUENCE}
+    up = [1.0 + 0.01 * i for i in range(32)]
+    metas = {
+        "e004_lora_mood_up": _done(by_id["e004_lora_mood_up"], 1.05, up),
+        "e005_lora_neutral_control": _done(by_id["e005_lora_neutral_control"], 0.05, [0.05] * 32),
+        "e006_lora_mood_down": _done(by_id["e006_lora_mood_down"], -0.9, [-0.9] * 32),
+        "e007_lora_mood_up_reseed": _done(by_id["e007_lora_mood_up_reseed"], 1.1, up),
+        "e010_lora_neutral_control_draw2": _done(by_id["e010_lora_neutral_control_draw2"], 0.6, [0.6] * 32),
+        "e012_lora_mood_up_lr_5e-5_draw2": _done(by_id["e012_lora_mood_up_lr_5e-5_draw2"], 0.7, up, first=4),
+    }
+    r = sx.sequence_reads(metas)
+    assert r["draw_1000"]["control"] == "CONTROL QUIET" and r["draw_2000"]["control"] == "CONTROL MOVES"
+    assert r["settled"]["control"] == "UNSETTLED" and r["replicate"] == "REPLICATES"
+    assert "mirror" in r["draw_1000"] and "mirror" not in r["draw_2000"]
+    assert set(r["draw_2000"]["lr_dose"]) == {"5e-05", "0.0001"}
+    md = sx.render_reads(r)
+    assert "draw 1000-1007" in md and "draw 2000-2007" in md and "UNSETTLED" in md and "5e-05" in md
 
 
 def test_readmes_are_plain_and_complete():
     spec = sx.SEQUENCE[0]
     txt = sx.render_arm_readme(spec, {"optimizer": "Adam"})
     assert spec.id in txt and "fixed before the run" in txt and "Running." in txt
-    top = sx.render_repo_readme([sx.arm_meta(spec, "running")], {"control": "CONTROL QUIET"})
+    top = sx.render_repo_readme([sx.arm_meta(spec, "running")], {"draw_1000": {"control": "CONTROL QUIET"}})
     assert "license: apache-2.0" in top and f"experiments/{spec.id}/" in top and "CONTROL QUIET" in top
     assert "2410.10629" in top and "2311.12092" in top
     for word in ("S-1", "Phil", "docket", "canon/"):
