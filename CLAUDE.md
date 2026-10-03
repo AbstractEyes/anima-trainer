@@ -35,8 +35,9 @@ installable package **`geolip_anima_trainer`** (console command **`anima`**):
   re-pasting cells. Holds the shared **`_RunnerMixin`**. See "Colab cache factory" below.
 - `trainer_runner.py` — the **RTX 6000 TRAINER** runner (mirror of the factory: pull cache →
   build → detached train → monitor/resume/backup). See "RTX 6000 trainer" below.
-- `sana_runner.py` — the **Sana Colab** runner behind `notebooks/sana_colab_train.ipynb` (fork
-  bootstrap → self-rendered mood set → configs → train → diffusers-load evaluation → backup).
+- `sana_runner.py` + `sana_experiments.py` — the **Sana Colab** runner behind
+  `notebooks/sana_colab_train.ipynb`: the experiment SEQUENCE (self-rendered mood sets → configs →
+  train → diffusers-load evaluation per epoch), one folder per experiment in the HF experiments repo.
   See "Sana — model type `sana`" below.
 - `api.py` / `cli.py` — the Python API and the `anima` CLI.
 - `templates/anima_lora.toml`, `templates/anima_dataset.toml` — packaged templates;
@@ -454,6 +455,25 @@ judge = 100 × (mean cosine to 3 upbeat phrases − to 3 downbeat phrases); verd
 MIXED per `mood_outcome`; `eval/eval.json` + `eval/sheet.jpg`) → `backup()`. `tests/test_sana_runner.py`
 covers the set, the verdict rule, the fork lookup, the config wiring, the train plan, the log follower and
 the bootstrap.
+
+**The sequence** (`SanaRunner.run_sequence()`, the notebook's main path): the arms of
+`sana_experiments.SEQUENCE` (e004 upbeat, e005 neutral control, e006 downbeat, e007 reseeded upbeat, e008 /
+e009 half / double lr; each the reference recipe with ONE change, asserted by a test), uploaded into the HF
+experiments repo `AbstractPhil/geolip-beatrix-sana` (public; `repo_id=` / `ANIMA_SANA_REPO`), one folder per
+experiment: `experiments/<id>/` README.md + meta.json + config/ + data/ (items.jsonl + sheet) + lora/epochN/
+(each uploaded as soon as the NEXT epoch appears, the rest at the end) + samples/ + eval/ (final.json,
+epochs.json, two sheets) + logs/. Order of work: the write check (publishing the README index) BEFORE any GPU
+minute; every training set (`datasets/<flavor>_<seed_base>/images`, items.jsonl + sheet.jpg BESIDE the image
+folder so the trainer never scans them) and the shared no-LoRA baseline rendered BEFORE any LoRA is loaded
+(`_assert_stock` refuses stock renders with a LoRA loaded); then per arm: config → train (log followed, epochs
+shipped by the follower's tick) → each saved epoch loaded with `load_lora_weights` at scale 1 (final also 0.5),
+paired by cell against the baseline → `unload_lora_weights()`. The stock pipeline + the CLIP judge stay
+resident across arms. Verdicts (`sana_experiments`): `arm_outcome(diffs, direction)`, `control_read`,
+`net_of_control`, `replicate_read`, `sequence_reads`; the README index is regenerated from EVERY folder's
+meta.json (re-read before each publish, so folders added meanwhile survive). A failed arm uploads meta
+`failed` + its log and stops the run; a rerun skips arms whose meta says done. Public prose only in the
+generated READMEs (a test bans in-house words). `tests/test_sana_sequence.py` runs the whole sequence
+against a fake trainer, pipeline and hub.
 
 ### Training previews — `SamplesConfig` → `[samples]`
 `TrainConfig.samples = SamplesConfig(prompts=[...])` renders a `[samples]` table into the lora toml

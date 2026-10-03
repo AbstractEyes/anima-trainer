@@ -147,8 +147,26 @@ def _epoch_dirs(output_dir: "str | Path") -> list[tuple[int, Path]]:
     return sorted(out)
 
 
+def _folder_files(folder: "str | Path", prefix: str, allow: "list[str] | None" = None) -> dict:
+    """{path in the repo: local file (a Path)} for every file under folder (allow = top-level names to keep),
+    skipping deepspeed state (global_step*) and caches."""
+    folder = Path(folder)
+    out: dict = {}
+    if not folder.is_dir():
+        return out
+    for p in sorted(folder.rglob("*")):
+        rel = p.relative_to(folder).as_posix()
+        if not p.is_file() or rel.startswith(("global_step", "cache/")) or "/cache/" in rel:
+            continue
+        if allow is not None and rel not in allow:
+            continue
+        out[f"{prefix}/{rel}"] = p
+    return out
+
+
 class _HubRepo:
-    """Uploads into one HF *model* repo (the experiments repo). Every call is one commit."""
+    """Uploads into one HF *model* repo (the experiments repo), a few commits per experiment, each retried."""
+    RETRY_S = (15, 30, 60, 120)
 
     def __init__(self, repo_id: str, token: "str | None"):
         if not token:
@@ -171,14 +189,31 @@ class _HubRepo:
                 out[parts[1]] = json.loads(Path(p).read_text(encoding="utf-8"))
         return out
 
-    def put(self, path_in_repo: str, data: "bytes | str", msg: str) -> None:
-        self.api.upload_file(path_or_fileobj=data.encode("utf-8") if isinstance(data, str) else data,
-                             path_in_repo=path_in_repo, repo_id=self.repo_id, repo_type="model", commit_message=msg)
+    def commit(self, files: dict, msg: str, *, retry: bool = True) -> None:
+        """One commit adding every {path in the repo: a local file (Path) | bytes | text (str)}. Rate limits,
+        server errors and dropped connections are retried; a refused token is not."""
+        from huggingface_hub import CommitOperationAdd
+        if not files:
+            return
+        ops = [CommitOperationAdd(path_in_repo=path, path_or_fileobj=str(v) if isinstance(v, Path)
+                                  else v.encode("utf-8") if isinstance(v, str) else v)
+               for path, v in files.items()]
+        for wait in ((*self.RETRY_S, None) if retry else (None,)):
+            try:
+                self.api.create_commit(repo_id=self.repo_id, repo_type="model", operations=ops, commit_message=msg)
+                return
+            except Exception as e:  # noqa: BLE001
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                if wait is None or code in (401, 403, 404):
+                    raise
+                print(f"[sana] upload '{msg}' failed ({type(e).__name__}: {str(e)[:120]}); retry in {wait} s", flush=True)
+                time.sleep(wait)
 
-    def put_folder(self, folder: "str | Path", path_in_repo: str, msg: str, **kw) -> None:
-        if Path(folder).is_dir() and any(Path(folder).iterdir()):
-            self.api.upload_folder(folder_path=str(folder), path_in_repo=path_in_repo, repo_id=self.repo_id,
-                                   repo_type="model", commit_message=msg, **kw)
+    def put(self, path_in_repo: str, data: "bytes | str", msg: str, *, retry: bool = True) -> None:
+        self.commit({path_in_repo: data.encode("utf-8") if isinstance(data, str) else data}, msg, retry=retry)
+
+    def put_folder(self, folder: "str | Path", path_in_repo: str, msg: str, *, allow: "list[str] | None" = None) -> None:
+        self.commit(_folder_files(folder, path_in_repo, allow), msg)
 
 
 @dataclass
@@ -539,9 +574,11 @@ class SanaRunner(_RunnerMixin):
                 metas[spec.id] = self._run_arm(spec, repo, metas)
             except Exception as e:  # noqa: BLE001
                 metas[spec.id] = sx.arm_meta(spec, "failed", error=f"{type(e).__name__}: {e}"[:500])
-                self._safe(lambda: repo.put(f"experiments/{spec.id}/meta.json", sx.dumps(metas[spec.id]), f"{spec.id}: failed"))
-                self._safe(lambda: repo.put(f"experiments/{spec.id}/README.md",
-                                            sx.render_arm_readme(spec, self._recipe(spec.lr), metas[spec.id]), f"{spec.id}: failed"))
+                base = f"experiments/{spec.id}"
+                files = {f"{base}/meta.json": sx.dumps(metas[spec.id]),
+                         f"{base}/README.md": sx.render_arm_readme(spec, self._recipe(spec.lr), metas[spec.id])}
+                files.update(_folder_files(Path(self.state["data_root"]) / "experiments" / spec.id / "logs", f"{base}/logs"))
+                self._safe(lambda: repo.commit(files, f"{spec.id}: failed"))
                 self._safe(lambda: self._publish_index(repo, metas))
                 print(f"[sana] {spec.id} FAILED: {e}", flush=True)
                 if stop_on_error:
@@ -591,34 +628,40 @@ class SanaRunner(_RunnerMixin):
         recipe = self._recipe(spec.lr)
         lora_toml, _ = self._render_config(str(img_dir), str(out_dir), str(cfg_dir), lr=spec.lr, held_out_previews=True)
         print(f"\n[sana] ===== {spec.id}: {spec.title} =====", flush=True)
-        repo.put(f"{base}/meta.json", sx.dumps(sx.arm_meta(spec, "running", recipe=recipe)), f"{spec.id}: started")
-        repo.put(f"{base}/README.md", sx.render_arm_readme(spec, recipe), f"{spec.id}: README")
-        repo.put_folder(cfg_dir, f"{base}/config", f"{spec.id}: config")
-        repo.put_folder(img_dir.parent, f"{base}/data", f"{spec.id}: training-set list + sheet",
-                        allow_patterns=["items.jsonl", "sheet.jpg"])
+        start = {f"{base}/meta.json": sx.dumps(sx.arm_meta(spec, "running", recipe=recipe)),
+                 f"{base}/README.md": sx.render_arm_readme(spec, recipe)}
+        start.update(_folder_files(cfg_dir, f"{base}/config"))
+        start.update(_folder_files(img_dir.parent, f"{base}/data", allow=["items.jsonl", "sheet.jpg"]))
+        repo.commit(start, f"{spec.id}: started (README, config, training-set list)")
 
         uploaded: set = set()
 
-        def ship_epochs(final: bool = False) -> None:
+        def epoch_files(final: bool = False) -> dict:
             eps = _epoch_dirs(out_dir)
+            files: dict = {}
             for n, d in (eps if final else eps[:-1]):          # the newest may still be writing
                 if n not in uploaded:
-                    repo.put_folder(d, f"{base}/lora/epoch{n}", f"{spec.id}: epoch {n}")
+                    files.update(_folder_files(d, f"{base}/lora/epoch{n}"))
                     uploaded.add(n)
+            return files
+
+        def ship_epochs() -> None:                             # long runs: saved epochs ship while training
+            files = epoch_files()
+            if files:
+                repo.commit(files, f"{spec.id}: epochs saved so far")
 
         self._point_at_fork()
         plan = _launch.build_plan(config_toml=str(lora_toml), num_gpus=self.cfg.num_gpus)
         t0 = time.time()
-        try:
-            _launch.launch(plan, log_path=str(log), monitor=self._follow(str(log), on_tick=ship_epochs))
-        finally:
-            self._safe(lambda: repo.put_folder(log.parent, f"{base}/logs", f"{spec.id}: log"))
+        _launch.launch(plan, log_path=str(log), monitor=self._follow(str(log), on_tick=ship_epochs, tick_s=300.0))
         train_s = time.time() - t0
-        ship_epochs(final=True)
         epochs = _epoch_dirs(out_dir)
         if not epochs:
             raise RuntimeError(f"training finished but saved no LoRA under {out_dir}")
-        self._safe(lambda: repo.put_folder(epochs[-1][1].parent / "samples", f"{base}/samples", f"{spec.id}: previews"))
+        trained = epoch_files(final=True)                       # the weights ship BEFORE the evaluation
+        trained.update(_folder_files(log.parent, f"{base}/logs"))
+        trained.update(_folder_files(epochs[-1][1].parent / "samples", f"{base}/samples"))
+        repo.commit(trained, f"{spec.id}: LoRA epochs, previews, log")
 
         # ---- evaluation: every saved epoch at scale 1, the final one also at 0.5 ----
         cells, prompts, seeds = self._cells()
@@ -667,9 +710,10 @@ class SanaRunner(_RunnerMixin):
                            first_epoch_beyond_3se=first, train_seconds=round(train_s),
                            summary=self._summary(spec, final, metas),
                            finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
-        repo.put_folder(ev, f"{base}/eval", f"{spec.id}: evaluation")
-        repo.put(f"{base}/meta.json", sx.dumps(meta), f"{spec.id}: done")
-        repo.put(f"{base}/README.md", sx.render_arm_readme(spec, recipe, meta), f"{spec.id}: result")
+        done = _folder_files(ev, f"{base}/eval")
+        done[f"{base}/meta.json"] = sx.dumps(meta)
+        done[f"{base}/README.md"] = sx.render_arm_readme(spec, recipe, meta)
+        repo.commit(done, f"{spec.id}: evaluation + result")
         print(f"[sana] {spec.id} done: {meta['summary']}", flush=True)
         try:
             from IPython.display import Image as _Img, display
@@ -813,10 +857,10 @@ class SanaRunner(_RunnerMixin):
             create_repo(repo_id, token=token, repo_type="model", private=True, exist_ok=True)
         repo = _HubRepo(repo_id, token)
         rel = f"{lora.parent.name}/{lora.name}"
-        repo.put_folder(lora, f"{base}lora/{lora.name}", f"LoRA :: {rel}",
-                        ignore_patterns=["global_step*/*", "global_step*/**"])
-        repo.put_folder(lora.parent / "samples", f"{base}samples", "previews")
-        repo.put_folder(Path(self.state.get("data_root", ""), "eval"), f"{base}eval", f"evaluation :: {rel}")
+        files = _folder_files(lora, f"{base}lora/{lora.name}")
+        files.update(_folder_files(lora.parent / "samples", f"{base}samples"))
+        files.update(_folder_files(Path(self.state.get("data_root", ""), "eval"), f"{base}eval"))
+        repo.commit(files, f"LoRA + previews + evaluation :: {rel}")
         print(f"[sana] backed up -> https://huggingface.co/{repo_id}/tree/main/{base}")
         return base or rel
 

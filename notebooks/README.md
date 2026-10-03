@@ -34,25 +34,33 @@ Anima and any LoRA from it are **NON-COMMERCIAL** (CircleStone NC + NVIDIA Open 
 License / Cosmos derivative). The backup model card is labelled accordingly.
 
 ## `sana_colab_train.ipynb`
-A **Sana LoRA** on a Colab GPU runtime (the RTX PRO 6000 is the target; the 600M recipe fits much
-smaller cards), trained through model type `sana` in the
-[AbstractEyes diffusion-pipe fork](https://github.com/AbstractEyes/diffusion-pipe). Thin shell over
-`geolip_anima_trainer.sana_runner.SanaRunner`: bootstrap (`anima_colab.install(...,
+**Sana LoRA experiments** on a Colab GPU runtime (the RTX PRO 6000 is the target), trained through
+model type `sana` in the [AbstractEyes diffusion-pipe fork](https://github.com/AbstractEyes/diffusion-pipe)
+and uploaded one folder per experiment into
+[AbstractPhil/geolip-beatrix-sana](https://huggingface.co/AbstractPhil/geolip-beatrix-sana). Thin shell
+over `geolip_anima_trainer.sana_runner.SanaRunner`: bootstrap (`anima_colab.install(...,
 dp_url=anima_colab.DP_FORK_URL)` clones the fork at `external/diffusion-pipe-fork`; one restart), then
-`setup()` → `prepare_dataset()` → `build_configs()` → `train()` → `evaluate()` → `backup()`.
+`setup()` → `run_sequence()`.
 
-- **No dataset needed by default:** the stock Sana 600M 512px model renders 192 upbeat images
-  (24 subjects × 8 seeds) captioned with the neutral prompt "a photo of <subject>"; 8 more subjects
-  never enter training.
+- **No dataset needed:** the stock Sana 600M 512px model renders its own training sets, images of one
+  mood (24 subjects × 8 seeds = 192) captioned with the neutral prompt "a photo of <subject>"; 8 more
+  subjects never enter training.
+- **The sequence** (`sana_experiments.SEQUENCE`, each the first recipe with one change): e004 upbeat
+  images; e005 the model's own neutral images (a control that can fail); e006 downbeat images; e007 a
+  fresh draw of upbeat images; e008 / e009 half / double the learning rate.
 - **Recipe:** rank 32, plain Adam (weight decay 0) at 1e-4, 10 epochs at micro-batch 4 (480 steps),
   20 warmup steps, a save + 4 preview images every 2 epochs, `shift = 3.0`.
-- **Evaluation:** the saved LoRA is loaded through diffusers (`load_lora_weights`) and the 8 held-out
-  subjects × 4 seeds are rendered without the LoRA and with it at scale 0.5 and 1; a CLIP mood judge
-  (upbeat phrases minus downbeat phrases) gives the verdict: **FLAVOR LORA** (mean above 0, at least 75%
-  of the pairs positive, above 3 standard errors), **NO EFFECT** (within 2 standard errors of 0, or under
-  60% positive), else **MIXED**. Writes `eval/eval.json` + `eval/sheet.jpg`.
-- `HF_TOKEN` is optional (the models are public); `backup()` uses it to push the LoRA + the evaluation
-  to a private model repo (`<user>/sana-mood-lora` unless `backup_repo=` is set).
-- **Your own data:** `SanaRunner(source="folder", dataset_dir=..., preview_prompts=[...])`.
+- **Evaluation:** every saved LoRA is loaded through diffusers (`load_lora_weights`) and the 8 held-out
+  subjects × 4 seeds are rendered with it (scale 1; the final epoch also at 0.5), paired against the same
+  cells without a LoRA; a CLIP mood judge (upbeat phrases minus downbeat phrases) gives each arm's verdict
+  in its direction: **FLAVOR LORA** (the mean moves that way, at least 75% of the cells that way, beyond
+  3 standard errors), **NO EFFECT** (within 2 standard errors of 0, or under 60% that way), else **MIXED**;
+  the reads across arms (the control, the net effect, the replicate, the learning-rate dose) go into the
+  repo README.
+- **Uploads** (a WRITE `HF_TOKEN` in Colab Secrets; checked before any GPU work): `experiments/<id>/`
+  with README, `meta.json`, `config/`, `data/`, every `lora/epochN/` as it is saved, `samples/`, `eval/`,
+  `logs/`. A rerun skips the arms the repo lists as done.
+- **One ad-hoc run on your own images:** `SanaRunner(source="folder", dataset_dir=..., preview_prompts=[...])`
+  with `prepare_dataset()` → `build_configs()` → `train()` → `evaluate()` → `backup()`.
 
 Sana's weights are Apache-2.0; its Gemma-2-2B-IT text encoder is under the Gemma Terms of Use.

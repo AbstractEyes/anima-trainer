@@ -192,9 +192,11 @@ cache → two-phase train):
   `DATA_ROOT`/`HF_HOME`, `limit=None` extraction, long-run config: `save_every_n_steps`, gradient
   accumulation, `activation_checkpointing=true` + larger `micro_batch`, `compile=true`; run **detached**
   via tmux/nohup and recover with `--resume_from_checkpoint` — disk is the durability, backup is optional).
-- **`sana_colab_train.ipynb`** — a **Sana LoRA** on Colab with no dataset needed: the stock model renders
-  its own upbeat training set captioned neutrally, and the saved LoRA is loaded back through diffusers and
-  scored on held-out subjects. See [Sana](#sana-diffusers-format) and `notebooks/README.md`.
+- **`sana_colab_train.ipynb`** — a sequence of **Sana LoRA experiments** on Colab with no dataset needed:
+  the stock model renders its own mood training sets captioned neutrally, every saved LoRA is loaded back
+  through diffusers and scored on held-out subjects, and each experiment uploads into its own folder of
+  [AbstractPhil/geolip-beatrix-sana](https://huggingface.co/AbstractPhil/geolip-beatrix-sana). See
+  [Sana](#sana-diffusers-format) and `notebooks/README.md`.
 
 ## Programmatic / sweeps
 

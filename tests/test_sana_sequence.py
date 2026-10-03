@@ -70,9 +70,11 @@ def test_epoch_dirs_reads_the_newest_run(tmp_path):
 
 # ---- run_sequence end to end, with fakes ---------------------------------------------------------------
 class FakeRepo:
+    """The _HubRepo surface: commit() stores every file's bytes; put() is one file."""
+
     def __init__(self):
         self.files_: dict[str, bytes] = {}
-        self.folders: list[tuple[str, list[str]]] = []
+        self.commits: list[str] = []
         self.fail_writes = False
 
     def files(self):
@@ -82,19 +84,28 @@ class FakeRepo:
         return {p.split("/")[1]: json.loads(b) for p, b in self.files_.items()
                 if p.startswith("experiments/") and p.endswith("/meta.json")}
 
-    def put(self, path, data, msg):
+    def commit(self, files, msg, *, retry=True):
         if self.fail_writes:
             raise PermissionError("403 Forbidden")
-        self.files_[path] = data.encode() if isinstance(data, str) else data
+        for p, v in files.items():
+            assert isinstance(v, (Path, bytes, str)), type(v)
+            self.files_[p] = v.read_bytes() if isinstance(v, Path) else v.encode() if isinstance(v, str) else v
+        self.commits.append(msg)
 
-    def put_folder(self, folder, path_in_repo, msg, **kw):
-        folder = Path(folder)
-        if folder.is_dir():
-            names = sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file())
-            pats = kw.get("allow_patterns")
-            if pats:
-                names = [n for n in names if n in pats]
-            self.folders.append((path_in_repo, names))
+    def put(self, path, data, msg, *, retry=True):
+        self.commit({path: data}, msg)
+
+
+def test_folder_files_keeps_allowed_names_and_skips_caches(tmp_path):
+    (tmp_path / "images" / "cache").mkdir(parents=True)
+    (tmp_path / "images" / "cache" / "x.bin").write_bytes(b"c")
+    (tmp_path / "images" / "a.png").write_bytes(b"p")
+    (tmp_path / "items.jsonl").write_text("{}", encoding="utf-8")
+    (tmp_path / "global_step10").mkdir()
+    (tmp_path / "global_step10" / "s.pt").write_bytes(b"s")
+    assert sorted(sr._folder_files(tmp_path, "d")) == ["d/images/a.png", "d/items.jsonl"]
+    assert list(sr._folder_files(tmp_path, "d", allow=["items.jsonl"])) == ["d/items.jsonl"]
+    assert all(isinstance(v, Path) for v in sr._folder_files(tmp_path, "d").values())
 
 
 class FakePipe:
@@ -183,14 +194,20 @@ def test_run_sequence_end_to_end(runner):
     assert [(r["epoch"], r["scale"]) for r in m4["epochs"]] == [(2, 1.0), (4, 1.0), (6, 1.0), (8, 1.0), (10, 0.5), (10, 1.0)]
     assert len(m4["final_diffs"]) == 32 and m4["first_epoch_beyond_3se"] == 2
     # the repo: every arm's folder, every epoch, the data list, the eval files, the index with the reads
-    folders = dict(repo.folders)
     for a in arms:
+        base = f"experiments/{a}"
         for n in (2, 4, 6, 8, 10):
-            assert f"experiments/{a}/lora/epoch{n}" in folders
-        assert folders[f"experiments/{a}/data"] == ["items.jsonl", "sheet.jpg"]
-        assert {"final.json", "epochs.json", "sheet_final.jpg", "sheet_epochs.jpg"} <= set(folders[f"experiments/{a}/eval"])
-        assert json.loads(repo.files_[f"experiments/{a}/meta.json"])["status"] == "done"
-        assert "## Result" in repo.files_[f"experiments/{a}/README.md"].decode()
+            assert repo.files_[f"{base}/lora/epoch{n}/adapter_model.safetensors"] == b"lora"
+        data = sorted(p for p in repo.files_ if p.startswith(f"{base}/data/"))
+        assert data == [f"{base}/data/items.jsonl", f"{base}/data/sheet.jpg"]
+        for f in ("final.json", "epochs.json", "sheet_final.jpg", "sheet_epochs.jpg"):
+            assert f"{base}/eval/{f}" in repo.files_
+        assert f"{base}/config/anima_lora.toml" in repo.files_ and f"{base}/logs/train.log" in repo.files_
+        assert f"{base}/samples/step0/0.png" in repo.files_
+        assert json.loads(repo.files_[f"{base}/meta.json"])["status"] == "done"
+        assert "## Result" in repo.files_[f"{base}/README.md"].decode()
+    arm_commits = [c for c in repo.commits if c.startswith("e004")]
+    assert len(arm_commits) == 3                              # started, weights (before the eval), result
     top = repo.files_["README.md"].decode()
     assert "CONTROL QUIET" in top and "THE MOOD COMES FROM THE IMAGES" in top and "e006_lora_mood_down" in top
     # the training sets were rendered stock, beside (not inside) the image folders the trainer scans
@@ -202,15 +219,16 @@ def test_run_sequence_end_to_end(runner):
 
 def test_index_keeps_folders_added_while_the_sequence_runs(runner):
     s, repo, pipe, calls = runner
-    real_put = repo.put
+    real_commit = repo.commit
 
-    def put(path, data, msg):                      # another writer adds a folder mid-sequence
-        real_put(path, data, msg)
-        if path.endswith("e004_lora_mood_up/meta.json") and b'"done"' in (data if isinstance(data, bytes) else data.encode()):
-            real_put("experiments/e001_flavor_test/meta.json",
-                     json.dumps({"id": "e001_flavor_test", "title": "t", "status": "done", "summary": "DIAL"}).encode(), "x")
+    def commit(files, msg, *, retry=True):         # another writer adds a folder mid-sequence
+        real_commit(files, msg)
+        meta = files.get("experiments/e004_lora_mood_up/meta.json")
+        if meta is not None and b'"done"' in meta:
+            real_commit({"experiments/e001_flavor_test/meta.json":
+                         json.dumps({"id": "e001_flavor_test", "title": "t", "status": "done", "summary": "DIAL"}).encode()}, "x")
 
-    repo.put = put
+    repo.commit = commit
     s.run_sequence(["e004_lora_mood_up"])
     assert "e001_flavor_test" in repo.files_["README.md"].decode()
 
