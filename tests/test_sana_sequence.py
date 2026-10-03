@@ -138,6 +138,7 @@ def runner(tmp_path, monkeypatch):
     s.state.update(data_root=str(tmp_path / "data"), resolution=512, diffusers_path=str(model), hf_token="tok")
     repo, pipe, calls = FakeRepo(), FakePipe(), {"train": []}
     monkeypatch.setattr(sr, "_HubRepo", lambda repo_id, token: repo)
+    monkeypatch.setattr(sr, "_drop_torchao", lambda: False)      # never touch this environment's packages
     monkeypatch.setattr(s, "_point_at_fork", lambda: "fork")
     s._pipe = pipe
 
@@ -263,6 +264,21 @@ def test_no_write_access_stops_before_any_gpu_work(runner):
     with pytest.raises(RuntimeError, match="WRITE"):
         s.run_sequence()
     assert calls["train"] == [] and not (Path(s.state["data_root"]) / "datasets").exists()
+
+
+def test_drop_torchao_uninstalls_only_when_present(monkeypatch):
+    import importlib.metadata as md
+    ran = []
+    monkeypatch.setattr(sr.subprocess, "run", lambda argv, check=False: ran.append(argv))
+
+    def version_missing(name):
+        raise md.PackageNotFoundError(name)
+
+    monkeypatch.setattr(md, "version", version_missing)
+    assert sr._drop_torchao() is False and ran == []
+    monkeypatch.setattr(md, "version", lambda name: "0.10.0")
+    assert sr._drop_torchao() is True
+    assert ran and ran[0][-3:] == ["-y", "-q", "torchao"] and "uninstall" in ran[0]
 
 
 def test_unknown_arm_is_refused(runner):

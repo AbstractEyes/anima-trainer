@@ -205,11 +205,14 @@ def test_bootstrap_clones_the_fork_beside_upstream(tmp_path, monkeypatch, colab)
 
     monkeypatch.setattr(colab, "_sh", _sh)
     monkeypatch.setattr(colab, "_pip", lambda *a: pips.append(" ".join(a)))
+    import importlib.metadata as md
+    monkeypatch.setattr(md, "version", lambda name: "0.10.0" if name == "torchao" else "1")
     assert colab.dp_dir(str(repo)) == f"{repo}/external/diffusion-pipe"
     assert colab.dp_dir(str(repo), colab.DP_FORK_URL) == f"{repo}/external/diffusion-pipe-fork"
 
     assert colab.install(str(repo), dp_url=colab.DP_FORK_URL, similarity=False) is True
     assert any(colab.DP_FORK_URL in c and "diffusion-pipe-fork" in c for c in cmds)
+    assert any("uninstall -y -q torchao" in c for c in cmds)      # peft refuses old torchao builds
     assert os.environ["ANIMA_DIFFUSION_PIPE"] == f"{repo}/external/diffusion-pipe-fork"
     assert any("diffusion-pipe-fork/requirements.txt" in p for p in pips)
     assert (repo / ".anima_colab_installed_fork").is_file() and not (repo / ".anima_colab_installed").exists()

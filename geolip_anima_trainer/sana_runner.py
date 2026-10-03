@@ -119,6 +119,20 @@ def _pixel_stats(img) -> dict:
             "contrast": float(luma.std())}
 
 
+def _drop_torchao() -> bool:
+    """Uninstall torchao when present: peft refuses torchao builds older than its minimum when it builds LoRA
+    layers (Colab ships 0.10; recent peft requires 0.16+), and nothing here uses torchao. The trainer runs in a
+    fresh process, and peft checks lazily, so no restart is needed. Returns True when it uninstalled it."""
+    import importlib.metadata as md
+    try:
+        version = md.version("torchao")
+    except md.PackageNotFoundError:
+        return False
+    print(f"[sana] uninstalling torchao {version}: peft refuses it when building LoRA layers", flush=True)
+    subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q", "torchao"], check=False)
+    return True
+
+
 def _grid(rows: list[list], path: Path, *, tile: int = 256) -> Path:
     """A contact sheet: rows of PIL images (None = blank)."""
     from PIL import Image
@@ -284,6 +298,7 @@ class SanaRunner(_RunnerMixin):
     # ---- 1. setup: env -> (optional) auth -> gpu -> the fork -> the model ---------------
     def setup(self) -> dict:
         self._setup_env()
+        _drop_torchao()
         self._auth_optional()
         self._verify_gpu()
         self._point_at_fork()
@@ -548,6 +563,7 @@ class SanaRunner(_RunnerMixin):
         """Run the arms of sana_experiments.SEQUENCE in order (or the named subset), each into its own folder of
         cfg.repo_id. Arms the repo already lists as done are skipped (a rerun resumes). Returns the metas."""
         self._need("diffusers_path")
+        _drop_torchao()                                  # a kernel set up before this check existed
         repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
         specs = [a for a in sx.SEQUENCE if arms is None or a.id in arms]
         unknown = set(arms or []) - {a.id for a in sx.SEQUENCE}

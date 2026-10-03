@@ -85,6 +85,20 @@ def ensure_repo(repo: str | None = None, *, url: str = REPO_URL, pull: bool = Tr
     return repo
 
 
+def drop_torchao() -> bool:
+    """Uninstall torchao when it is present. peft refuses torchao builds older than its minimum when it
+    builds LoRA layers (Colab ships 0.10; recent peft requires 0.16+), diffusion-pipe trains every LoRA
+    through peft, and nothing here uses torchao. Returns True when it uninstalled it."""
+    import importlib.metadata as md
+    try:
+        version = md.version("torchao")
+    except md.PackageNotFoundError:
+        return False
+    print(f"[anima_colab] uninstalling torchao {version}: peft refuses it when building LoRA layers", flush=True)
+    _sh(f'"{sys.executable}" -m pip uninstall -y -q torchao', check=False)
+    return True
+
+
 def install(repo: str | None = None, *, similarity: bool = True, force: bool = False,
             dp_url: str = DP_URL) -> bool:
     """Install torch (cu128) + diffusion-pipe requirements + this package ([similarity]) + the
@@ -100,6 +114,7 @@ def install(repo: str | None = None, *, similarity: bool = True, force: bool = F
     needs `install(force=True)` (or a fresh runtime) to be picked up; pure-Python logic changes need
     neither."""
     repo = ensure_repo(repo, dp_url=dp_url)
+    drop_torchao()                                               # also on runtimes installed before this check
     marker = os.path.join(repo, _MARKER + ("" if dp_url == DP_URL else "_fork"))
     if os.path.exists(marker) and not force:
         print("[anima_colab] deps already installed on this runtime -> skipping (no restart).", flush=True)
@@ -111,6 +126,7 @@ def install(repo: str | None = None, *, similarity: bool = True, force: bool = F
     _pip(f'-e "{repo}{extra}"')                                  # the bridge package + its deps
     _pip('"datasets>=2.19,<3"')                                  # diffusion-pipe needs datasets<3
     _pip(f"--index-url {TORCH_INDEX} torch torchvision")          # re-pin torch LAST so nothing overrode it
+    drop_torchao()                                               # in case a requirement brought it back
     with open(marker, "w", encoding="utf-8") as f:
         f.write("ok\n")
     print("\n[anima_colab] install complete. RESTART once so the new torch loads, then re-run.", flush=True)
