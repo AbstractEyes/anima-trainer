@@ -548,9 +548,12 @@ the rule, every group the right way): the class contrast moved (|W (z_up - z_dow
 (`ConnectorArm.axis`): `connector_axis()` reduces f to [a, n] = (f - mid) @ V.T with mid = the midpoint of the up
 and down training centres, V = [ax / (|ax|^2 / 2), nax / |nax|^2], ax = up - down, nax = neutral - mid (the
 training centres land at a = +-1 and n = 1; scale = ones; mu / V / scale ship like the whitening's).
-LESSON (e018): the cheerful side moved (unseen phrases too), the gloomy side did not: one slider value through a
-linear map pushes gloomy phrases along the mirror of the cheerful push, and the image model's downbeat direction is not
-the upbeat one negated (e015's free vectors are nearly orthogonal). e023-e025 (`ConnectorArm.sides`, `slider_map()`):
+LESSON (e018 / e019): one slider value through a linear map ties both sides to ONE direction (gloomy phrases get the
+negation of the cheerful push, around the shared bias), and the image does not read the two ends of a direction alike
+(e015's free vectors are nearly orthogonal). Fit per side over the evaluated phrases, e018 (Beatrix) came out
+cheerful-strong (+0.58 per unit, her unseen cheerful phrases in order; gloomy -0.21) and e019 (untrained) the reverse
+(+0.19 / -0.34): not a hard limit of the form, a tie. Her last-byte features also carry the phrase's ending ('upbeat'
+and 'downbeat' share most of their state); the byte after the phrase does not. e023-e025 (`ConnectorArm.sides`, `slider_map()`):
 [a, n] mapped before W, relu [max(a,0), max(-a,0), n] (e023 Beatrix, e024 untrained), exp [e^a, e^-a, n] (e025, e023's
 seed); contrast_l1 is taken on the mapped rows; the weights' metadata 'input map' names the map.
 `_connector_inputs()` builds every arm's input rows.

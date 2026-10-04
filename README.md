@@ -342,9 +342,10 @@ a.run_beatrix_connectors() # e013-e025: a push from Beatrix's phrase features, a
   so e018 / e019 reduce the features to a slider value: the phrase's position on the axis from the gloomy to
   the cheerful training phrases' centres (at -1 and +1) and on the axis toward the neutral training phrases'
   centre (2 numbers, both axes fit on the training phrases only). e018 moved the image for cheerful phrases,
-  unseen ones too, and not for gloomy ones: a linear map of one slider value pushes gloomy phrases along the
-  exact mirror of the cheerful push, and the image model's downbeat direction is not its upbeat direction
-  negated (e015's free vectors are nearly orthogonal). e023 / e024 split the slider value by its sign,
+  unseen ones too, and not for gloomy ones; e019 (the untrained trunk) came out the other way round. A linear
+  map of one slider value ties both sides to one direction (gloomy phrases get the mirror of the cheerful
+  push), and the image model's downbeat direction is not its upbeat direction negated (e015's free vectors are
+  nearly orthogonal), so one side comes out strong and the other weak. e023 / e024 split the slider value by its sign,
   [max(a, 0), max(-a, 0), n], so each side gets its own direction (Beatrix, then the untrained trunk); e025
   maps it to [e^a, e^-a, n], both sides on for every phrase (no dead zone).
 - **Progress:** every long step prints the size of the job, then done / total, time spent and time left.
