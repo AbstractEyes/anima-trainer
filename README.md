@@ -292,6 +292,7 @@ from geolip_anima_trainer.anima_runner import AnimaRunner
 a = AnimaRunner()          # Anima-Base v1.0, 768 px
 a.setup()                  # GPU + the fork + the three model files
 a.run_flavor_test()        # e001: the stock model
+a.run_route_split()        # e020: which of the adapter's two readings carries the words
 a.run_attribute_screen()   # e012: attribute sliders on the stock model
 a.run_sequence()           # e002..e011: the LoRA arms
 a.run_beatrix_connectors() # e013-e019: a push from Beatrix's phrase features, and its controls
@@ -309,6 +310,10 @@ a.run_beatrix_connectors() # e013-e019: a push from Beatrix's phrase features, a
 - **e001** adds a mood direction to the conditioning at two sites: the Qwen3 states the LLM adapter reads,
   and the adapter's output the DiT cross-attends to (both 1,024 wide). Result: a push added equally to every
   token moves the mood only after the adapter.
+- **e020** splits the adapter's two readings of a caption: its cross-attention reads Qwen3's states, and its
+  blocks start from the caption's T5 token ids through the adapter's own word table. The mood prompt goes
+  through one reading at a time (the other reads the neutral prompt) on e001's cells, to find which reading
+  carries the words.
 - **e012** screens six character attributes (hair length, hair colour, eye colour, chibi proportions, age
   for adults only, style) as tag pairs on eight characters: does the tag move the attribute, does its
   direction added after the adapter act as a slider, and does each slider leave the other attributes alone

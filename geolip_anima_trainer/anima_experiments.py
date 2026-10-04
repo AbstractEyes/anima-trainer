@@ -11,7 +11,8 @@ prefix "masterpiece, best quality, score_7, safe, " and the negative prompt it r
 
 e001 measures the stock bed (the words, a mood direction added to the conditioning at two sites, the conditioning
 norms); e002-e011 are the LoRA arms, the Sana design at Anima's learning rates; e012 screens attribute sliders on the
-stock model; e013-e015 condition the image on Beatrix's own states through a learned push (and its two controls).
+stock model; e013-e019 condition the image on Beatrix's own states through a learned push (and its controls); e020
+splits the adapter's two readings of a caption (Qwen3's states, the T5 ids) on the stock model.
 
 Pure Python (no torch); anima_runner.AnimaRunner does the GPU work.
 """
@@ -415,6 +416,114 @@ def render_attribute_screen_readme(meta: dict, recipe: dict) -> str:
         out += ["## Result", "Running.", ""]
     out += ["## Files", "- `result.json`: every cell's scores, the reads, the cross-talk and the direction overlaps.",
             "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
+    return "\n".join(out)
+
+
+# ---- e020: the route split (the stock model: which of the adapter's two inputs carries the words) -------------------
+ROUTE_TEST_ID = "e020_anima_route_split"
+ROUTE_TEST_TITLE = ("The stock model: which of the adapter's two readings of a caption carries the mood words, Qwen3's "
+                    "states or the T5 word ids")
+ROUTE_SEEDS = FLAVOR_TEST_SEEDS                 # e001's cells, so its words re-render as this run's reference
+# every image set: (the template flavor whose Qwen3 states the adapter reads, the flavor whose T5 ids it reads)
+ROUTE_SETS = {
+    "neutral": ("neutral", "neutral"),
+    "words_up": ("up", "up"), "words_down": ("down", "down"),
+    "qwen_up": ("up", "neutral"), "qwen_down": ("down", "neutral"),
+    "t5_up": ("neutral", "up"), "t5_down": ("neutral", "down"),
+}
+ROUTES = {"words": ("THE WORDS MOVE IT", "both readings (the plain mood prompt)"),
+          "qwen": ("THE QWEN STATES MOVE IT", "Qwen3's states of the mood prompt, the neutral prompt's T5 ids"),
+          "t5": ("THE T5 IDS MOVE IT", "the neutral prompt's Qwen3 states, the mood prompt's T5 ids")}
+
+
+def route_reads(scores: dict) -> dict:
+    """The registered reads from mood scores {set key: [score per cell]} (keys as ROUTE_SETS): per set, the cells'
+    difference to the neutral image under e001's rule; per split route CARRIES THE WORDS (both of its sets move it),
+    ONE WAY (one) or CARRIES NOTHING; descriptive: each route's share of the words' effect and the two routes' sum."""
+    import numpy as np
+    base = scores["neutral"]
+    sets = {}
+    for key in ROUTE_SETS:
+        if key != "neutral":
+            route, mood = key.rsplit("_", 1)
+            sets[key] = flavor_outcome(list(np.subtract(scores[key], base)), 1 if mood == "up" else -1,
+                                       label=ROUTES[route][0])
+    out: dict = {"sets": sets, "routes": {}}
+    for route in ("qwen", "t5"):
+        moving = [sets[f"{route}_{m}"]["OUTCOME"] == ROUTES[route][0] for m in ("up", "down")]
+        share = {m: (sets[f"{route}_{m}"]["mean"] / sets[f"words_{m}"]["mean"] if sets[f"words_{m}"]["mean"] else None)
+                 for m in ("up", "down")}
+        out["routes"][route] = {"OUTCOME": "CARRIES THE WORDS" if all(moving) else "ONE WAY" if any(moving)
+                                else "CARRIES NOTHING", "share_of_words": share}
+    out["sum_of_routes"] = {m: ((sets[f"qwen_{m}"]["mean"] + sets[f"t5_{m}"]["mean"]) / sets[f"words_{m}"]["mean"]
+                                if sets[f"words_{m}"]["mean"] else None) for m in ("up", "down")}
+    return out
+
+
+def route_summary(reads: dict) -> str:
+    s, r = reads["sets"], reads["routes"]
+    return "; ".join(f"{name} {s[f'{k}_up']['mean']:+.2f} / {s[f'{k}_down']['mean']:+.2f}"
+                     + (f" ({r[k]['OUTCOME']})" if k in r else "")
+                     for k, name in (("words", "the words"), ("qwen", "Qwen3's states only"), ("t5", "the T5 ids only")))
+
+
+def render_route_split_readme(meta: dict, recipe: dict) -> str:
+    """e020's README: the question, the design and the rule fixed before the run, and the result when done."""
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    out = [f"# {ROUTE_TEST_ID}: {ROUTE_TEST_TITLE}", "",
+           f"Date: 2026-10-04. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Question",
+           "Anima's LLM adapter reads a caption twice: as Qwen3 0.6B's last hidden states (the source its "
+           "cross-attention reads) and as the caption's T5 token ids, through the adapter's own embedding table (the "
+           "queries its blocks start from). When mood words are added to the caption, which of the two readings carries "
+           "their effect on the image? (Experiment e001 found that a direction added to every Qwen3 state does not move "
+           "the mood, while the words do; this splits the words themselves.)", "",
+           "## Design",
+           f"- e001's 32 scenes x seeds {', '.join(map(str, ROUTE_SEEDS))} (64 cells) and its first templates; the "
+           "negative prompt unchanged. Seven sets, 448 images:", "",
+           "| set | Qwen3 states from | T5 ids from |", "|---|---|---|",
+           *[f"| {k} | the {q} prompt | the {t} prompt |" for k, (q, t) in ROUTE_SETS.items()], "",
+           "- The words sets are e001's words, re-rendered in this run as its reference.", "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           "Per cell, a set's mood score minus the neutral image's, read in the mood's direction (e001's rule): a set "
+           "**moves it** when the mean moves that way, at least 75% of the 64 cells move that way and the mean is beyond "
+           "3 standard errors; **NO EFFECT** within 2 standard errors of zero or under 60% that way; **MIXED** otherwise. "
+           "Per reading (Qwen3's states, the T5 ids): **CARRIES THE WORDS** when both of its sets move it, **ONE WAY** "
+           "when one does, **CARRIES NOTHING** when neither does. Reported beside them: each reading's share of the "
+           "words' effect, the two readings' sum against the words, content kept (the CLIP image cosine to the neutral "
+           "image of the same cell).", "",
+           "**Limit fixed in advance**: the mood words shift the later tokens' positions in the reading that carries them "
+           "while the other reading stays neutral. The adapter always pairs two tokenizations of unequal length, but the "
+           "split is not position-exact.", "", ANIMA.judge_text, ""]
+    if meta.get("status") == "done":
+        r = meta["result"]
+        out += ["## Result", meta.get("summary", ""), "",
+                "| set | effect (mean +- SE) | cells moving the expected way | content kept | verdict |",
+                "|---|---|---|---|---|"]
+        for k, v in r["sets"].items():
+            frac = v.get("frac_pos", v.get("frac_neg"))
+            kept = r.get("content_kept", {}).get(k)
+            out.append(f"| {k} | {v['mean']:+.3f} +- {v['se']:.3f} | {frac:.0%} | "
+                       f"{'' if kept is None else f'{kept:.3f}'} | **{v['OUTCOME']}** |")
+        out += ["", "| reading | verdict | share of the words' effect, up / down |", "|---|---|---|"]
+        for k, v in r["routes"].items():
+            sh = " / ".join("" if v["share_of_words"][m] is None else f"{v['share_of_words'][m]:.2f}" for m in ("up", "down"))
+            out.append(f"| {ROUTES[k][1]} | **{v['OUTCOME']}** | {sh} |")
+        sm = r["sum_of_routes"]
+        out += ["", "The two readings' effects summed, against the words: up "
+                + ("" if sm["up"] is None else f"{sm['up']:.2f}") + ", down " + ("" if sm["down"] is None else f"{sm['down']:.2f}")
+                + " (1 = the words' effect is the sum of the two)."]
+        if r.get("e001_words"):
+            out += ["", f"e001's words for the same cells: up {r['e001_words']['up']:+.3f}, down "
+                        f"{r['e001_words']['down']:+.3f}."]
+        out += ["", "![the seven sets](sheet_routes.jpg)", "",
+                "Rows: eight scenes at the first seed. Columns: " + ", ".join(ROUTE_SETS) + ".", ""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    else:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files", "- `result.json`: every cell's scores and the reads.", "- `sheet_routes.jpg`: the contact sheet.", ""]
     return "\n".join(out)
 
 

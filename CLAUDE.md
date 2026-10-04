@@ -512,6 +512,13 @@ drawn set at `sets/<flavor>_<seed_base>-<key>` (key = sha256 of the render setti
 every item); `run_sequence` pulls a matching set before drawing (`_pull_set`, verified image by image and caption by
 caption) and pushes each set once drawn (`_push_set`); the arm's recipe links its training images;
 `a.save_training_sets()` / `ts.upload_local_sets(a)` upload by hand. Changing any render setting changes the key.
+ROUTE SPLIT (`run_route_split()` = e020, `anima_experiments.ROUTE_SETS` / `route_reads()`): the LLM adapter reads a
+caption twice: cross-attention over Qwen3's last hidden state (the source) and blocks that start from the caption's T5
+token ids through the adapter's own embedding table (the queries). `AnimaPipe.generate(t5_prompts=)` takes the T5 ids
+(and mask) from another prompt per image while the Qwen3 states stay the prompt's (both pad to 512);
+`_render_routes()` chunks the two lists together. Seven sets on e001's 64 cells (neutral; the words; the words through
+Qwen3's states only; through the T5 ids only); e001's rule per set; per reading CARRIES THE WORDS / ONE WAY / CARRIES
+NOTHING; shares of the words' effect and the two readings' sum beside them.
 CONNECTORS (`run_beatrix_connectors()` = e013-e019, `anima_experiments.CONNECTOR_ARMS`): push = f @ W.T + b at the
 `context` site (every caption token after the adapter), W/b zero-init fp32, the only trained tensors; f = Beatrix's
 phrase features (`CONNECTOR_FEATURES` in the data repo: `trained` / `random` [74, 4096] + the phrase table in the

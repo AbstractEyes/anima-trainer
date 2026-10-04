@@ -752,6 +752,62 @@ def test_connector_axis_puts_the_training_centres_on_the_slider_marks():
     assert torch.allclose(q["mu"], p["mu"]) and torch.allclose(q["V"], p["V"])
 
 
+def test_route_reads_split_the_words_between_the_two_readings():
+    n = 64
+    sc = {"neutral": [0.1 * (i % 4) for i in range(n)]}
+
+    def shifted(d):
+        return [v + d + 0.01 * (i % 3) for i, v in enumerate(sc["neutral"])]
+
+    sc.update(words_up=shifted(2.0), words_down=shifted(-1.0), qwen_up=shifted(0.0), qwen_down=shifted(0.0),
+              t5_up=shifted(2.0), t5_down=shifted(-1.0))
+    r = ax.route_reads(sc)
+    assert r["routes"]["t5"]["OUTCOME"] == "CARRIES THE WORDS" and r["routes"]["qwen"]["OUTCOME"] == "CARRIES NOTHING"
+    assert r["sets"]["words_down"]["OUTCOME"] == "THE WORDS MOVE IT" and r["sets"]["t5_up"]["OUTCOME"] == "THE T5 IDS MOVE IT"
+    assert r["routes"]["t5"]["share_of_words"]["up"] == pytest.approx(1.0, abs=0.01)
+    assert r["sum_of_routes"]["down"] == pytest.approx(1.0, abs=0.02)
+    assert ax.route_summary(r).startswith("the words +2.01 / -0.99")
+
+
+def test_route_split_end_to_end(runner, monkeypatch):
+    from PIL import Image
+    s, repo, _, _ = runner
+    passed = []
+
+    def mood(p):
+        return 1.0 if "cheerful" in p else -1.0 if "gloomy" in p else 0.0
+
+    def render(prompts, seeds, t5_prompts=None):
+        """A model that reads the mood from the T5 ids, and the upbeat words a little from Qwen3's states too."""
+        passed.append(t5_prompts is not None)
+        t5 = t5_prompts or prompts
+        assert len(t5) == len(prompts) == len(seeds)
+        return [Image.new("RGB", (8, 8), (int(round(128 + 20 * (mood(t) + 0.25 * max(0.0, mood(q))))),) * 3)
+                for q, t in zip(prompts, t5)]
+
+    monkeypatch.setattr(s, "_render", render)
+    meta = s.run_route_split()
+    r = meta["result"]
+    assert meta["status"] == "done" and meta["kind"] == "route_split"
+    assert r["routes"]["t5"]["OUTCOME"] == "CARRIES THE WORDS" and r["routes"]["qwen"]["OUTCOME"] == "ONE WAY"
+    assert r["sets"]["qwen_down"]["OUTCOME"] == "NO EFFECT" and r["sets"]["words_up"]["OUTCOME"] == "THE WORDS MOVE IT"
+    assert r["routes"]["qwen"]["share_of_words"]["up"] == pytest.approx(0.25 / 1.25, abs=0.01)
+    assert r["sum_of_routes"]["up"] == pytest.approx(1.0, abs=0.01)
+    assert any(passed) and not all(passed)             # only the split sets hand the adapter another prompt's T5 ids
+    base = f"experiments/{ax.ROUTE_TEST_ID}"
+    for f in ("meta.json", "README.md", "result.json", "sheet_routes.jpg"):
+        assert f"{base}/{f}" in repo.files_, f
+    readme = repo.files_[f"{base}/README.md"].decode()
+    assert "**CARRIES THE WORDS**" in readme and "position-exact" in readme and ax.ROUTE_TEST_ID in repo.files_["README.md"].decode()
+    import re
+    for word in (r"S-1", r"\bPhil\b", r"docket", r"canon/"):
+        assert not re.search(word, readme), word
+    assert len(json.loads(repo.files_[f"{base}/result.json"])["cells"]) == 64
+    n = len(repo.commits)
+    assert s.run_route_split()["status"] == "done"                    # done already: skipped
+    assert not any(c.startswith(ax.ROUTE_TEST_ID) for c in repo.commits[n:])
+
+
 def test_config_validation_refuses_master_weights_without_plain_adam():
     from geolip_anima_trainer import api
     cfg = api.TrainConfig(run=api.RunConfig(output_dir="o", bf16_master_weights=True), model=api.ModelConfig(),

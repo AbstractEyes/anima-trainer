@@ -307,14 +307,19 @@ class AnimaPipe:
         return inputs
 
     def generate(self, prompts: list[str], seeds: list[int], *, res: int, steps: int, cfg: float, shift: float,
-                 negative: str = "", batch: int = 8, source_add=None, context_add=None, uncond_add=None) -> list:
+                 negative: str = "", batch: int = 8, source_add=None, context_add=None, uncond_add=None,
+                 t5_prompts: "list[str] | None" = None) -> list:
         """PIL images, one per (prompt, seed). source_add / context_add: a 1024-vector added to every prompt token
         before / after the LLM adapter, on the conditional branch; uncond_add: the same after the adapter on the
-        negative prompt's branch (a trained push goes on both branches, as a LoRA acts; e001's dial on neither)."""
+        negative prompt's branch (a trained push goes on both branches, as a LoRA acts; e001's dial on neither).
+        t5_prompts: per image, the prompt whose T5 token ids the adapter reads in place of the prompt's own, while
+        the Qwen3 states stay the prompt's (the adapter's two inputs from one caption, split)."""
         import torch
         from utils.previews import to_pil
         if len(prompts) != len(seeds):
             raise ValueError("one seed per prompt")
+        if t5_prompts is not None and len(t5_prompts) != len(prompts):
+            raise ValueError("one T5 prompt per prompt")
         unc = self.encode([negative]) if cfg > 1 else None
         out: list = []
         with torch.no_grad():
@@ -322,6 +327,9 @@ class AnimaPipe:
                 p, s = list(prompts[i:i + batch]), list(seeds[i:i + batch])
                 n = len(p)
                 conds = self.encode(p)
+                if t5_prompts is not None:                         # both encodings pad to the same 512 tokens
+                    t5 = self.encode(list(t5_prompts[i:i + batch]))
+                    conds = (conds[0], conds[1], t5[2], t5[3])
                 if source_add is not None:
                     conds = (self.add_at_tokens(conds[0], conds[1], source_add), *conds[1:])
                 un = tuple(u.expand(n, *u.shape[1:]).contiguous() for u in unc) if unc is not None else None
@@ -676,6 +684,91 @@ class AnimaRunner(_sr.SanaRunner):
         conds = pipe.encode(prompts)
         ctx = pipe.adapt(conds)
         return {"source": (conds[0].float(), conds[1]), "context": (ctx.float(), conds[3])}
+
+    # ---- e020: the route split ---------------------------------------------------------------------------------------
+    def run_route_split(self, *, force: bool = False) -> dict:
+        """e020 into its own folder of cfg.repo_id: the mood words through one of the adapter's two readings of the
+        caption at a time (Qwen3's states, the T5 ids). Skipped when the repo lists it as done (force=True reruns)."""
+        self._need_model()
+        _drop_torchao()
+        repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
+        metas = repo.metas()
+        try:
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        rid = ax.ROUTE_TEST_ID
+        if metas.get(rid, {}).get("status") == "done" and not force:
+            print(f"[anima] {rid} is done already (force=True reruns it)", flush=True)
+            return metas[rid]
+        base = f"experiments/{rid}"
+        recipe = self._flavor_recipe()
+        meta = {"id": rid, "title": ax.ROUTE_TEST_TITLE, "date": "2026-10-04", "kind": "route_split", "status": "running",
+                "recipe": recipe}
+        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_route_split_readme(meta, recipe)},
+                    f"{rid}: started (README)")
+        out_dir = Path(self._need("data_root")) / "experiments" / rid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        try:
+            result = self._route_split(out_dir)
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                                            f"{base}/README.md": ax.render_route_split_readme(meta, recipe)},
+                                           f"{rid}: failed"))
+            raise
+        e001 = metas.get(ax.FLAVOR_TEST_ID, {}).get("result", {})
+        if e001.get("up_words") and e001.get("down_words"):
+            result["e001_words"] = {"up": e001["up_words"]["mean"], "down": e001["down_words"]["mean"]}
+        summary = ax.route_summary(result)
+        meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
+                    seconds=round(time.time() - t0), finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
+        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_route_split_readme(meta, recipe),
+                     f"{base}/result.json": out_dir / "result.json", f"{base}/sheet_routes.jpg": out_dir / "sheet_routes.jpg"},
+                    f"{rid}: result")
+        metas[rid] = meta
+        self._safe(lambda: self._publish_index(repo, metas))
+        print(f"[anima] {rid} done in {meta['seconds']} s: {summary}", flush=True)
+        return meta
+
+    def _route_split(self, out_dir: Path) -> dict:
+        import numpy as np
+        self._eval_pipe()
+        self._assert_stock()
+        seeds = list(ax.ROUTE_SEEDS)
+        cells = [(si, sd) for si in range(len(SUBJECTS)) for sd in seeds]
+        print(f"[anima] e020: {len(ax.ROUTE_SETS)} sets of {len(cells)} images (neutral; the words; the words through "
+              "Qwen3's states only; through the T5 ids only), one line per set", flush=True)
+        eta = _sr._Eta(self.TAG, "e020", len(ax.ROUTE_SETS) * len(cells))
+        S = [sd for _, sd in cells]
+        P = {f: [ax.TEMPLATES[f][0].format(s=SUBJECTS[si]) for si, _ in cells] for f in ("neutral", "up", "down")}
+        imgs, feats, scores, kept = {}, {}, {}, {}
+        for key, (fq, ft) in ax.ROUTE_SETS.items():                # neutral first: content kept is read against it
+            imgs[key] = self._render_routes(P[fq], P[ft], S, eta)
+            feats[key], sc = self._score(imgs[key])
+            scores[key] = [float(x) for x in sc]
+            kept[key] = float(np.mean((feats[key] * feats["neutral"]).sum(-1)))
+            print(f"[anima] e020 {key}: mood score {np.mean(scores[key]):+.3f}, content kept {kept[key]:.3f}", flush=True)
+        result = ax.route_reads(scores)
+        result.update(content_kept=kept, mood_score={k: float(np.mean(v)) for k, v in scores.items()})
+        rows_first = [i for i, (_, sd) in enumerate(cells) if sd == seeds[0]][::4]      # 8 scenes, first seed
+        _grid([[imgs[k][i] for k in ax.ROUTE_SETS] for i in rows_first], out_dir / "sheet_routes.jpg")
+        result["cells"] = [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
+                           for j, (si, sd) in enumerate(cells)]
+        return result
+
+    def _render_routes(self, qwen_prompts: list[str], t5_prompts: list[str], seeds: list[int], eta=None) -> list:
+        """_render_tracked with the T5 ids from t5_prompts, chunked with their images (the plain prompts when equal)."""
+        if qwen_prompts == t5_prompts:
+            return self._render_tracked(qwen_prompts, seeds, eta)
+        out, b = [], self.cfg.gen_batch
+        for i in range(0, len(qwen_prompts), b):
+            out += self._render(qwen_prompts[i:i + b], seeds[i:i + b], t5_prompts=t5_prompts[i:i + b])
+            if eta is not None:
+                eta.add(len(qwen_prompts[i:i + b]))
+        return out
 
     # ---- e012: the attribute screen ----------------------------------------------------------------------
     def _tagger(self):

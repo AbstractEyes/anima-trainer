@@ -76,6 +76,8 @@ step prints the job's size, then done / total, time spent and time left.
 - **e001** (`run_flavor_test`): 32 scenes × {neutral, upbeat, downbeat} words × 2 seeds; the conditioning
   norms of the 32 neutral prompts at two sites (the Qwen3 states the LLM adapter reads, and the adapter's
   output the DiT cross-attends to); a mood direction added at each site at alpha −2..+2 (about 700 images).
+- **e020** (`run_route_split`): the adapter reads a caption as Qwen3's states and as T5 word ids; the mood prompt
+  through one of the two at a time, on e001's 64 cells (448 images, ~25 min).
 - **e012** (`run_attribute_screen`): six attributes as tag pairs (hair length, hair colour, eye colour, chibi,
   age for adults only, style) on 8 characters × 2 seeds; the words, a slider after the adapter at ±2, the
   cross-talk between sliders; judged by the WD EVA02-Large tagger v3 (352 images, ~20 min).
