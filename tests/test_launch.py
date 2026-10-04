@@ -35,6 +35,25 @@ def test_build_plan_single_gpu(tmp_path: Path):
     assert plan.effective_batch == 4  # 4 * 1 * (1//1)
 
 
+def test_master_port_is_a_launcher_option(tmp_path: Path):
+    # trainings side by side on one machine each need their own rendezvous port
+    root = _fake_pipe(tmp_path)
+    assert not any(a.startswith("--master_port") for a in
+                   L.build_plan(config_toml=_lora(tmp_path), repo_root=root).argv())
+    argv = L.build_plan(config_toml=_lora(tmp_path), repo_root=root, master_port=29511).argv()
+    assert argv.index("--master_port=29511") < argv.index(next(a for a in argv if a.endswith("train.py")))
+    with pytest.raises(ValueError, match="master_port"):
+        L.build_plan(config_toml=_lora(tmp_path), repo_root=root, master_port=80)
+
+
+def test_spawn_refuses_windows(tmp_path: Path, monkeypatch):
+    root = _fake_pipe(tmp_path)
+    plan = L.build_plan(config_toml=_lora(tmp_path), repo_root=root)
+    monkeypatch.setattr(L.platform, "system", lambda: "Windows")
+    with pytest.raises(L.WindowsTrainingRefused):
+        L.spawn(plan, tmp_path / "train.log")
+
+
 def test_build_plan_multi_gpu_data_parallel(tmp_path: Path):
     root = _fake_pipe(tmp_path)
     plan = L.build_plan(config_toml=_lora(tmp_path, micro=4, grad=1),

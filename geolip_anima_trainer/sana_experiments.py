@@ -376,7 +376,12 @@ def render_arm_readme(spec: ArmSpec, recipe: dict, meta: dict | None = None) -> 
            "## Recipe", "| setting | value |", "|---|---|", rec, "",
            "## The rule (fixed before the run)", rule, "", JUDGE_TEXT, ""]
     if meta and meta.get("status") == "done":
-        out += ["## Result", meta.get("summary", ""), "",
+        beside = meta.get("trained_beside")
+        out += ["## Result", meta.get("summary", ""), ""]
+        if beside:
+            out += [f"Trained on the same card at the same time as {', '.join(beside)} (each its own trainer process; "
+                    "the recipe is unchanged).", ""]
+        out += [
                 "| epoch | scale | effect (mean +- SE) | cells moving the expected way | content kept |",
                 "|---|---|---|---|---|"]
         for r in meta.get("epochs", []):

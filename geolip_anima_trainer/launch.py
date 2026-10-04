@@ -69,6 +69,7 @@ class LaunchPlan:
     resume_from_checkpoint: bool | str = False
     env: dict[str, str] = field(default_factory=dict)
     extra_args: tuple[str, ...] = ()
+    master_port: int | None = None            # distinct per process when several train side by side
 
     # ---- derived -----------------------------------------------------------
     @property
@@ -93,6 +94,8 @@ class LaunchPlan:
             cmd += ["--include", "localhost:" + ",".join(str(i) for i in self.gpu_ids)]
         elif self.num_gpus is not None:
             cmd += [f"--num_gpus={self.num_gpus}"]
+        if self.master_port is not None:
+            cmd += [f"--master_port={self.master_port}"]
         cmd += [str(self.train_py), "--deepspeed", "--config", str(self.config_toml)]
         if self.cache_only:
             cmd += ["--cache_only"]
@@ -193,9 +196,12 @@ def build_plan(
     expandable_segments: bool = True,
     extra_env: dict[str, str] | None = None,
     extra_args: list[str] | None = None,
+    master_port: int | None = None,
 ) -> LaunchPlan:
     """Construct a fully-resolved LaunchPlan. Reads (but never writes) the toml for
-    batch math + topology validation. Never spawns, never touches the GPU."""
+    batch math + topology validation. Never spawns, never touches the GPU.
+    master_port: the deepspeed rendezvous port (default 29500); give each of several
+    trainings that run at once on one machine its own."""
     train_py = find_diffusion_pipe(repo_root)
 
     cfg_path = Path(config_toml).expanduser().resolve()
@@ -228,6 +234,8 @@ def build_plan(
         raise ValueError(f"pipeline_stages={stages} exceeds world size {world}")
     if world % stages != 0:
         raise ValueError(f"world size {world} not divisible by pipeline_stages={stages}")
+    if master_port is not None and not 1024 <= int(master_port) <= 65535:
+        raise ValueError(f"master_port={master_port} is outside 1024-65535")
 
     # A model type only the fork ships: fail here, not minutes into the deepspeed launch.
     model_type = str((toml.get("model") or {}).get("type", ""))
@@ -261,6 +269,7 @@ def build_plan(
         cache_only=cache_only, regenerate_cache=regenerate_cache,
         trust_cache=trust_cache, resume_from_checkpoint=resume_from_checkpoint,
         env=env, extra_args=tuple(extra_args or ()),
+        master_port=int(master_port) if master_port is not None else None,
     )
 
 
@@ -286,13 +295,7 @@ def launch(plan: LaunchPlan, *, dry_run: bool = False, check: bool = True,
         print(plan.pretty())
         return plan
 
-    if platform.system() == "Windows":
-        raise WindowsTrainingRefused(
-            "diffusion-pipe + deepspeed do not run on Windows. This box is INSTALL + "
-            "IMPORT + smoke-test only. Use --dry-run to print the command, or run on the "
-            "Linux target. Constructed command:\n" + plan.pretty()
-        )
-
+    _refuse_on_windows(plan)
     env = {**os.environ, **plan.env_prefix()}
     cwd = str(plan.train_py.parent)
     if monitor is None and log_path is None:
@@ -315,6 +318,27 @@ def launch(plan: LaunchPlan, *, dry_run: bool = False, check: bool = True,
     if check and rc != 0:
         raise subprocess.CalledProcessError(rc, plan.argv())
     return rc
+
+
+def spawn(plan: LaunchPlan, log_path: str | Path) -> subprocess.Popen:
+    """Start the plan in the background (stdout + stderr -> log_path) and return the
+    process for the caller to poll. Several plans can train at once on one machine
+    when each has its own master_port."""
+    _refuse_on_windows(plan)
+    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "w", encoding="utf-8") as logf:     # the child keeps its own handle
+        return subprocess.Popen(plan.argv(), env={**os.environ, **plan.env_prefix()},
+                                cwd=str(plan.train_py.parent),
+                                stdout=logf, stderr=subprocess.STDOUT)
+
+
+def _refuse_on_windows(plan: LaunchPlan) -> None:
+    if platform.system() == "Windows":
+        raise WindowsTrainingRefused(
+            "diffusion-pipe + deepspeed do not run on Windows. This box is INSTALL + "
+            "IMPORT + smoke-test only. Use --dry-run to print the command, or run on the "
+            "Linux target. Constructed command:\n" + plan.pretty()
+        )
 
 
 def rewrite_init_from_existing(lora_toml: str | Path, epoch_dir: str | Path,

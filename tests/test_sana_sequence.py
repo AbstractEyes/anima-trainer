@@ -188,19 +188,30 @@ def runner(tmp_path, monkeypatch):
 
     monkeypatch.setattr(s, "_render", render)
     monkeypatch.setattr(s, "_score", score)
-    monkeypatch.setattr(sr._launch, "build_plan", lambda config_toml, num_gpus: config_toml)
+    calls.update(ports=[], running={}, max_running=0, overlaps=[], exit_codes={})
 
-    def fake_launch(plan, log_path=None, monitor=None, **kw):
+    def build_plan(config_toml, num_gpus, master_port=None):
+        calls["ports"].append(master_port)
+        return config_toml
+
+    monkeypatch.setattr(sr._launch, "build_plan", build_plan)
+
+    def fake_train(plan, log_path):
         cfg = tomllib.loads(Path(plan).read_text(encoding="utf-8"))
         calls["train"].append(cfg["optimizer"]["lr"])
         run = Path(cfg["output_dir"]) / "20261003_160000"
         for n in (2, 4, 6, 8, 10):
-            (run / f"epoch{n}").mkdir(parents=True)
+            (run / f"epoch{n}").mkdir(parents=True, exist_ok=True)
             (run / f"epoch{n}" / "adapter_model.safetensors").write_bytes(b"lora")
             (run / f"epoch{n}" / "adapter_config.json").write_text("{}", encoding="utf-8")
-        (run / "samples" / "step0").mkdir(parents=True)
+        (run / "samples" / "step0").mkdir(parents=True, exist_ok=True)
         (run / "samples" / "step0" / "0.png").write_bytes(b"png")
-        Path(log_path).write_text("step 1\nstep 480\n", encoding="utf-8")
+        Path(log_path).write_text("steps: 10 loss: 1.0 iter time (s): 0.1 samples/sec: 40.0\n"
+                                  "steps: 480 loss: 0.9 iter time (s): 0.1 samples/sec: 41.3\n", encoding="utf-8")
+        return Path(cfg["output_dir"]).parent.name            # the arm id
+
+    def fake_launch(plan, log_path=None, monitor=None, **kw):
+        fake_train(plan, log_path)
 
         class Done:
             pid = 1
@@ -211,7 +222,30 @@ def runner(tmp_path, monkeypatch):
         monitor(Done())
         return 0
 
+    def fake_spawn(plan, log_path):
+        """A background trainer that finishes on its third poll; tracks which arms train at once."""
+        arm = fake_train(plan, log_path)
+        key = {a.id: a for a in sx.SEQUENCE}[arm].data_key
+        if key in calls["running"].values():
+            calls["overlaps"].append(arm)
+        calls["running"][arm] = key
+        calls["max_running"] = max(calls["max_running"], len(calls["running"]))
+
+        class Proc:
+            pid, polls = 7, 0
+
+            def poll(self):
+                self.polls += 1
+                if self.polls < 3:
+                    return None
+                calls["running"].pop(arm, None)
+                return calls["exit_codes"].get(arm, 0)
+
+        return Proc()
+
     monkeypatch.setattr(sr._launch, "launch", fake_launch)
+    monkeypatch.setattr(sr._launch, "spawn", fake_spawn)
+    monkeypatch.setattr(sr.time, "sleep", lambda s: None)
     return s, repo, pipe, calls
 
 
@@ -318,3 +352,58 @@ def test_unknown_arm_is_refused(runner):
     s, *_ = runner
     with pytest.raises(ValueError, match="unknown arm"):
         s.run_sequence(["e999_nope"])
+
+
+DRAW2 = ["e010_lora_neutral_control_draw2", "e011_lora_mood_down_draw2",
+         "e012_lora_mood_up_lr_5e-5_draw2", "e013_lora_mood_up_lr_2e-4_draw2"]
+
+
+def test_parallel_trains_side_by_side_never_on_a_shared_training_set(runner):
+    s, repo, pipe, calls = runner
+    metas = s.run_sequence(DRAW2, parallel=3)
+    assert calls["max_running"] == 3                          # e010, e011, e012 together
+    assert calls["overlaps"] == []                            # e013 waited for e012 (same images)
+    ports = [p for p in calls["ports"] if p is not None]
+    assert len(ports) == 4 and len(set(ports)) == 4           # one rendezvous port per trainer
+    assert all(metas[a]["status"] == "done" for a in DRAW2)
+    assert metas["e011_lora_mood_down_draw2"]["final"]["mean"] < 0
+    for a in DRAW2:
+        assert len([c for c in repo.commits if c.startswith(a)]) == 3
+        assert repo.files_[f"experiments/{a}/lora/epoch10/adapter_model.safetensors"] == b"lora"
+    assert metas["e010_lora_neutral_control_draw2"]["trained_beside"] == DRAW2[1:3]
+    assert "same card at the same time" in repo.files_["experiments/e010_lora_neutral_control_draw2/README.md"].decode()
+    assert not pipe.loaded
+
+
+def test_parallel_matches_the_one_at_a_time_results(runner):
+    s, repo, pipe, calls = runner
+    side = s.run_sequence(DRAW2, parallel=4)
+    repo.files_ = {k: v for k, v in repo.files_.items() if not k.startswith("experiments/")}
+    s._base = None
+    one = s.run_sequence(DRAW2)
+    for a in DRAW2:
+        assert side[a]["final"] == one[a]["final"] and side[a]["final_diffs"] == one[a]["final_diffs"]
+
+
+def test_parallel_failure_lets_the_running_arms_finish_then_raises(runner):
+    s, repo, pipe, calls = runner
+    calls["exit_codes"]["e010_lora_neutral_control_draw2"] = 1
+    with pytest.raises(RuntimeError, match="exited with code 1"):
+        s.run_sequence(DRAW2, parallel=3)
+    metas = repo.metas()
+    assert metas["e010_lora_neutral_control_draw2"]["status"] == "failed"
+    assert metas["e011_lora_mood_down_draw2"]["status"] == "done"     # was training beside it: finished + evaluated
+    assert metas["e012_lora_mood_up_lr_5e-5_draw2"]["status"] == "done"
+    assert "e013_lora_mood_up_lr_2e-4_draw2" not in metas            # nothing new starts after a failure
+    assert "experiments/e010_lora_neutral_control_draw2/logs/train.log" in repo.files_
+
+
+def test_progress_reads_the_trainer_log(tmp_path):
+    log = tmp_path / "train.log"
+    assert sr._progress(log) == "starting"
+    log.write_text("caching latents\n", encoding="utf-8")
+    assert sr._progress(log) == "starting"
+    log.write_text("x\nsteps: 120 loss: 0.9 iter time (s): 0.097 samples/sec: 41.321\n", encoding="utf-8")
+    assert sr._progress(log) == "step 120 (41 samples/s)"
+    log.write_text("steps: 480 loss: 0.9 iter time (s): 0.1 samples/sec: 41.3\nTRAINING COMPLETE!\n", encoding="utf-8")
+    assert sr._progress(log) == "saving"

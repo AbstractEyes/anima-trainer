@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -176,6 +177,41 @@ def _folder_files(folder: "str | Path", prefix: str, allow: "list[str] | None" =
             continue
         out[f"{prefix}/{rel}"] = p
     return out
+
+
+def _progress(log: "str | Path") -> str:
+    """A trainer's state from the tail of its log: 'step N (S samples/s)' from the trainer's 'steps: N loss: ...
+    samples/sec: S' lines, 'saving' once it is done, else 'starting'."""
+    try:
+        with open(log, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 16384))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return "starting"
+    if "TRAINING COMPLETE" in tail:
+        return "saving"
+    hits = re.findall(r"steps: (\d+) loss: [\d.]+ .*?samples/sec: ([\d.]+)", tail)
+    if hits:
+        step, rate = hits[-1]
+        return f"step {step} ({float(rate):.0f} samples/s)"
+    return "starting"
+
+
+def _free_ports(start: int = 29510):
+    """Rendezvous ports nothing on this machine holds (checked by binding), one per trainer started side by side."""
+    import socket
+    port = start
+    while port < 65535:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+            try:
+                sk.bind(("127.0.0.1", port))
+                free = True
+            except OSError:
+                free = False
+        if free:
+            yield port
+        port += 1
 
 
 class _HubRepo:
@@ -559,9 +595,11 @@ class SanaRunner(_RunnerMixin):
         return bool(isinstance(info, dict) and info.get("pid") and _pid_alive(info["pid"]))
 
     # ---- 5. THE SEQUENCE ----------------------------------------------------------------------------
-    def run_sequence(self, arms: "list[str] | None" = None, *, stop_on_error: bool = True) -> dict:
+    def run_sequence(self, arms: "list[str] | None" = None, *, stop_on_error: bool = True, parallel: int = 1) -> dict:
         """Run the arms of sana_experiments.SEQUENCE in order (or the named subset), each into its own folder of
-        cfg.repo_id. Arms the repo already lists as done are skipped (a rerun resumes). Returns the metas."""
+        cfg.repo_id. Arms the repo already lists as done are skipped (a rerun resumes). parallel > 1 trains that many
+        arms side by side on the card (each its own trainer process and port; two arms on the same training set never
+        overlap, so its cache has one writer); the evaluations run here, one at a time. Returns the metas."""
         self._need("diffusers_path")
         _drop_torchao()                                  # a kernel set up before this check existed
         repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
@@ -585,24 +623,96 @@ class SanaRunner(_RunnerMixin):
             self._render_dataset(*key)
         self._baseline()                                                      # the shared no-LoRA cells
         print(f"[sana] training sets + baseline ready in {time.time() - t0:.0f} s", flush=True)
-        for spec in todo:
-            try:
-                metas[spec.id] = self._run_arm(spec, repo, metas)
-            except Exception as e:  # noqa: BLE001
-                metas[spec.id] = sx.arm_meta(spec, "failed", error=f"{type(e).__name__}: {e}"[:500])
-                base = f"experiments/{spec.id}"
-                files = {f"{base}/meta.json": sx.dumps(metas[spec.id]),
-                         f"{base}/README.md": sx.render_arm_readme(spec, self._recipe(spec.lr), metas[spec.id])}
-                files.update(_folder_files(Path(self.state["data_root"]) / "experiments" / spec.id / "logs", f"{base}/logs"))
-                self._safe(lambda: repo.commit(files, f"{spec.id}: failed"))
+        if parallel > 1:
+            self._run_parallel(todo, repo, metas, parallel=parallel, stop_on_error=stop_on_error)
+        else:
+            for spec in todo:
+                try:
+                    metas[spec.id] = self._run_arm(spec, repo, metas)
+                except Exception as e:  # noqa: BLE001
+                    self._record_failure(spec, repo, metas, e)
+                    if stop_on_error:
+                        raise
                 self._safe(lambda: self._publish_index(repo, metas))
-                print(f"[sana] {spec.id} FAILED: {e}", flush=True)
-                if stop_on_error:
-                    raise
-            self._safe(lambda: self._publish_index(repo, metas))
         reads = sx.sequence_reads({k: m for k, m in metas.items() if m.get("status") == "done"})
         print("[sana] reads across the sequence:", json.dumps(reads, indent=1, default=float), flush=True)
         return metas
+
+    def _record_failure(self, spec: "sx.ArmSpec", repo: "_HubRepo", metas: dict, e: Exception) -> None:
+        metas[spec.id] = sx.arm_meta(spec, "failed", error=f"{type(e).__name__}: {e}"[:500])
+        base = f"experiments/{spec.id}"
+        files = {f"{base}/meta.json": sx.dumps(metas[spec.id]),
+                 f"{base}/README.md": sx.render_arm_readme(spec, self._recipe(spec.lr), metas[spec.id])}
+        files.update(_folder_files(Path(self.state["data_root"]) / "experiments" / spec.id / "logs", f"{base}/logs"))
+        self._safe(lambda: repo.commit(files, f"{spec.id}: failed"))
+        self._safe(lambda: self._publish_index(repo, metas))
+        print(f"[sana] {spec.id} FAILED: {e}", flush=True)
+
+    def _run_parallel(self, todo: list, repo: "_HubRepo", metas: dict, *, parallel: int, stop_on_error: bool) -> None:
+        """Up to `parallel` trainers at once, each with its own deepspeed port; an arm waits while another arm on the same
+        training set is training (one writer per cache). A finished trainer's arm is evaluated here while the others keep
+        training. On a failure (stop_on_error) no new arm starts; the running ones finish and are evaluated, then it raises.
+        Interrupting the cell stops every trainer it started (a rerun resumes from the arms already done)."""
+        self._point_at_fork()
+        queue, running, ports = list(todo), {}, _free_ports()
+        error, last_status = None, 0.0
+        try:
+            while queue or running:
+                for spec in list(queue):
+                    if error is not None or len(running) >= parallel:
+                        break
+                    if any(r["spec"].data_key == spec.data_key for r in running.values()):
+                        continue
+                    queue.remove(spec)
+                    try:
+                        ctx = self._arm_begin(spec, repo)
+                        plan = _launch.build_plan(config_toml=str(ctx["lora_toml"]), num_gpus=self.cfg.num_gpus,
+                                                  master_port=next(ports))
+                        proc = _launch.spawn(plan, ctx["log"])
+                    except Exception as e:  # noqa: BLE001
+                        self._record_failure(spec, repo, metas, e)
+                        error = e if stop_on_error and error is None else error
+                        continue
+                    for r in running.values():
+                        r["beside"].add(spec.id)
+                    running[spec.id] = {"spec": spec, "ctx": ctx, "proc": proc, "t0": time.time(),
+                                        "shipped": time.time(), "beside": set(running)}
+                    print(f"[sana] {spec.id} training (pid {proc.pid}); on the card now: {', '.join(running)}", flush=True)
+                if error is not None and not running:
+                    break
+                time.sleep(5)
+                for aid, r in list(running.items()):
+                    rc = r["proc"].poll()
+                    if rc is None:
+                        if time.time() - r["shipped"] >= 300:          # long runs: saved epochs ship while training
+                            r["shipped"] = time.time()
+                            files = self._epoch_files(r["ctx"])
+                            if files:
+                                self._safe(lambda: repo.commit(files, f"{aid}: epochs saved so far"))
+                        continue
+                    del running[aid]
+                    try:
+                        if rc != 0:
+                            raise RuntimeError(f"the trainer exited with code {rc} (experiments/{aid}/logs/train.log)")
+                        metas[aid] = self._arm_finish(r["spec"], repo, metas, r["ctx"], time.time() - r["t0"],
+                                                      beside=sorted(r["beside"]))
+                    except Exception as e:  # noqa: BLE001
+                        self._record_failure(r["spec"], repo, metas, e)
+                        error = e if stop_on_error and error is None else error
+                    self._safe(lambda: self._publish_index(repo, metas))
+                if running and time.time() - last_status >= 30:
+                    last_status = time.time()
+                    print("[sana] " + " | ".join(f"{a.split('_')[0]} {_progress(r['ctx']['log'])}"
+                                                 for a, r in running.items())
+                          + (f" | waiting: {', '.join(s.id.split('_')[0] for s in queue)}" if queue else ""), flush=True)
+        except KeyboardInterrupt:
+            for aid, r in running.items():
+                r["proc"].terminate()                 # the deepspeed launcher stops its trainer on SIGTERM
+                print(f"[sana] stopped {aid} (pid {r['proc'].pid})", flush=True)
+            print("[sana] interrupted; run_sequence() again resumes from the arms already done", flush=True)
+            raise
+        if error is not None:
+            raise error
 
     @staticmethod
     def _safe(fn) -> None:
@@ -632,8 +742,8 @@ class SanaRunner(_RunnerMixin):
                   flush=True)
         return self._base
 
-    def _run_arm(self, spec: "sx.ArmSpec", repo: "_HubRepo", metas: dict) -> dict:
-        import numpy as np
+    def _arm_begin(self, spec: "sx.ArmSpec", repo: "_HubRepo") -> dict:
+        """The arm's folders + config, and its first commit (README, meta 'running', config, training-set list)."""
         dr = Path(self._need("data_root"))
         arm = dr / "experiments" / spec.id
         base = f"experiments/{spec.id}"
@@ -649,32 +759,46 @@ class SanaRunner(_RunnerMixin):
         start.update(_folder_files(cfg_dir, f"{base}/config"))
         start.update(_folder_files(img_dir.parent, f"{base}/data", allow=["items.jsonl", "sheet.jpg"]))
         repo.commit(start, f"{spec.id}: started (README, config, training-set list)")
+        return {"arm": arm, "base": base, "out_dir": out_dir, "log": log, "recipe": recipe, "lora_toml": lora_toml,
+                "uploaded": set()}
 
-        uploaded: set = set()
+    @staticmethod
+    def _epoch_files(ctx: dict, *, final: bool = False) -> dict:
+        """The saved epochs not uploaded yet (the newest may still be writing unless final)."""
+        eps = _epoch_dirs(ctx["out_dir"])
+        files: dict = {}
+        for n, d in (eps if final else eps[:-1]):
+            if n not in ctx["uploaded"]:
+                files.update(_folder_files(d, f"{ctx['base']}/lora/epoch{n}"))
+                ctx["uploaded"].add(n)
+        return files
 
-        def epoch_files(final: bool = False) -> dict:
-            eps = _epoch_dirs(out_dir)
-            files: dict = {}
-            for n, d in (eps if final else eps[:-1]):          # the newest may still be writing
-                if n not in uploaded:
-                    files.update(_folder_files(d, f"{base}/lora/epoch{n}"))
-                    uploaded.add(n)
-            return files
+    def _run_arm(self, spec: "sx.ArmSpec", repo: "_HubRepo", metas: dict) -> dict:
+        """One arm, trained in the foreground with its log followed into the cell."""
+        ctx = self._arm_begin(spec, repo)
 
         def ship_epochs() -> None:                             # long runs: saved epochs ship while training
-            files = epoch_files()
+            files = self._epoch_files(ctx)
             if files:
                 repo.commit(files, f"{spec.id}: epochs saved so far")
 
         self._point_at_fork()
-        plan = _launch.build_plan(config_toml=str(lora_toml), num_gpus=self.cfg.num_gpus)
+        plan = _launch.build_plan(config_toml=str(ctx["lora_toml"]), num_gpus=self.cfg.num_gpus)
         t0 = time.time()
-        _launch.launch(plan, log_path=str(log), monitor=self._follow(str(log), on_tick=ship_epochs, tick_s=300.0))
-        train_s = time.time() - t0
+        _launch.launch(plan, log_path=str(ctx["log"]),
+                       monitor=self._follow(str(ctx["log"]), on_tick=ship_epochs, tick_s=300.0))
+        return self._arm_finish(spec, repo, metas, ctx, time.time() - t0)
+
+    def _arm_finish(self, spec: "sx.ArmSpec", repo: "_HubRepo", metas: dict, ctx: dict, train_s: float,
+                    beside: "list[str] | None" = None) -> dict:
+        """A trained arm: its weights + previews + log in one commit, then the evaluation and the result commit.
+        beside = the arms that trained on the card at the same time (side-by-side runs; None when alone)."""
+        import numpy as np
+        arm, base, out_dir, log, recipe = ctx["arm"], ctx["base"], ctx["out_dir"], ctx["log"], ctx["recipe"]
         epochs = _epoch_dirs(out_dir)
         if not epochs:
             raise RuntimeError(f"training finished but saved no LoRA under {out_dir}")
-        trained = epoch_files(final=True)                       # the weights ship BEFORE the evaluation
+        trained = self._epoch_files(ctx, final=True)            # the weights ship BEFORE the evaluation
         trained.update(_folder_files(log.parent, f"{base}/logs"))
         trained.update(_folder_files(epochs[-1][1].parent / "samples", f"{base}/samples"))
         repo.commit(trained, f"{spec.id}: LoRA epochs, previews, log")
@@ -727,7 +851,8 @@ class SanaRunner(_RunnerMixin):
         meta = sx.arm_meta(spec, "done", recipe=recipe, epochs=rows, final=final, final_diffs=final_diffs,
                            baseline=baseline, first_epoch_beyond_3se=first, train_seconds=round(train_s),
                            summary=self._summary(spec, final, metas),
-                           finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+                           finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                           **({"trained_beside": beside} if beside else {}))
         done = _folder_files(ev, f"{base}/eval")
         done[f"{base}/meta.json"] = sx.dumps(meta)
         done[f"{base}/README.md"] = sx.render_arm_readme(spec, recipe, meta)
