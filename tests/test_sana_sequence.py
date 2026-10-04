@@ -78,6 +78,66 @@ def test_sequence_reads_per_draw_and_settled():
     assert "draw 1000-1007" in md and "draw 2000-2007" in md and "UNSETTLED" in md and "5e-05" in md
 
 
+LEGACY_README = """---
+license: apache-2.0
+base_model: x
+---
+# geolip-beatrix-sana
+
+Intro. The repo also keeps the experiments that led here. A hand-written note the runner must keep.
+
+## Experiments
+| folder | date | what | result |
+|---|---|---|---|
+| [`e004_lora_mood_up`](experiments/e004_lora_mood_up/) | 2026-10-03 | old | old |
+
+## Reads across the LoRA sequence (rules fixed before the runs)
+- old reads
+
+## How the mood experiments are measured
+Judge text.
+
+## Licences
+Hand-edited licence line.
+"""
+
+
+def test_readme_merge_keeps_hand_edits():
+    metas = [sx.arm_meta(sx.SEQUENCE[0], "done", summary="NEW SUMMARY")]
+    reads = {"draw_1000": {"control": "CONTROL QUIET"}}
+    # a README written before the block markers: the old index is replaced, everything else kept
+    once = sx.merge_repo_readme(LEGACY_README, metas, reads)
+    assert "A hand-written note the runner must keep." in once and "Hand-edited licence line." in once
+    assert "NEW SUMMARY" in once and "| old | old |" not in once and "old reads" not in once
+    assert once.count("## How the mood experiments are measured") == 1 and once.count(sx.INDEX_START) == 1
+    # with the markers: a hand edit outside the block survives a rewrite, the block follows the metas
+    edited = once.replace("Judge text.", "Judge text, edited by hand.")
+    twice = sx.merge_repo_readme(edited, [sx.arm_meta(sx.SEQUENCE[0], "done", summary="NEWER")], reads)
+    assert "Judge text, edited by hand." in twice and "NEWER" in twice and "NEW SUMMARY" not in twice
+    assert sx.merge_repo_readme(twice, [sx.arm_meta(sx.SEQUENCE[0], "done", summary="NEWER")], reads) == twice
+    # no README yet, or only a metadata stub: the whole README
+    full = sx.render_repo_readme(metas, reads)
+    assert sx.merge_repo_readme(None, metas, reads) == full
+    assert sx.merge_repo_readme("---\nlicense: mit\n---", metas, reads) == full
+    # a fully hand-written README without an index: the block is appended, nothing removed
+    own = "# My notes\n\n## Anything\ntext\n"
+    out = sx.merge_repo_readme(own, metas, reads)
+    assert out.startswith(own.rstrip("\n")) and sx.INDEX_END in out
+
+
+def test_publish_index_keeps_hand_edits_and_always_writes(runner):
+    s, repo, pipe, calls = runner
+    repo.files_["README.md"] = LEGACY_README.encode()
+    s._publish_index(repo, {})
+    first = repo.files_["README.md"].decode()
+    assert "A hand-written note the runner must keep." in first and sx.INDEX_START in first
+    index = json.loads(repo.files_["index.json"])
+    assert index["experiments"] == {} and "updated_utc" in index
+    n = len(repo.commits)
+    s._publish_index(repo, {})                                # nothing new: still one commit (the write check)
+    assert len(repo.commits) == n + 1
+
+
 def test_readmes_are_plain_and_complete():
     spec = sx.SEQUENCE[0]
     txt = sx.render_arm_readme(spec, {"optimizer": "Adam"})
@@ -112,6 +172,10 @@ class FakeRepo:
 
     def files(self):
         return list(self.files_)
+
+    def read(self, path):
+        b = self.files_.get(path)
+        return b.decode() if b is not None else None
 
     def metas(self):
         return {p.split("/")[1]: json.loads(b) for p, b in self.files_.items()

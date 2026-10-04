@@ -158,6 +158,10 @@ class FakeRepo:
     def files(self):
         return list(self.files_)
 
+    def read(self, path):
+        b = self.files_.get(path)
+        return b.decode() if b is not None else None
+
     def metas(self):
         return {p.split("/")[1]: json.loads(b) for p, b in self.files_.items()
                 if p.startswith("experiments/") and p.endswith("/meta.json")}

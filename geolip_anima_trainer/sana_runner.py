@@ -228,6 +228,14 @@ class _HubRepo:
     def files(self) -> list[str]:
         return self.api.list_repo_files(self.repo_id, repo_type="model")
 
+    def read(self, path_in_repo: str) -> "str | None":
+        """A text file's current content in the repo, or None when the repo has no such file."""
+        from huggingface_hub import hf_hub_download
+        if path_in_repo not in self.files():
+            return None
+        p = hf_hub_download(self.repo_id, path_in_repo, repo_type="model", token=self.api.token)
+        return Path(p).read_text(encoding="utf-8")
+
     def metas(self) -> dict:
         """Every experiments/<id>/meta.json in the repo, keyed by id."""
         from huggingface_hub import hf_hub_download
@@ -738,13 +746,19 @@ class SanaRunner(_RunnerMixin):
             print(f"[hub] (upload failed: {e})", flush=True)
 
     def _publish_index(self, repo: "_HubRepo", metas: dict) -> None:
-        """The repo README from EVERY folder's meta.json (re-read now: other folders may have been added while
-        this sequence ran), this session's newer metas winning."""
+        """The repo README's experiment index from EVERY folder's meta.json (re-read now: other folders may have been
+        added while this sequence ran; this session's newer metas win) + index.json, in one commit. Only the README's
+        index block is rewritten, so hand edits elsewhere in it are kept. index.json carries the time, so the commit
+        always writes something (this is also the write check before any GPU work)."""
         merged = {**repo.metas(), **metas}
         done = {k: m for k, m in merged.items() if m.get("status") == "done"}
         reads = sx.sequence_reads(done, self.BED.roles)
-        repo.put("README.md", sx.render_repo_readme(list(merged.values()), reads, self.BED),
-                 "README: the experiment index")
+        readme = sx.merge_repo_readme(repo.read("README.md"), list(merged.values()), reads, self.BED)
+        index = {"updated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                 "experiments": {k: {"title": m.get("title"), "status": m.get("status"), "summary": m.get("summary")}
+                                 for k, m in sorted(merged.items())},
+                 "reads": reads}
+        repo.commit({"README.md": readme, "index.json": sx.dumps(index)}, "README: the experiment index")
 
     def _baseline(self) -> dict:
         """The held-out cells rendered WITHOUT a LoRA (once per session; every arm is paired against them)."""

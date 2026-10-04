@@ -341,15 +341,50 @@ def render_reads(reads: dict | None, bed: "Bed | None" = None) -> str:
     return "\n".join(out) + "\n"
 
 
-def render_repo_readme(metas: list[dict], reads: dict | None = None, bed: "Bed | None" = None) -> str:
+INDEX_START = ("<!-- experiments index: start. The runner rewrites this block after every experiment; "
+               "edits outside it are kept. -->")
+INDEX_END = "<!-- experiments index: end -->"
+
+
+def render_index_block(metas: list[dict], reads: dict | None = None, bed: "Bed | None" = None) -> str:
+    """The part of the repo README the runner owns: the experiment table and the cross-arm reads, between markers."""
     bed = bed or SANA
     rows = []
     for m in sorted(metas, key=lambda m: m["id"]):
         status = m.get("status", "")
         res = m.get("summary") or {"running": "running", "failed": "failed (see its log)"}.get(status, status)
         rows.append(f"| [`{m['id']}`](experiments/{m['id']}/) | {m.get('date', '')} | {m.get('title', '')} | {res} |")
-    refs = "\n".join(f"- {t}. {u}" for t, u in bed.references)
     reads_md = render_reads(reads, bed)
+    return (f"{INDEX_START}\n## Experiments\n| folder | date | what | result |\n|---|---|---|---|\n"
+            f"{chr(10).join(rows)}\n\n{reads_md}{INDEX_END}\n")
+
+
+def merge_repo_readme(current: "str | None", metas: list[dict], reads: dict | None = None,
+                      bed: "Bed | None" = None) -> str:
+    """The README to publish. A repo without a real README (none, or only a metadata header) gets the whole README;
+    otherwise every line outside the index block is kept as it is (hand edits survive) and only the block is
+    rewritten. A README written before the block markers existed has its old index (from '## Experiments' to the
+    next section after the reads) replaced by the block; one without that section gets the block appended."""
+    block = render_index_block(metas, reads, bed)
+    if not current or "\n## " not in "\n" + current:
+        return render_repo_readme(metas, reads, bed)
+    if INDEX_START in current and INDEX_END in current:
+        head, rest = current.split(INDEX_START, 1)
+        tail = rest.split(INDEX_END, 1)[1]
+        return head + block.rstrip("\n") + tail
+    lines = current.split("\n")
+    try:
+        start = lines.index("## Experiments")
+    except ValueError:
+        return current.rstrip("\n") + "\n\n" + block
+    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")
+                and not lines[i].startswith("## Reads across the LoRA sequence")), len(lines))
+    return "\n".join(lines[:start] + block.split("\n") + lines[end:])
+
+
+def render_repo_readme(metas: list[dict], reads: dict | None = None, bed: "Bed | None" = None) -> str:
+    bed = bed or SANA
+    refs = "\n".join(f"- {t}. {u}" for t, u in bed.references)
     tags = "\n".join(f"- {t}" for t in bed.tags)
     return f"""---
 license: {bed.yaml_license}
@@ -364,12 +399,7 @@ tags:
 Each experiment has its own folder under `experiments/` with a README (the question, the recipe, the rule fixed before
 the run, the result), `meta.json`, and its configuration, weights, evaluation and logs where it has them.
 
-## Experiments
-| folder | date | what | result |
-|---|---|---|---|
-{chr(10).join(rows)}
-
-{reads_md}
+{render_index_block(metas, reads, bed)}
 ## How the mood experiments are measured
 {bed.judge_text}
 
