@@ -975,10 +975,10 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
               "and e018 moved only the cheerful side. "
               + ("Splitting the value by its sign gives each side its own direction; each side trains only on the "
                  "phrases on its side (checked before the run: "
-                 + ("her gloomy training phrases sit on the negative side, 90% of them beyond -0.25, and all four unseen "
-                    "gloomy phrases do)." if arm.source == "trained" else
-                    "the untrained trunk places 80% of its gloomy training phrases beyond -0.25 and 2 of its 4 unseen "
-                    "gloomy phrases on the negative side).") if arm.sides == "relu" else
+                 + ("93% of her gloomy training phrases sit on the negative side and 90% beyond -0.25, and all four "
+                    "unseen gloomy phrases sit beyond -0.25)." if arm.source == "trained" else
+                    "the untrained trunk places 87% of its gloomy training phrases on the negative side and 80% beyond "
+                    "-0.25, and 2 of its 4 unseen gloomy phrases on the negative side).") if arm.sides == "relu" else
                  "The exponentials keep both sides on for every phrase, the sign tilting the balance (no dead zone; at a "
                  "= 0 both sides contribute equally).")]
              if arm.axis and arm.sides != "one" else []),

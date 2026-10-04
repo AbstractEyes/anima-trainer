@@ -551,6 +551,7 @@ def test_connector_registry_and_rules():
     assert "Two-sided" not in slider and "phi(" not in slider
     two = ax.render_connector_readme(ax.CONNECTOR_ARMS[7], {"status": "running"}, {"input": "x"}, PHRASES)
     assert "**Two-sided**" in two and "phi([a, n]) = [max(a, 0), max(-a, 0), n]" in two and "all four unseen" in two
+    assert "93% of her gloomy training phrases" in two
     assert "2 of its 4 unseen" in ax.render_connector_readme(ax.CONNECTOR_ARMS[8], {"status": "running"}, {"input": "x"},
                                                              PHRASES)
     smooth = ax.render_connector_readme(ax.CONNECTOR_ARMS[9], {"status": "running"}, {"input": "x"}, PHRASES)
