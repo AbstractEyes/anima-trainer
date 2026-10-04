@@ -427,6 +427,7 @@ class SanaRunner(_RunnerMixin):
 
     def _judge(self):
         if self._judge_fns is None:
+            print(f"[{self.TAG}] loading the CLIP judge ({CLIP_JUDGE}; a 1.7 GB download the first time)...", flush=True)
             self._judge_fns = self._clip_judge()
         return self._judge_fns
 
@@ -491,6 +492,7 @@ class SanaRunner(_RunnerMixin):
         todo = [it for it in items if not (img_dir / f"{it['name']}.png").is_file()]
         if todo:
             self._assert_stock()
+            print(f"[{self.TAG}] rendering {len(todo)} {flavor} training images (seeds {seed_base}+)...", flush=True)
             for i in range(0, len(todo), self.cfg.gen_batch):
                 chunk = todo[i:i + self.cfg.gen_batch]
                 for it, img in zip(chunk, self._render([c["prompt"] for c in chunk], [c["seed"] for c in chunk])):

@@ -391,8 +391,11 @@ class AnimaRunner(_sr.SanaRunner):
     def _eval_pipe(self):
         if self._pipe is None:
             fork = self.state.get("diffusion_pipe") or self._point_at_fork()
+            print(f"[{self.TAG}] loading Anima into this notebook (transformer, Qwen3, VAE)...", flush=True)
+            t0 = time.time()
             self._pipe = AnimaPipe(fork, self._need("transformer_path"), self._need("vae_path"),
                                    self._need("llm_path"))
+            print(f"[{self.TAG}] Anima loaded in {time.time() - t0:.0f} s", flush=True)
         return self._pipe
 
     def _render(self, prompts: list[str], seeds: list[int], **kw) -> list:
@@ -555,6 +558,9 @@ class AnimaRunner(_sr.SanaRunner):
         self._assert_stock()
         seeds = list(ax.FLAVOR_TEST_SEEDS)
         cells = [(si, sd) for si in range(len(SUBJECTS)) for sd in seeds]
+        print(f"[anima] e001: {3 + len(ax.DIAL_SITES) * len(ax.DIAL_ALPHAS)} sets of {len(cells)} images (the words: "
+              f"neutral, upbeat, downbeat; the dial: {len(ax.DIAL_SITES)} sites x {len(ax.DIAL_ALPHAS)} strengths), "
+              "one line per set", flush=True)
         S = [sd for _, sd in cells]
         P = {f: [ax.TEMPLATES[f][0].format(s=SUBJECTS[si]) for si, _ in cells] for f in ("neutral", "up", "down")}
         imgs, feats, scores = {}, {}, {}
