@@ -340,6 +340,18 @@ class AnimaPipe:
             x = ad.in_proj(ad.embed(torch.tensor(ids, device="cuda")))
         return x.float()
 
+    def piece_queries(self, pieces: "tuple[str, ...]"):
+        """The adapter's query embedding of raw T5 pieces [len, D] float32 (e.g. the bare space piece), by their ids."""
+        import torch
+        tok = self.model.t5_tokenizer
+        ids = [tok.convert_tokens_to_ids(p) for p in pieces]
+        if any(i is None or i == tok.unk_token_id for i in ids):
+            raise ValueError(f"not T5 pieces: {pieces} -> {ids}")
+        ad = self.model.transformer.llm_adapter
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            x = ad.in_proj(ad.embed(torch.tensor(ids, device="cuda")))
+        return x.float()
+
     def encode_images(self, imgs: list, res: int):
         """Latents [B, 16, 1, res/8, res/8] of PIL images by the trainer's own path: fitted to res x res
         (utils.image_resize.convert_crop_and_resize), scaled to [-1, 1] (ToTensor + Normalize(.5, .5)), then the VAE
@@ -1082,7 +1094,8 @@ class AnimaRunner(_sr.SanaRunner):
     # ---- e027: the slot pair ------------------------------------------------------------------------------------------
     def run_slot_pair(self, *, force: bool = False) -> dict:
         """e027 into its own folder of cfg.repo_id: a word-sized mood push at one word's position, on the adapter's query
-        side, its source side, or both (a matched pair). Skipped when the repo lists it as done (force=True reruns)."""
+        side, its source side, both (a matched pair), or the source side under a content-free question. Skipped when the
+        repo lists it as done (force=True reruns)."""
         self._need_model()
         _drop_torchao()
         repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
@@ -1132,34 +1145,42 @@ class AnimaRunner(_sr.SanaRunner):
         S = [sd for _, sd in cells]
         up, down = ax.SLOT_REFERENCE
         P = {w: [ax.slot_prompt(w, SUBJECTS[si]) for si, _ in cells] for w in (ax.SLOT_WORD, up, down)}
+        P["plain"] = [ax.NEUTRAL_CAPTION.format(s=SUBJECTS[si]) for si, _ in cells]
         q = pipe.word_queries((up, down))                    # the word table's rows through in_proj
         d_q = q[0] - q[1]
+        # the content-free question: the slot's query swapped for the bare space piece's (in_proj is affine, so adding
+        # the difference at the slot makes the slot's query exactly the piece's)
+        q_free = pipe.piece_queries((ax.SLOT_FREE_PIECE,))[0] - pipe.word_queries((ax.SLOT_WORD,))[0]
         xq, mq = pipe.query_states(P[ax.SLOT_WORD])
         q_size = float(xq.norm(dim=-1)[mq.bool()].mean())
         d_s = pipe.word_states(P[up], (up,)).mean(0) - pipe.word_states(P[down], (down,)).mean(0)
         conds = pipe.encode(P[ax.SLOT_WORD])
         s_size = float(conds[0].float().norm(dim=-1)[conds[1].bool()].mean())
         sizes = {"query token mean size": q_size, "query direction before scaling": float(d_q.norm()),
-                 "Qwen3 state mean size": s_size, "source direction before scaling": float(d_s.norm())}
+                 "Qwen3 state mean size": s_size, "source direction before scaling": float(d_s.norm()),
+                 "question swap size": float(q_free.norm())}
         d_q, d_s = d_q / d_q.norm() * q_size, d_s / d_s.norm() * s_size       # one unit of alpha = one word's size
         sets = ax.slot_sets()
-        print(f"[anima] e027: {len(sets)} sets of {len(cells)} images (the slot prompt, the real words at the slot, the "
-              f"query / pair / answer at the slot per alpha), one line per set; sizes "
-              + ", ".join(f"{k} {v:.1f}" for k, v in sizes.items()), flush=True)
+        print(f"[anima] e027: {len(sets)} sets of {len(cells)} images (the slot prompt, the scene prompt, the real words at "
+              f"the slot, the query / pair / answer / answer under a content-free question at the slot per alpha), one line "
+              f"per set; sizes " + ", ".join(f"{k} {v:.1f}" for k, v in sizes.items()), flush=True)
         eta = _sr._Eta(self.TAG, "e027", len(sets) * len(cells))
         rows = list(range(len(cells)))[::4]                                    # 8 scenes for the sheet
-        cols = ["slot", f"word_{up}", f"word_{down}"] + [f"{f}@{a:+g}" for f in ax.SLOT_FORMS
-                                                         for a in (min(ax.SLOT_ALPHAS), max(ax.SLOT_ALPHAS))]
+        cols = (["plain", "slot", f"word_{up}", f"word_{down}", "C@+0"]
+                + [f"{f}@{a:+g}" for f in ax.SLOT_FORMS for a in (min(ax.SLOT_ALPHAS), max(ax.SLOT_ALPHAS))])
         sheet, feat0, scores, kept = {}, None, {}, {}
         for key in sets:                                   # the slot prompt first: content kept is read against it
-            if key == "slot" or key.startswith("word_"):
-                ims = self._render_tracked(P[ax.SLOT_WORD if key == "slot" else key[len("word_"):]], S, eta)
+            if key in ("slot", "plain") or key.startswith("word_"):
+                ims = self._render_tracked(P[{"slot": ax.SLOT_WORD, "plain": "plain"}.get(key, key[len("word_"):])], S,
+                                           eta)
             else:
                 form, a = key.split("@")
                 kw: dict = {"slot_word": ax.SLOT_WORD}
                 if form in ("Q", "P"):
                     kw["slot_query"] = d_q * float(a)
-                if form in ("P", "S"):
+                if form == "C":
+                    kw["slot_query"] = q_free
+                if form in ("P", "S") or (form == "C" and float(a) != 0):
                     kw["slot_source"] = d_s * float(a)
                 ims = self._render_tracked(P[ax.SLOT_WORD], S, eta, **kw)
             fa, sc = self._score(ims)

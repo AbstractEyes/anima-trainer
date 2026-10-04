@@ -857,10 +857,11 @@ def render_word_split_readme(meta: dict, recipe: dict) -> str:
     return "\n".join(out)
 
 
-# ---- e027: the slot pair (a word-sized push at one word's position: its query side, its source side, or both) -----------
+# ---- e027: the slot pair (a word-sized push at one word's position: its query side, its source side, both, or the source
+# side under a content-free question) -------------------------------------------------------------------------------------
 SLOT_TEST_ID = "e027_anima_slot_pair"
 SLOT_TEST_TITLE = ("The stock model: a word-sized mood push at one word's position, on the adapter's query side, its source "
-                   "side, or both")
+                   "side, both, or the source side under a content-free question")
 SLOT_WORD = "neutral"                    # one token in both tokenizers, at aligned positions
 SLOT_TEMPLATE = PREFIX + "an illustration of {s}, {w} mood."
 SLOT_REFERENCE = ("happy", "sad")        # the words behind the directions; the real words at the slot are the references
@@ -872,7 +873,11 @@ SLOT_FORMS = {
     "P": "Q + the source direction at the slot: Qwen3's state at the slot for \"happy mood\" minus \"sad mood\" (the mean "
          "over the scenes), unit length, times Qwen3's states' mean size per unit alpha (the matched pair)",
     "S": "the source direction at the slot alone (an answer to the slot's own neutral question)",
+    "C": "the source direction at the slot under a content-free question: the slot's query replaced by that of T5's bare "
+         "space piece (the piece most words the T5 vocabulary does not hold open with), C at alpha 0 being that question "
+         "alone",
 }
+SLOT_FREE_PIECE = "▁"               # T5's bare space piece: '▁ gle e ful', '▁ ju bil ant', '▁ g loom y' (e026)
 SLOT_GATE = "THE MATCHED SOURCE ADDS"
 
 
@@ -881,27 +886,41 @@ def slot_prompt(w: str, scene: str) -> str:
 
 
 def slot_sets() -> list[str]:
-    """Every image set of e027 in render order: the slot prompt, the real words at the slot, each form at each alpha."""
-    return ["slot", *[f"word_{w}" for w in SLOT_REFERENCE], *[f"{f}@{a:+g}" for f in SLOT_FORMS for a in SLOT_ALPHAS]]
+    """Every image set of e027 in render order: the slot prompt, the scene prompt without the slot, the real words at the
+    slot, each form at each alpha (the content-free question C also at alpha 0)."""
+    return ["slot", "plain", *[f"word_{w}" for w in SLOT_REFERENCE],
+            *[f"{f}@{a:+g}" for f in SLOT_FORMS for a in ((0.0,) if f == "C" else ()) + SLOT_ALPHAS]]
 
 
 def slot_pair_reads(scores: dict) -> dict:
     """The registered reads from mood scores {set: [score per cell]} (keys as slot_sets()): per form, the per-cell slope of
-    the mood score on alpha (A DIAL rule; alpha in words); THE GATE: per cell, the mean over the negative alphas of the
-    pair minus the query alone, read downward; descriptive: the same over the positive alphas read upward, the real words
-    against the slot prompt, and the share of each word's effect the pair recovers at alpha +-1."""
+    the mood score on alpha (A DIAL rule; alpha in words; alpha 0 = the slot prompt, for C its content-free question
+    alone); THE GATE: per cell, the mean over the negative alphas of the pair minus the query alone, read downward;
+    descriptive: the same over the positive alphas read upward, the real words against the slot prompt, the share of each
+    word's effect the pair recovers at alpha +-1, the content-free question's own cost against the slot prompt and the
+    scene prompt, the slot's own cost, and C minus S per side (the same answer under the two questions)."""
     import numpy as np
     neg = [a for a in SLOT_ALPHAS if a < 0]
     pos = [a for a in SLOT_ALPHAS if a > 0]
 
-    def side(alphas):
-        return list(np.mean([np.subtract(scores[f"P@{a:+g}"], scores[f"Q@{a:+g}"]) for a in alphas], axis=0))
+    def side(alphas, hi="P", lo="Q"):
+        return list(np.mean([np.subtract(scores[f"{hi}@{a:+g}"], scores[f"{lo}@{a:+g}"]) for a in alphas], axis=0))
 
-    out: dict = {"dials": {f: flavor_outcome(cell_slopes({0.0: scores["slot"], **{a: scores[f"{f}@{a:+g}"]
-                                                                                 for a in SLOT_ALPHAS}}), 1, label="A DIAL")
+    def zero(f):
+        return scores["C@+0"] if f == "C" else scores["slot"]
+
+    def cost(a, b):                       # descriptive: the mean, its SE and the share of cells upward
+        return {**flavor_outcome(list(np.subtract(scores[a], scores[b])), 0, label=""), "OUTCOME": "DESCRIPTIVE"}
+
+    out: dict = {"dials": {f: flavor_outcome(cell_slopes({0.0: zero(f), **{a: scores[f"{f}@{a:+g}"] for a in SLOT_ALPHAS}}),
+                                             1, label="A DIAL")
                            for f in SLOT_FORMS},
                  "gate": flavor_outcome(side(neg), -1, label=SLOT_GATE),
-                 "upbeat_side": flavor_outcome(side(pos), 1, label=SLOT_GATE), "words": {}, "pair_share": {}}
+                 "upbeat_side": flavor_outcome(side(pos), 1, label=SLOT_GATE), "words": {}, "pair_share": {},
+                 "free_question_cost": cost("C@+0", "slot"), "slot_cost": cost("slot", "plain"),
+                 "free_question_vs_plain": cost("C@+0", "plain"),
+                 "free_minus_whole": {"downbeat": flavor_outcome(side(neg, "C", "S"), -1, label="THE FREE QUESTION READS MORE"),
+                                      "upbeat": flavor_outcome(side(pos, "C", "S"), 1, label="THE FREE QUESTION READS MORE")}}
     for w, d, key in ((SLOT_REFERENCE[0], 1, f"P@{max(SLOT_ALPHAS):+g}"), (SLOT_REFERENCE[1], -1, f"P@{min(SLOT_ALPHAS):+g}")):
         word = flavor_outcome(list(np.subtract(scores[f"word_{w}"], scores["slot"])), d, label="THE WORD MOVES IT")
         out["words"][w] = word
@@ -913,8 +932,9 @@ def slot_pair_reads(scores: dict) -> dict:
 def slot_summary(reads: dict) -> str:
     d, g = reads["dials"], reads["gate"]
     return (f"per word of push: the query at the slot {d['Q']['mean']:+.3f} ({d['Q']['OUTCOME']}), the pair "
-            f"{d['P']['mean']:+.3f} ({d['P']['OUTCOME']}), the answer alone {d['S']['mean']:+.3f} ({d['S']['OUTCOME']}); "
-            f"downbeat side, the matched source beside the query {g['mean']:+.2f} ({g['OUTCOME']})")
+            f"{d['P']['mean']:+.3f} ({d['P']['OUTCOME']}), the answer alone {d['S']['mean']:+.3f} ({d['S']['OUTCOME']}), the "
+            f"answer under a content-free question {d['C']['mean']:+.3f} ({d['C']['OUTCOME']}); downbeat side, the matched "
+            f"source beside the query {g['mean']:+.2f} ({g['OUTCOME']})")
 
 
 def render_slot_pair_readme(meta: dict, recipe: dict) -> str:
@@ -933,23 +953,37 @@ def render_slot_pair_readme(meta: dict, recipe: dict) -> str:
            "beside it is not read. Here the push is word-sized and sits at one word's position, on both sides of the "
            "lookup: does a synthetic question at the slot move the image, and does its matched synthetic answer at the "
            "same position add to it on the downbeat side?", "",
+           "Experiment e026 then found that a word the T5 vocabulary holds whole works through its query alone (Qwen3's "
+           "state adds nothing there), while a word cut into pieces gets its meaning only from Qwen3's states, looked up "
+           "by pieces that carry no meaning of their own. So the design adds a fourth form: the same answer at the slot "
+           "under a content-free question (the bare space piece most such words open with: \"gleeful\" = ▁ gle e "
+           "ful) instead of the word \"neutral\". "
+           "Does an answer under a question that asks for nothing in particular move the image, where the same answer "
+           "under a whole word may not?", "",
            "## Design",
            f"- The slot prompt \"{SLOT_TEMPLATE.replace(PREFIX, '').format(s='{scene}', w=SLOT_WORD)}\" (after the model "
            f"card's quality prefix; the negative prompt unchanged): \"{SLOT_WORD}\" is one token in both tokenizers, at "
            f"aligned positions; e001's 32 scenes at seed {SLOT_SEEDS[0]} (32 cells); alpha {alphas} in units of one "
            "word's size; every push on the conditional branch only.", "",
            "| form | what is added |", "|---|---|", forms, "",
-           f"- References: the slot prompt (alpha 0) and the real words at the slot (\"{up} mood\", \"{down} mood\"). "
-           f"{n_sets} sets x 32 = {32 * n_sets} images.", "",
+           f"- References: the slot prompt (alpha 0), the scene prompt without the slot "
+           f"(\"{NEUTRAL_CAPTION.replace(PREFIX, '').format(s='{scene}')}\") and the real words at the slot (\"{up} "
+           f"mood\", \"{down} mood\"). {n_sets} sets x 32 = {32 * n_sets} images.", "",
            "## Recipe", "| setting | value |", "|---|---|", rec, "",
            "## The rule (fixed before the run)",
            "Per cell, e001's rule. **Dial**: the least-squares slope of the mood score on alpha (alpha 0 = the slot "
-           "prompt); **A DIAL** when the mean is upward, at least 75% of the 32 cells upward and beyond 3 standard "
-           "errors; **NO EFFECT** within 2 standard errors of zero or under 60% upward; **MIXED** otherwise. **The gate** "
+           "prompt; for C, the content-free question alone); **A DIAL** when the mean is upward, at least 75% of the 32 "
+           "cells upward and beyond 3 standard errors; **NO EFFECT** within 2 standard errors of zero or under 60% "
+           "upward; **MIXED** otherwise. **The gate** "
            "(the downbeat side): per cell, the mean over the negative alphas of the pair's mood score minus the query's "
            f"alone, read downward under the same rule: **{SLOT_GATE}**, **NO EFFECT** or **MIXED**. Reported beside it: "
            "the same over the positive alphas read upward, the real words against the slot prompt, the share of each "
-           "word's effect the pair recovers at alpha +-1, content kept and the sizes.", "",
+           "word's effect the pair recovers at alpha +-1, content kept and the sizes; for the content-free question, its "
+           "own cost (C at alpha 0 minus the slot prompt, and minus the scene prompt), the slot's own cost (the slot prompt "
+           "minus the scene prompt), and C minus S per side (the same answer under the two questions). How C reads, fixed "
+           "in advance: C a dial and S not = a whole word's own entry keeps its answer from being read, and a content-free "
+           "question at the slot is the form; both dials = the answer is found by its position under either question; "
+           "neither, with the pair a dial = question and answer must agree; none = one position is not enough.", "",
            "**Limit fixed in advance**: one slot and one word pair behind the directions; the source direction is the "
            "mean over the scenes; 32 cells.", "", ANIMA.judge_text, ""]
     if meta.get("status") == "done":
@@ -968,12 +1002,26 @@ def render_slot_pair_readme(meta: dict, recipe: dict) -> str:
             sh = r["pair_share"].get(w)
             out.append(f"| {w} | {v['mean']:+.3f} +- {v['se']:.3f} | {v['OUTCOME']} | "
                        f"{'' if sh is None else f'{sh:.2f}'} |")
+        if "free_question_cost" in r:
+            fm = r["free_minus_whole"]
+            out += ["", "| the content-free question | effect (mean +- SE) | cells upward |", "|---|---|---|"]
+            for label, k in (("C at alpha 0 minus the slot prompt (the question swap)", "free_question_cost"),
+                             ("the slot prompt minus the scene prompt (the slot itself)", "slot_cost"),
+                             ("C at alpha 0 minus the scene prompt", "free_question_vs_plain")):
+                v = r[k]
+                out.append(f"| {label} | {v['mean']:+.3f} +- {v['se']:.3f} | {v['frac_pos']:.0%} |")
+            out += ["", "| C minus S (the same answer, content-free vs whole-word question) | effect | cells that way | "
+                        "verdict |", "|---|---|---|---|",
+                    f"| downbeat side | {fm['downbeat']['mean']:+.3f} +- {fm['downbeat']['se']:.3f} | "
+                    f"{fm['downbeat']['frac_neg']:.0%} | {fm['downbeat']['OUTCOME']} |",
+                    f"| upbeat side | {fm['upbeat']['mean']:+.3f} +- {fm['upbeat']['se']:.3f} | "
+                    f"{fm['upbeat']['frac_pos']:.0%} | {fm['upbeat']['OUTCOME']} |"]
         if r.get("sizes"):
             out += ["", "Sizes: " + ", ".join(f"{k} {v:.3f}" for k, v in r["sizes"].items()) + "."]
         out += ["", "| set | mood score | content kept |", "|---|---|---|"]
         for k in slot_sets():
             out.append(f"| {k} | {r['mood_score'][k]:+.3f} | {r['content_kept'][k]:.3f} |")
-        out += ["", "![the forms at alpha -1 and +1](sheet_slot.jpg)", "",
+        out += ["", "![the references and the forms at alpha -1 and +1](sheet_slot.jpg)", "",
                 "Rows: eight scenes. Columns: " + ", ".join(r.get("sheet_columns", [])) + ".", ""]
     elif meta.get("status") == "failed":
         out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]

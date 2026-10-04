@@ -539,9 +539,14 @@ every caption query is a twentieth of a word's query (4% of a query's size, 6.2 
 `AnimaPipe.slot_masks(prompts, word)` = masks over the T5 and the Qwen3 positions of the word's tokens (offsets; both
 tokenizers are called plainly with right padding, so offset indices are tensor positions); `generate(slot_word=,
 slot_query=, slot_source=)` adds at those positions only (the query through `_forward(query_mask=)`, the source on
-conds[0]; conditional branch only); `word_queries()` = the word table's rows through in_proj (one-token words). Forms Q /
-P / S at alpha in units of a word's size (each side's mean token size); `slot_pair_reads()` = dials + the downbeat gate
-(P minus Q) + the real words + the pair's share.
+conds[0]; conditional branch only); `word_queries()` = the word table's rows through in_proj (one-token words);
+`piece_queries()` = the same for raw T5 pieces by id. Forms Q / P / S / C at alpha in units of a word's size (each side's
+mean token size); C = S's source push under a content-free question: slot_query = in_proj(e['▁']) - in_proj(e['▁neutral'])
+makes the slot's query exactly the bare space piece's (in_proj is affine); C@+0 is C's zero; `plain` = the scene prompt
+without the slot. `slot_pair_reads()` = dials + the downbeat gate (P minus Q) + the real words + the pair's share + the
+question swap's and the slot's costs + C minus S per side. LESSON (e026, BY TOKENIZATION): a word the T5 vocabulary holds
+whole rides its query alone and Qwen3's state adds nothing there; a shattered word's meaning comes only from Qwen3's states
+looked up by meaning-free pieces; fragments carry no mood (three of four darken ~0.5).
 CONNECTORS (`run_beatrix_connectors()` = e013-e025, `anima_experiments.CONNECTOR_ARMS`): push = f @ W.T + b at the
 `context` site (every caption token after the adapter), W/b zero-init fp32, the only trained tensors; f = Beatrix's
 phrase features (`CONNECTOR_FEATURES` in the data repo: `trained` / `random` [74, 4096] + the phrase table in the

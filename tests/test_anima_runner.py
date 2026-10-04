@@ -983,11 +983,14 @@ def test_slot_masks_mark_the_word_in_both_tokenizers():
 
 def test_slot_pair_reads_the_matched_source_beside_the_query(runner, monkeypatch):
     """e027: a fake model where the query at the slot is a dial and the matched source adds only on the downbeat side
-    when the query is there (the answer alone does nothing): the query and the pair are dials, the gate passes, the
-    answer alone reads no effect, and the pair's share of each real word comes out of the known levels."""
+    when the query is there (the answer alone does nothing), while under the content-free question the answer is read
+    at 0.7 per word and the question itself costs -0.3: the query, the pair and the content-free form are dials, the
+    gate passes, the answer alone reads no effect, and the shares and costs come out of the known levels."""
     from PIL import Image
     s, repo, pipe, _ = runner
-    pipe.word_queries = lambda words: torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    rows = {"happy": [1.0, 0.0, 0.0], "sad": [0.0, 0.0, 0.0], "neutral": [0.0, 0.0, 0.0]}
+    pipe.word_queries = lambda words: torch.tensor([rows[w] for w in words])
+    pipe.piece_queries = lambda pieces: torch.tensor([[0.0, 0.0, 5.0] for _ in pieces])
     pipe.query_states = lambda prompts: (torch.tensor([[[2.0, 0.0, 0.0]] * 4] * len(prompts)),
                                          torch.tensor([[1, 1, 1, 0]] * len(prompts)))
     pipe.word_states = lambda prompts, words: torch.tensor([[0.0, 1.0 if words == ("happy",) else -1.0, 0.0]] * len(prompts))
@@ -999,14 +1002,19 @@ def test_slot_pair_reads_the_matched_source_beside_the_query(runner, monkeypatch
         calls.append((slot_word, slot_query is not None, slot_source is not None))
         out = []
         for p in prompts:
-            assert ", neutral mood." in p or ", happy mood." in p or ", sad mood." in p
-            if "happy mood" in p or "sad mood" in p:
+            if "mood." not in p:                                                  # the scene prompt without the slot
+                assert slot_word is None and p.endswith(".")
+                level = 0.2
+            elif "happy mood" in p or "sad mood" in p:
                 assert slot_word is None
                 level = 2.0 if "happy" in p else -2.0
             else:
+                assert ", neutral mood." in p
+                free = slot_query is not None and float(slot_query[2]) != 0          # the content-free question
                 aq = float(slot_query[0]) / 2 if slot_query is not None else 0.0       # back to alpha (query size 2)
                 a_s = float(slot_source[1]) / 3 if slot_source is not None else 0.0    # (state size 3)
-                level = 0.5 * aq + (0.8 * a_s if a_s < 0 and aq != 0 else 0.0)
+                level = (0.5 * aq + (0.8 * a_s if a_s < 0 and aq != 0 else 0.0)
+                         + ((0.7 * a_s - 0.3) if free else 0.0))
             out.append(Image.new("RGB", (8, 8), (int(round(128 + 20 * level)),) * 3))
         return out
 
@@ -1021,13 +1029,24 @@ def test_slot_pair_reads_the_matched_source_beside_the_query(runner, monkeypatch
     assert r["words"]["happy"]["OUTCOME"] == r["words"]["sad"]["OUTCOME"] == "THE WORD MOVES IT"
     assert r["pair_share"]["happy"] == pytest.approx(0.25, abs=0.01) and r["pair_share"]["sad"] == pytest.approx(0.65, abs=0.01)
     assert r["sizes"]["query token mean size"] == pytest.approx(2.0) and r["sizes"]["Qwen3 state mean size"] == pytest.approx(3.0)
+    assert r["sizes"]["question swap size"] == pytest.approx(5.0)
+    assert r["dials"]["C"]["OUTCOME"] == "A DIAL" and r["dials"]["C"]["mean"] == pytest.approx(0.7, abs=0.01)
+    assert r["free_question_cost"]["mean"] == pytest.approx(-0.3, abs=0.01)
+    assert r["slot_cost"]["mean"] == pytest.approx(-0.2, abs=0.01)
+    assert r["free_question_vs_plain"]["mean"] == pytest.approx(-0.5, abs=0.01)
+    fm = r["free_minus_whole"]
+    assert fm["downbeat"]["mean"] == pytest.approx(-0.825, abs=0.01) and fm["downbeat"]["OUTCOME"] == "THE FREE QUESTION READS MORE"
+    assert fm["upbeat"]["mean"] == pytest.approx(0.225, abs=0.01) and fm["upbeat"]["OUTCOME"] == "THE FREE QUESTION READS MORE"
     assert ("neutral", True, True) in calls and ("neutral", False, True) in calls and (None, False, False) in calls
-    assert len(r["content_kept"]) == len(ax.slot_sets()) == 15 and len(r["sheet_columns"]) == 9
+    assert ("neutral", True, False) in calls                                     # Q, and C at alpha 0
+    assert len(r["content_kept"]) == len(ax.slot_sets()) == 21 and len(r["sheet_columns"]) == 13
+    assert "C@+0" in ax.slot_sets() and "plain" in ax.slot_sets() and ax.slot_sets()[0] == "slot"
     base = f"experiments/{ax.SLOT_TEST_ID}"
     for f in ("meta.json", "README.md", "result.json", "sheet_slot.jpg"):
         assert f"{base}/{f}" in repo.files_, f
     readme = repo.files_[f"{base}/README.md"].decode()
     assert f"**{ax.SLOT_GATE}**" in readme and "share the pair recovers" in readme
+    assert "content-free question" in readme and "the question swap" in readme and "C minus S" in readme
     import re
     for word in (r"S-1", r"\bPhil\b", r"docket", r"canon/", r"Fable"):
         assert not re.search(word, readme), word

@@ -296,7 +296,7 @@ a.run_route_split()        # e020: which of the adapter's two readings carries t
 a.run_appended_split()     # e021: the same with the mood words after the scene (the query half, the source half, both)
 a.run_query_dial()         # e022: a mood direction in the adapter's queries, alone and with a source token beside it
 a.run_word_split()         # e026: single mood words, whole T5 tokens against shattered ones
-a.run_slot_pair()          # e027: a word-sized push at one word's position, on the query side, the source side, or both
+a.run_slot_pair()          # e027: a word-sized push at one word's position (query, source, both, source under a free question)
 a.run_attribute_screen()   # e012: attribute sliders on the stock model
 a.run_sequence()           # e002..e011: the LoRA arms
 a.run_beatrix_connectors() # e013-e025: a push from Beatrix's phrase features, and its controls
@@ -331,7 +331,11 @@ a.run_beatrix_connectors() # e013-e025: a push from Beatrix's phrase features, a
   vocabulary. e022's direction, spread over every query, was a twentieth of a word's size and moved little, and
   the source token beside it went unread; **e027** puts a word-sized push at one word's position ("neutral" in
   "..., neutral mood."): the query side alone (the adapter's query of "happy" minus "sad"), the source side alone
-  (Qwen3's state there for "happy mood" minus "sad mood"), and both (a matched pair), against the real words.
+  (Qwen3's state there for "happy mood" minus "sad mood"), and both (a matched pair), against the real words. After
+  e026 found that the split follows the T5 vocabulary (a whole word rides its query alone; a word cut into pieces gets
+  its meaning only from Qwen3's states, looked up by pieces that mean nothing), e027 also places the same source push
+  under a content-free question at the slot (the bare space piece most such words open with) and adds the scene
+  prompt without the slot.
 - **e012** screens six character attributes (hair length, hair colour, eye colour, chibi proportions, age
   for adults only, style) as tag pairs on eight characters: does the tag move the attribute, does its
   direction added after the adapter act as a slider, and does each slider leave the other attributes alone
