@@ -37,6 +37,7 @@ from . import anima_experiments as ax
 from . import api as _api
 from . import sana_experiments as sx
 from . import sana_runner as _sr
+from . import training_sets as _ts
 from .cache_factory import get_hf_token
 from .sana_runner import HELD_OUT, SUBJECTS, _HubRepo, _drop_torchao, _grid
 
@@ -53,6 +54,7 @@ class AnimaConfig:
     base: str = "base-v1.0"                      # download_anima.BASE_CHOICES key: the card says LoRAs train on Base
     models_dir: str | None = None                # an existing folder with the three files (skips the download)
     repo_id: str = ax.DEFAULT_REPO               # the experiments repo (public): one folder per experiment
+    data_repo_id: str | None = _ts.DATA_REPO     # the drawn training sets, reused by later runtimes (None: never)
     resolution: int = RESOLUTION
     # data (the sequence renders its own training sets; source/dataset_dir keep the shared single-run surface)
     source: str = "mood"
@@ -79,6 +81,8 @@ class AnimaConfig:
             env["data_root"] = os.environ["ANIMA_DATA_ROOT"]
         if os.environ.get("ANIMA_EXPERIMENTS_REPO"):
             env["repo_id"] = os.environ["ANIMA_EXPERIMENTS_REPO"]
+        if os.environ.get("ANIMA_DATA_REPO"):
+            env["data_repo_id"] = os.environ["ANIMA_DATA_REPO"]
         valid = {f.name for f in fields(cls)}
         bad = set(overrides) - valid
         if bad:

@@ -506,6 +506,12 @@ preprocessing of neggles/wdv3-timm: white square pad, the model transform, RGB->
 `attribute_reads()` = the registered rule (words, dial, cross-talk in units of each attribute's word span, clean <
 reach / 3). PROGRESS: `sana_runner._Eta` / `_render_tracked` / `_train_eta` print job size, done / total, time
 spent and time left on every long step (renders, training from the trainer's own step lines, the sequence).
+TRAINING SETS ON THE HUB (`training_sets.py`, self-contained so an older kernel can import it after a pull):
+`cfg.data_repo_id` (Anima default `AbstractPhil/geolip-beatrix-anima-data`, a dataset repo; Sana None) keeps each
+drawn set at `sets/<flavor>_<seed_base>-<key>` (key = sha256 of the render settings via `render_spec_of(runner)` +
+every item); `run_sequence` pulls a matching set before drawing (`_pull_set`, verified image by image and caption by
+caption) and pushes each set once drawn (`_push_set`); the arm's recipe links its training images;
+`a.save_training_sets()` / `ts.upload_local_sets(a)` upload by hand. Changing any render setting changes the key.
 
 ### Training previews — `SamplesConfig` → `[samples]`
 `TrainConfig.samples = SamplesConfig(prompts=[...])` renders a `[samples]` table into the lora toml

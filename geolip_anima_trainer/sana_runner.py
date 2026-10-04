@@ -43,6 +43,7 @@ from pathlib import Path
 from . import api as _api
 from . import launch as _launch
 from . import sana_experiments as sx
+from . import training_sets as _ts
 from .cache_factory import _RunnerMixin, get_hf_token
 from .trainer_runner import _pid_alive
 
@@ -332,6 +333,7 @@ class SanaConfig:
     variant: str = "600m-512"                    # download_sana.SANA_REPOS key
     diffusers_path: str | None = None            # an existing local Sana folder (skips the download)
     repo_id: str = sx.DEFAULT_REPO               # the experiments repo (public): one folder per experiment
+    data_repo_id: str | None = None              # a dataset repo keeping the drawn training sets (training_sets.py)
     # data
     source: str = "mood"                         # single runs: 'mood' (the model renders its own set) | 'folder'
     dataset_dir: str | None = None               # source='folder': images + .txt captions
@@ -493,6 +495,54 @@ class SanaRunner(_RunnerMixin):
         """Images of a training set not rendered yet."""
         img_dir = Path(self._need("data_root")) / "datasets" / f"{flavor}_{seed_base}" / "images"
         return sum(not (img_dir / f"{it['name']}.png").is_file() for it in self._items(flavor, seed_base))
+
+    # ---- training sets kept on the Hub (training_sets.py): pulled by a fresh runtime, pushed once drawn -----
+    def _set_root(self, flavor: str, seed_base: int) -> Path:
+        return Path(self._need("data_root")) / "datasets" / f"{flavor}_{seed_base}"
+
+    def _pull_set(self, flavor: str, seed_base: int) -> bool:
+        """A set this runtime lacks, downloaded from cfg.data_repo_id when one was drawn with exactly these settings
+        and items (anything else, or any failure, falls back to drawing it)."""
+        repo = getattr(self.cfg, "data_repo_id", None)
+        if not repo or not self._missing(flavor, seed_base):
+            return False
+        root, t0 = self._set_root(flavor, seed_base), time.time()
+        try:
+            ok = _ts.download_set(self.state.get("hf_token"), repo, root, _ts.render_spec_of(self),
+                                  self._items(flavor, seed_base))
+        except Exception as e:  # noqa: BLE001
+            print(f"[{self.TAG}] training set {root.name}: download failed ({type(e).__name__}: {str(e)[:120]}); "
+                  "drawing it", flush=True)
+            return False
+        if ok:
+            print(f"[{self.TAG}] training set {root.name}: downloaded from {repo} in {_hms(time.time() - t0)} "
+                  "(drawn earlier with the same settings)", flush=True)
+        return ok
+
+    def _push_set(self, flavor: str, seed_base: int) -> "str | None":
+        """A complete set the data repo lacks, uploaded so later runtimes reuse it; a failure only warns. Returns
+        the set's folder in the data repo when it is there."""
+        repo = getattr(self.cfg, "data_repo_id", None)
+        if not repo or self._missing(flavor, seed_base):
+            return None
+        root, t0 = self._set_root(flavor, seed_base), time.time()
+        items, render = self._items(flavor, seed_base), _ts.render_spec_of(self)
+        try:
+            folder = _ts.upload_set(self.state.get("hf_token"), repo, root, render, items)
+        except Exception as e:  # noqa: BLE001
+            print(f"[{self.TAG}] training set {root.name}: upload failed ({type(e).__name__}: {str(e)[:120]}); it stays "
+                  "on this runtime only", flush=True)
+            return None
+        if folder:
+            print(f"[{self.TAG}] training set {root.name}: saved to {repo} for later runtimes "
+                  f"({_hms(time.time() - t0)})", flush=True)
+        return _ts.hub_folder(root.name, render, items)
+
+    def save_training_sets(self) -> dict:
+        """Every complete training set on this runtime, uploaded to cfg.data_repo_id unless it is there already."""
+        if not getattr(self.cfg, "data_repo_id", None):
+            raise RuntimeError("no data repo configured (cfg.data_repo_id)")
+        return _ts.upload_local_sets(self, self.cfg.data_repo_id)
 
     def _judge(self):
         if self._judge_fns is None:
@@ -729,6 +779,8 @@ class SanaRunner(_RunnerMixin):
             return metas
         t0 = time.time()
         keys = list(dict.fromkeys((a.flavor, a.seed_base) for a in todo))   # every training set, stock, first
+        for k in keys:                                                        # a fresh runtime: reuse the drawn sets
+            self._pull_set(*k)
         need = sum(self._missing(*k) for k in keys)
         saves = len(range(self.cfg.save_every_n_epochs, self.cfg.epochs + 1, self.cfg.save_every_n_epochs))
         print(f"[{self.TAG}] the job: {need} training images to render ({len(keys)} sets), then {len(todo)} trainings "
@@ -736,6 +788,7 @@ class SanaRunner(_RunnerMixin):
         eta = _Eta(self.TAG, "training sets", need) if need else None
         for key in keys:
             self._render_dataset(*key, eta=eta)
+            self._push_set(*key)                                              # kept for later runtimes
         self._baseline()                                                      # the shared no-LoRA cells
         print(f"[{self.TAG}] training sets + baseline ready in {_hms(time.time() - t0)}", flush=True)
         arms_eta = _Eta(self.TAG, "sequence", len(todo), unit="arms done", every=0)
@@ -879,6 +932,14 @@ class SanaRunner(_RunnerMixin):
         for d in (out_dir, cfg_dir, log.parent, arm / "eval"):
             d.mkdir(parents=True, exist_ok=True)
         recipe = self._recipe(spec.lr)
+        data_repo = getattr(self.cfg, "data_repo_id", None)
+        if data_repo:                                   # the exact training images, when the data repo holds them
+            try:
+                folder = _ts.hub_folder(spec.data_key, _ts.render_spec_of(self), self._items(spec.flavor, spec.seed_base))
+                if _ts.on_hub(self.state.get("hf_token"), data_repo, folder):
+                    recipe["training images"] = f"https://huggingface.co/datasets/{data_repo}/tree/main/{folder}"
+            except Exception:  # noqa: BLE001 - a link is optional
+                pass
         lora_toml, _ = self._render_config(str(img_dir), str(out_dir), str(cfg_dir), lr=spec.lr, held_out_previews=True)
         print(f"\n[{self.TAG}] ===== {spec.id}: {spec.title} =====", flush=True)
         start = {f"{base}/meta.json": sx.dumps(sx.arm_meta(spec, "running", recipe=recipe)),

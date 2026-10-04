@@ -86,5 +86,8 @@ then done / total, time spent and time left.
   evaluation at 30 steps, guidance 4.5, shift 3.
 - **Rendering** in the notebook process with the fork's own Anima code; LoRAs (ComfyUI format) applied by
   forward hooks. The first arm checks the renderer against the trainer's preview images.
+- **Training sets** are kept in
+  [AbstractPhil/geolip-beatrix-anima-data](https://huggingface.co/datasets/AbstractPhil/geolip-beatrix-anima-data):
+  uploaded once drawn, downloaded by a fresh runtime when drawn with the same settings (`training_sets.py`).
 
 Anima's weights are under the CircleStone Labs Non-Commercial License; LoRAs trained on it share it.

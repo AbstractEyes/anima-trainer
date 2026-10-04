@@ -198,7 +198,8 @@ class FakePipe:
 @pytest.fixture
 def runner(tmp_path, monkeypatch):
     from PIL import Image
-    s = ar.AnimaRunner(data_root=str(tmp_path / "data"), repo_root=str(tmp_path / "repo"), seeds_per_subject=2)
+    s = ar.AnimaRunner(data_root=str(tmp_path / "data"), repo_root=str(tmp_path / "repo"), seeds_per_subject=2,
+                       data_repo_id=None)          # offline; the training-set test points it at a fake data repo
     models = tmp_path / "models"
     models.mkdir()
     paths = {k: str(models / n) for k, n in (("transformer_path", "anima-base-v1.0.safetensors"),
@@ -448,6 +449,27 @@ def test_attribute_screen_end_to_end(runner, monkeypatch):
     assert len(json.loads(repo.files_[f"{base}/result.json"])["cells"]) == 16
     again = s.run_attribute_screen()                           # done already: skipped
     assert again["status"] == "done" and sum(c.startswith(ax.ATTR_TEST_ID) for c in repo.commits) == 2
+
+
+def test_training_sets_are_kept_and_reused_by_a_fresh_runtime(runner, fake_hub, tmp_path, capsys):
+    s, repo, pipe, calls = runner
+    s.cfg.data_repo_id = "AbstractPhil/geolip-beatrix-anima-data"
+    s.run_sequence(["e002_lora_mood_up"])
+    out = capsys.readouterr().out
+    assert "rendering 48 up training images" in out and "saved to AbstractPhil/geolip-beatrix-anima-data" in out
+    sets = [p.name for p in (fake_hub.d / "sets").iterdir()]
+    assert len(sets) == 1 and sets[0].startswith("up_1000-") and len(fake_hub.commits) == 1
+    assert repo.metas()["e002_lora_mood_up"]["recipe"]["training images"].endswith(f"/tree/main/sets/{sets[0]}")
+    # a fresh runtime: an empty data folder, the arm not done yet -> the set comes back from the data repo, undrawn
+    s.state["data_root"] = str(tmp_path / "data2")
+    for k in [k for k in repo.files_ if k.startswith("experiments/e002_lora_mood_up/")]:
+        del repo.files_[k]
+    s.run_sequence(["e002_lora_mood_up"])
+    out = capsys.readouterr().out
+    assert "training set up_1000: downloaded from AbstractPhil/geolip-beatrix-anima-data" in out
+    assert "rendering 48 up training images" not in out and len(fake_hub.commits) == 1
+    assert len(list((tmp_path / "data2" / "datasets" / "up_1000" / "images").glob("*.png"))) == 48
+    assert repo.metas()["e002_lora_mood_up"]["status"] == "done"
 
 
 def test_config_validation_refuses_master_weights_without_plain_adam():
