@@ -526,7 +526,7 @@ the caption's T5 tokens, the conditional branch only); `generate(source_token=)`
 caption's Qwen3 tokens (`append_source_token`, mask opened; Qwen3 pads on the right); `query_states()` /
 `word_states()` give the query embeddings and the mean Qwen3 state at given words (tokenizer offsets). Forms q,
 pair_dir, pair_state, pair_uniform (the control) at alpha -2..+2; `query_dial_reads()` = slopes + the downbeat gates.
-CONNECTORS (`run_beatrix_connectors()` = e013-e019, `anima_experiments.CONNECTOR_ARMS`): push = f @ W.T + b at the
+CONNECTORS (`run_beatrix_connectors()` = e013-e025, `anima_experiments.CONNECTOR_ARMS`): push = f @ W.T + b at the
 `context` site (every caption token after the adapter), W/b zero-init fp32, the only trained tensors; f = Beatrix's
 phrase features (`CONNECTOR_FEATURES` in the data repo: `trained` / `random` [74, 4096] + the phrase table in the
 metadata) or a one-hot class (e015). Training in the kernel: `AnimaPipe.train_loss` = the fork's `prepare_inputs`
@@ -548,6 +548,11 @@ the rule, every group the right way): the class contrast moved (|W (z_up - z_dow
 (`ConnectorArm.axis`): `connector_axis()` reduces f to [a, n] = (f - mid) @ V.T with mid = the midpoint of the up
 and down training centres, V = [ax / (|ax|^2 / 2), nax / |nax|^2], ax = up - down, nax = neutral - mid (the
 training centres land at a = +-1 and n = 1; scale = ones; mu / V / scale ship like the whitening's).
+LESSON (e018): the cheerful side moved (unseen phrases too), the gloomy side did not: one slider value through a
+linear map pushes gloomy phrases along the mirror of the cheerful push, and the image model's downbeat direction is not
+the upbeat one negated (e015's free vectors are nearly orthogonal). e023-e025 (`ConnectorArm.sides`, `slider_map()`):
+[a, n] mapped before W, relu [max(a,0), max(-a,0), n] (e023 Beatrix, e024 untrained), exp [e^a, e^-a, n] (e025, e023's
+seed); contrast_l1 is taken on the mapped rows; the weights' metadata 'input map' names the map.
 `_connector_inputs()` builds every arm's input rows.
 
 ### Training previews — `SamplesConfig` → `[samples]`

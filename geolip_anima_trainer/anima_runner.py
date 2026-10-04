@@ -10,7 +10,7 @@ handful of `a.<step>()` calls and all logic lives here.
     a.run_flavor_test()        # e001: the stock model (mood words, a mood dial at two conditioning sites, the norms)
     a.run_attribute_screen()   # e012: attribute words, attribute sliders after the adapter, their cross-talk
     a.run_sequence()           # e002..: the LoRA arms (anima_experiments.SEQUENCE)
-    a.run_beatrix_connectors() # e013-e015: a push from Beatrix's phrase features (+ an untrained trunk, a free vector)
+    a.run_beatrix_connectors() # e013-e025: a push from Beatrix's phrase features (+ an untrained trunk, a free vector)
 
 Rendering. Every image (the training sets, the no-LoRA baseline, the evaluations, e001) is made in this process by
 AnimaPipe, which loads the fork's own Anima model code (models/cosmos_predict2.py: Qwen3 0.6B -> the LLM adapter ->
@@ -1212,6 +1212,8 @@ class AnimaRunner(_sr.SanaRunner):
             proj = (connector_axis(F, pool) if arm.axis else
                     connector_whitening(F, [i for c in classes for i in pool[c]], arm.whiten_k))
             Z = (F - proj["mu"]) @ proj["V"].T / proj["scale"]
+            if arm.axis:
+                Z = slider_map(Z, arm.sides)
             out.update(inputs=Z, projection=proj,
                        contrast_l1=float((Z[pool["up"]].mean(0) - Z[pool["down"]].mean(0)).abs().sum()))
         return out
@@ -1232,6 +1234,11 @@ class AnimaRunner(_sr.SanaRunner):
             rec["input"] += (", reduced to a slider value: its position on the axis from the gloomy to the cheerful training "
                              "phrases' centres (at -1 and +1) and on the axis toward the neutral training phrases' centre (2 "
                              "numbers; the axes fit on the training phrases only)")
+            if arm.sides != "one":
+                rec["input"] += (f", then mapped to {ax.SLIDER_MAPS[arm.sides]} with a the slider value and n the neutral "
+                                 "reading (3 numbers: " + {"relu": "each side of the slider has its own push direction "
+                                 "and is zero on the other side", "exp": "both sides are on for every phrase and the "
+                                 "slider value tilts the balance"}[arm.sides] + ")")
         elif ci["projection"] is not None:
             rec["input"] += (f", projected on the top {fan_in} principal components of the training phrases' features and "
                              "scaled to unit variance per component (fit on the training phrases only)")
@@ -1374,6 +1381,8 @@ class AnimaRunner(_sr.SanaRunner):
         t0 = time.time()
         proj = ci["projection"]
         how = ("((f - mu) @ V.T / scale) @ W.T + b" if proj is not None else "f @ W.T + b")
+        if arm.axis and arm.sides != "one":
+            how = f"phi((f - mu) @ V.T / scale) @ W.T + b, with phi([a, n]) = {ax.SLIDER_MAPS[arm.sides]}"
         try:
             tr = self._connector_train(arm, ci, bank)
             files: dict = {}
@@ -1384,6 +1393,7 @@ class AnimaRunner(_sr.SanaRunner):
                     tensors.update({k: proj[k].contiguous() for k in ("mu", "V", "scale")})
                 save_file(tensors, str(p),
                           metadata={"experiment": arm.id, "input": arm.source, "step": str(step),
+                                    "input map": arm.sides if arm.axis else "none",
                                     "push": f"{how}, added to every caption token of the adapter's output, on both "
                                             "guidance branches"})
                 files[f"{bdir}/connector/{p.name}"] = p
@@ -1478,6 +1488,21 @@ def connector_axis(F, pool: dict) -> dict:
     ax, nax = c["up"] - c["down"], c["neutral"] - mid
     V = torch.stack([ax / (ax @ ax / 2), nax / (nax @ nax)])
     return {"mu": mid.float(), "V": V.float().contiguous(), "scale": torch.ones(2)}
+
+
+def slider_map(Z, sides: str = "one"):
+    """The slider's input map on its rows [a, n]: 'one' leaves them; 'relu' = [max(a, 0), max(-a, 0), n] (each side of
+    the reading its own push direction); 'exp' = [e^a, e^-a, n] (both sides on for every phrase, the sign tilting the
+    balance)."""
+    import torch
+    if sides == "one":
+        return Z
+    a, n = Z[:, :1], Z[:, 1:]
+    if sides == "relu":
+        return torch.cat([a.clamp(min=0), (-a).clamp(min=0), n], 1)
+    if sides == "exp":
+        return torch.cat([a.exp(), (-a).exp(), n], 1)
+    raise ValueError(f"unknown slider map {sides!r}")
 
 
 def _wd_tagger(repo_id: str, tags: list[str]):

@@ -719,6 +719,7 @@ class ConnectorArm:
     changed: str = "none (the reference connector)"
     whiten_k: "int | None" = None    # the features projected on the top k whitened components of the training phrases
     axis: bool = False               # the features reduced to a slider value on the training phrases' mood axis (+ neutral)
+    sides: str = "one"               # the slider's input map: 'one' [a, n]; 'relu' [max(a,0), max(-a,0), n]; 'exp' [e^a, e^-a, n]
 
 
 CONNECTOR_ARMS = (
@@ -770,10 +771,32 @@ CONNECTOR_ARMS = (
                  question="Does e018's held-out effect come from what Beatrix learned, or would any fixed random features of "
                           "the phrase text place unseen phrases on the right side? (A control that must fail on the held-out "
                           "phrases.)", axis=True),
+    # e018 moved the image for cheerful phrases (unseen ones too) and not for gloomy ones: a linear map of one slider value
+    # pushes gloomy phrases along the mirror of the cheerful push, while the image model's downbeat direction is not its
+    # upbeat direction negated (the free vectors of e015 are nearly orthogonal). The two-sided slider gives each side of
+    # her reading its own direction; the smooth form keeps both sides on for every phrase.
+    ConnectorArm("e023_beatrix_mood_slider_two_sided", "Beatrix's reading of a phrase's mood as a two-sided slider", "trained",
+                 23, changed="e018's slider value split into its cheerful and gloomy sides, [max(a, 0), max(-a, 0), n], so "
+                             "each side gets its own push direction",
+                 question="With each side of her slider value free to push its own direction, does Beatrix's reading of a "
+                          "phrase's mood steer the image both ways, for the phrases it trained on and for mood phrases it "
+                          "never saw?", axis=True, sides="relu"),
+    ConnectorArm("e024_beatrix_random_trunk_slider_two_sided",
+                 "Control: the same two-sided slider on an untrained Beatrix of the same shape", "random", 24,
+                 changed="e023's two-sided slider on the features of a randomly initialised trunk of the same shape (seed 0)",
+                 question="Does e023's held-out effect come from what Beatrix learned? (A control that must fail on the "
+                          "held-out phrases.)", axis=True, sides="relu"),
+    ConnectorArm("e025_beatrix_mood_slider_smooth", "Beatrix's reading of a phrase's mood as a smooth two-sided slider",
+                 "trained", 23,
+                 changed="e018's slider value through [e^a, e^-a, n]: both sides on for every phrase, the sign tilting the "
+                         "balance (no dead zone); the same training randomness as e023",
+                 question="Does a two-sided slider without a dead zone steer the unseen gloomy phrases further than the "
+                          "split one (e023)?", axis=True, sides="exp"),
 )
 CONNECTOR_IDS = [a.id for a in CONNECTOR_ARMS]
 CONNECTOR_PAIRS = ((CONNECTOR_IDS[0], CONNECTOR_IDS[1]), (CONNECTOR_IDS[3], CONNECTOR_IDS[4]),
-                   (CONNECTOR_IDS[5], CONNECTOR_IDS[6]))                                            # (Beatrix, untrained)
+                   (CONNECTOR_IDS[5], CONNECTOR_IDS[6]), (CONNECTOR_IDS[7], CONNECTOR_IDS[8]))      # (Beatrix, untrained)
+SLIDER_MAPS = {"one": "[a, n]", "relu": "[max(a, 0), max(-a, 0), n]", "exp": "[e^a, e^-a, n]"}
 CONNECTOR_FREE = CONNECTOR_IDS[2]
 CONNECTOR_FEATURES = "beatrix/mood_phrases_mini-beatrix-3_step212000.safetensors"   # in the data repo
 CONNECTOR_CHECKPOINT = "AbstractPhil/alephllm-mini-beatrix-training, mini-beatrix-3 at step 212,000"
@@ -886,6 +909,10 @@ def connector_cross_reads(reads: dict) -> dict:
     if free and free.get("trained_effect"):
         out["of_free_vector"] = {a: r["trained_effect"] / free["trained_effect"] for a, r in reads.items()
                                  if a != CONNECTOR_FREE}
+    hers = [a.id for a in CONNECTOR_ARMS if a.axis and a.source == "trained" and "heldout_down" in
+            (reads.get(a.id) or {}).get("groups", {})]
+    if len(hers) > 1:                                  # descriptive: her slider forms on the unseen gloomy phrases
+        out["unseen_gloomy"] = {a: reads[a]["groups"]["heldout_down"]["mean"] for a in hers}
     return out
 
 
@@ -938,8 +965,23 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
               "toward the centre of the neutral training phrases (that centre at 1). The axes ship with the weights. The "
               "image model receives her reading of the phrase's mood and nothing phrase-specific: in e016 each phrase's own "
               "part of the push outweighed the mood contrast. The map's learning rate follows the free vector's pace (1e-3 "
-              "x 2 / the L1 size of the cheerful-minus-gloomy class-mean difference of the inputs, about 2 here)."]
+              "x 2 / the L1 size of the cheerful-minus-gloomy class-mean difference of the inputs, "
+              + ("about 2 here)." if arm.sides != "exp" else
+                 "larger here, as the exponentials stretch both sides; the recipe gives its value).")]
              if arm.axis else []),
+           *([f"- **Two-sided**: the map reads {SLIDER_MAPS[arm.sides]} instead of [a, n]. With one slider value, a "
+              "linear map pushes gloomy phrases along the exact mirror of the cheerful push, but the image model's "
+              "downbeat direction is not its upbeat direction negated (the free vectors of e015 are nearly orthogonal), "
+              "and e018 moved only the cheerful side. "
+              + ("Splitting the value by its sign gives each side its own direction; each side trains only on the "
+                 "phrases on its side (checked before the run: "
+                 + ("her gloomy training phrases sit on the negative side, 90% of them beyond -0.25, and all four unseen "
+                    "gloomy phrases do)." if arm.source == "trained" else
+                    "the untrained trunk places 80% of its gloomy training phrases beyond -0.25 and 2 of its 4 unseen "
+                    "gloomy phrases on the negative side).") if arm.sides == "relu" else
+                 "The exponentials keep both sides on for every phrase, the sign tilting the balance (no dead zone; at a "
+                 "= 0 both sides contribute equally).")]
+             if arm.axis and arm.sides != "one" else []),
            "- **Training**: Anima's own flow-matching objective, computed by the trainer's code (logit-normal "
            "timesteps, the noisy latent (1 - t) x0 + t noise, mean squared error to noise - x0), on the LoRA "
            "experiments' first-draw training images: 192 upbeat, 192 downbeat and 192 neutral renders of the stock "
@@ -1001,6 +1043,9 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
         if cross.get("of_free_vector"):
             out += ["", "Trained effect as a fraction of the free vector's: " + ", ".join(
                 f"{a.split('_')[0]} {v:.2f}" for a, v in cross["of_free_vector"].items()) + "."]
+        if cross.get("unseen_gloomy") and arm.axis:
+            out += ["", "Beatrix's slider forms on the unseen gloomy phrases (mean effect): " + ", ".join(
+                f"{a.split('_')[0]} {v:+.3f}" for a, v in cross["unseen_gloomy"].items()) + "."]
         lora = r.get("lora_baselines") or {}
         if lora:
             out += ["", "For scale, the mood LoRAs on the same judge and held-out scenes (their final epoch at scale 1, "
@@ -1019,7 +1064,11 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
     else:
         out += ["## Result", "Running.", ""]
     out += ["## Files",
-            ("- `connector/stepNNNN.safetensors`: W and b after every pass over the training images, with the input "
+            (f"- `connector/stepNNNN.safetensors`: W and b after every pass over the training images, with the input "
+             f"projection mu, V, scale (float32; the push for features f is phi((f - mu) @ V.T / scale) @ W.T + b, "
+             f"phi([a, n]) = {SLIDER_MAPS[arm.sides]})."
+             if arm.axis and arm.sides != "one" else
+             "- `connector/stepNNNN.safetensors`: W and b after every pass over the training images, with the input "
              "projection mu, V, scale (float32; the push for features f is ((f - mu) @ V.T / scale) @ W.T + b)."
              if arm.whiten_k or arm.axis else
              "- `connector/stepNNNN.safetensors`: W and b after every pass over the training images (float32; the push "

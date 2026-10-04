@@ -487,13 +487,18 @@ def test_connector_registry_and_rules():
     assert ax.CONNECTOR_IDS == ["e013_beatrix_mood_connector", "e014_beatrix_random_trunk_connector",
                                 "e015_free_vector_connector", "e016_beatrix_mood_connector_whitened",
                                 "e017_beatrix_random_trunk_connector_whitened", "e018_beatrix_mood_slider",
-                                "e019_beatrix_random_trunk_slider"]
-    assert [a.source for a in ax.CONNECTOR_ARMS] == ["trained", "random", "onehot", "trained", "random", "trained", "random"]
-    assert [a.whiten_k for a in ax.CONNECTOR_ARMS] == [None, None, None, 16, 16, None, None]
-    assert [a.axis for a in ax.CONNECTOR_ARMS] == [False] * 5 + [True] * 2
+                                "e019_beatrix_random_trunk_slider", "e023_beatrix_mood_slider_two_sided",
+                                "e024_beatrix_random_trunk_slider_two_sided", "e025_beatrix_mood_slider_smooth"]
+    assert [a.source for a in ax.CONNECTOR_ARMS] == ["trained", "random", "onehot", "trained", "random", "trained", "random",
+                                                     "trained", "random", "trained"]
+    assert [a.whiten_k for a in ax.CONNECTOR_ARMS] == [None, None, None, 16, 16] + [None] * 5
+    assert [a.axis for a in ax.CONNECTOR_ARMS] == [False] * 5 + [True] * 5
+    assert [a.sides for a in ax.CONNECTOR_ARMS] == ["one"] * 7 + ["relu", "relu", "exp"]
     ids = ax.CONNECTOR_IDS
-    assert ax.CONNECTOR_PAIRS == ((ids[0], ids[1]), (ids[3], ids[4]), (ids[5], ids[6]))
-    assert len({a.seed for a in ax.CONNECTOR_ARMS}) == 7 and not set(ax.CONNECTOR_IDS) & set(ax.SEQUENCE_IDS)
+    assert ax.CONNECTOR_PAIRS == ((ids[0], ids[1]), (ids[3], ids[4]), (ids[5], ids[6]), (ids[7], ids[8]))
+    seeds = [a.seed for a in ax.CONNECTOR_ARMS]
+    assert len(set(seeds[:9])) == 9 and seeds[9] == seeds[7]      # e025 = e023's training randomness, another input map
+    assert not set(ax.CONNECTOR_IDS) & set(ax.SEQUENCE_IDS)
     assert ax.CONNECTOR_STEPS * ax.CONNECTOR_BATCH == 5 * 576 and ax.CONNECTOR_SAVE_EVERY * ax.CONNECTOR_BATCH == 576
     assert ax.connector_lrs("trained", 4096) == {"W": 1e-3 / 4096, "b": 1e-3}          # the fan-in rule (e013, e014)
     assert ax.connector_lrs("onehot", 3) == {"W": 1e-3, "b": 1e-3}
@@ -543,6 +548,13 @@ def test_connector_registry_and_rules():
     assert "top 16 principal components" in whitened and "(f - mu) @ V.T / scale" in whitened
     slider = ax.render_connector_readme(ax.CONNECTOR_ARMS[5], {"status": "running"}, {"input": "x"}, PHRASES)
     assert "a slider value" in slider and "(f - mu) @ V.T / scale" in slider and "principal components" not in slider
+    assert "Two-sided" not in slider and "phi(" not in slider
+    two = ax.render_connector_readme(ax.CONNECTOR_ARMS[7], {"status": "running"}, {"input": "x"}, PHRASES)
+    assert "**Two-sided**" in two and "phi([a, n]) = [max(a, 0), max(-a, 0), n]" in two and "all four unseen" in two
+    assert "2 of its 4 unseen" in ax.render_connector_readme(ax.CONNECTOR_ARMS[8], {"status": "running"}, {"input": "x"},
+                                                             PHRASES)
+    smooth = ax.render_connector_readme(ax.CONNECTOR_ARMS[9], {"status": "running"}, {"input": "x"}, PHRASES)
+    assert "phi([a, n]) = [e^a, e^-a, n]" in smooth and "no dead zone" in smooth and "about 2 here" not in smooth
     import re
     for word in (r"S-1", r"\bPhil\b", r"docket", r"canon/"):           # the repo owner's handle in a repo id is fine
         assert not re.search(word, readme), word
@@ -669,19 +681,23 @@ def test_beatrix_connectors_end_to_end(runner, monkeypatch):
     for c in ax.CONNECTOR_CLASSES:                                    # the three first-draw training sets were drawn
         assert len(list((Path(s.state["data_root"]) / "datasets" / f"{c}_1000" / "images").glob("*.png"))) == 48
     m = repo.metas()
-    r13, r14, r15, r16, r17, r18, r19 = (m[k]["result"]["reads"] for k in ax.CONNECTOR_IDS)
-    for r in (r13, r16, r18):
+    r13, r14, r15, r16, r17, r18, r19, r23, r24, r25 = (m[k]["result"]["reads"] for k in ax.CONNECTOR_IDS)
+    for r in (r13, r16, r18, r23, r25):
         assert r["TRAINED"] == "TRAINED WORDS MOVE IT" and r["HELD_OUT"] == "HELD-OUT WORDS CARRY IT"
         assert r["NEUTRAL"] == "NEUTRAL QUIET"
-    for r in (r14, r17, r19):
+    for r in (r14, r17, r19, r24):
         assert r["heldout_effect"] == pytest.approx(0.0, abs=1e-6) and r["HELD_OUT"] != "HELD-OUT WORDS CARRY IT"
     assert r15["TRAINED"] == "THE CLASS VECTORS MOVE IT" and r15["NEUTRAL"] == "NEUTRAL QUIET" and "HELD_OUT" not in r15
     cross = m[ax.CONNECTOR_IDS[1]]["result"]["cross"]
-    assert [c["OUTCOME"] for c in cross["controls"].values()] == ["THE CONTROL FAILS AS IT SHOULD"] * 3
+    assert [c["OUTCOME"] for c in cross["controls"].values()] == ["THE CONTROL FAILS AS IT SHOULD"] * 4
     assert m[ax.CONNECTOR_IDS[1]]["summary"].endswith("against e013: THE CONTROL FAILS AS IT SHOULD")
     assert m[ax.CONNECTOR_IDS[4]]["summary"].endswith("against e016: THE CONTROL FAILS AS IT SHOULD")
     assert m[ax.CONNECTOR_IDS[6]]["summary"].endswith("against e018: THE CONTROL FAILS AS IT SHOULD")
-    assert set(cross["of_free_vector"]) == {ax.CONNECTOR_IDS[i] for i in (0, 1, 3, 4, 5, 6)}
+    assert m[ax.CONNECTOR_IDS[8]]["summary"].endswith("against e023: THE CONTROL FAILS AS IT SHOULD")
+    assert set(cross["of_free_vector"]) == {ax.CONNECTOR_IDS[i] for i in (0, 1, 3, 4, 5, 6, 7, 8, 9)}
+    assert set(cross["unseen_gloomy"]) == {ax.CONNECTOR_IDS[i] for i in (5, 7, 9)}
+    assert all(v < 0 for v in cross["unseen_gloomy"].values())
+    assert "slider forms on the unseen gloomy" in repo.files_[f"experiments/{ax.CONNECTOR_IDS[7]}/README.md"].decode()
     assert m[ax.CONNECTOR_IDS[0]]["result"]["learning_rates"] == {"W": 0.05 / 16, "b": 0.05}
     assert m[ax.CONNECTOR_IDS[2]]["result"]["learning_rates"] == {"W": 0.05, "b": 0.05}
     lr16 = m[ax.CONNECTOR_IDS[3]]["result"]["learning_rates"]
@@ -699,6 +715,17 @@ def test_beatrix_connectors_end_to_end(runner, monkeypatch):
     assert w18["V"].shape == (2, 16) and w18["W"].shape == (8, 2)
     push18 = ((f - w18["mu"]) @ w18["V"].T / w18["scale"]) @ w18["W"].T + w18["b"]
     assert any(torch.allclose(push18, p, atol=1e-5) for p in pushes)
+    for i, sides in ((7, "relu"), (9, "exp")):                          # the two-sided sliders from the shipped weights
+        raw = repo.files_[f"experiments/{ax.CONNECTOR_IDS[i]}/connector/step0072.safetensors"]
+        head = json.loads(raw[8:8 + int.from_bytes(raw[:8], "little")])["__metadata__"]
+        assert head["input map"] == sides and head["push"].startswith("phi((f - mu) @ V.T / scale) @ W.T + b")
+        w = load(raw)
+        assert w["V"].shape == (2, 16) and w["W"].shape == (8, 3)
+        push = ar.slider_map(((f - w["mu"]) @ w["V"].T / w["scale"])[None], sides)[0] @ w["W"].T + w["b"]
+        assert any(torch.allclose(push, p, atol=1e-5) for p in pushes)
+    lr23, lr25 = (m[ax.CONNECTOR_IDS[i]]["result"]["learning_rates"] for i in (7, 9))
+    assert lr25["W"] < lr23["W"] and lr23["b"] == lr25["b"] == 0.05      # the exponentials stretch the class contrast
+    assert "[max(a, 0), max(-a, 0), n]" in m[ax.CONNECTOR_IDS[7]]["recipe"]["input"]
     for k in ax.CONNECTOR_IDS:
         base = f"experiments/{k}"
         assert m[k]["kind"] == "beatrix_connector" and m[k]["status"] == "done"
@@ -750,6 +777,17 @@ def test_connector_axis_puts_the_training_centres_on_the_slider_marks():
     held[9:] += 100.0                                                          # rows outside the pool never move the fit
     q = ar.connector_axis(held, pool)
     assert torch.allclose(q["mu"], p["mu"]) and torch.allclose(q["V"], p["V"])
+
+
+def test_slider_map_splits_or_smooths_the_slider_value():
+    Z = torch.tensor([[1.5, 0.2], [-0.5, 0.9], [0.0, -1.0]])
+    assert torch.equal(ar.slider_map(Z, "one"), Z)
+    assert torch.equal(ar.slider_map(Z, "relu"), torch.tensor([[1.5, 0.0, 0.2], [0.0, 0.5, 0.9], [0.0, 0.0, -1.0]]))
+    e = ar.slider_map(Z, "exp")
+    assert torch.allclose(e[:, 0], Z[:, 0].exp()) and torch.allclose(e[:, 0] * e[:, 1], torch.ones(3))
+    assert torch.equal(e[:, 2], Z[:, 1])                                       # the neutral reading passes through
+    with pytest.raises(ValueError, match="unknown slider map"):
+        ar.slider_map(Z, "sigmoid")
 
 
 def test_route_reads_split_the_words_between_the_two_readings():
