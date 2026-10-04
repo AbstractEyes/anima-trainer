@@ -922,18 +922,50 @@ class AnimaRunner(_sr.SanaRunner):
                   f"{np.mean(self._cbase['scores']):+.3f}", flush=True)
         return self._cbase
 
-    def _connector_recipe(self, arm: "ax.ConnectorArm", fan_in: int) -> dict:
-        lrs = ax.connector_lrs(arm.source, fan_in)
+    def _connector_inputs(self, arm: "ax.ConnectorArm", feats: dict, phrases: list) -> dict:
+        """The arm's input rows (CPU float32) and, per class, the rows of its training inputs: the one-hot class (e015),
+        the phrase features as they are (e013, e014) or projected on the top whiten_k whitened components of the
+        training phrases (e016, e017; fit on the training phrases only), with that projection and the L1 size of the
+        up-minus-down class-mean difference of the training inputs (it sets W's learning rate)."""
+        import torch
+        classes = ax.CONNECTOR_CLASSES
+        if arm.source == "onehot":
+            return {"inputs": torch.eye(len(classes)), "pool": {c: [i] for i, c in enumerate(classes)},
+                    "row_of": {c: i for i, c in enumerate(classes)}, "projection": None, "contrast_l1": None}
+        F = feats[arm.source].float()
+        pool = {c: [i for i, p in enumerate(phrases) if p["class"] == c and p["split"] == "train"] for c in classes}
+        if not all(pool.values()):
+            raise ValueError(f"a class without training phrases: {({c: len(v) for c, v in pool.items()})}")
+        out = {"inputs": F, "pool": pool, "row_of": {p["text"]: i for i, p in enumerate(phrases)}, "projection": None,
+               "contrast_l1": None}
+        if arm.whiten_k:
+            proj = connector_whitening(F, [i for c in classes for i in pool[c]], arm.whiten_k)
+            Z = (F - proj["mu"]) @ proj["V"].T / proj["scale"]
+            out.update(inputs=Z, projection=proj,
+                       contrast_l1=float((Z[pool["up"]].mean(0) - Z[pool["down"]].mean(0)).abs().sum()))
+        return out
+
+    def _connector_recipe(self, arm: "ax.ConnectorArm", ci: dict) -> dict:
+        fan_in = int(ci["inputs"].shape[1])
+        lrs = ax.connector_lrs(arm.source, fan_in, contrast_l1=ci["contrast_l1"])
         data_repo, d = self.cfg.data_repo_id or _ts.DATA_REPO, ax.CONNECTOR_DRAW
+        n_feat = None if arm.source == "onehot" else int(ci["projection"]["V"].shape[1] if ci["projection"] is not None
+                                                         else fan_in)
         rec = {"image model": "Anima-Base v1.0, frozen (no LoRA)",
-               "input": {"trained": f"Beatrix ({ax.CONNECTOR_CHECKPOINT}): her features for the phrase ({fan_in} "
+               "input": {"trained": f"Beatrix ({ax.CONNECTOR_CHECKPOINT}): her features for the phrase ({n_feat} "
                                     "numbers)",
                          "random": f"an untrained Beatrix of the same shape (random initialisation, seed 0): its features "
-                                   f"for the phrase ({fan_in} numbers), standardized the same way",
+                                   f"for the phrase ({n_feat} numbers), standardized the same way",
                          "onehot": "the mood class as a one-hot vector (3 numbers); no encoder"}[arm.source]}
+        if ci["projection"] is not None:
+            rec["input"] += (f", projected on the top {fan_in} principal components of the training phrases' features and "
+                             "scaled to unit variance per component (fit on the training phrases only)")
         if arm.source != "onehot":
             rec["features file"] = f"https://huggingface.co/datasets/{data_repo}/blob/main/{ax.CONNECTOR_FEATURES}"
         lr = (f"{lrs['W']:g} for W and b" if arm.source == "onehot" else
+              f"{lrs['W']:.3g} for W ({lrs['b']:g} x 2 / {ci['contrast_l1']:.2f}, the L1 size of the training inputs' "
+              f"cheerful-minus-gloomy class-mean difference: the free vector's pace) and {lrs['b']:g} for b"
+              if ci["contrast_l1"] else
               f"{lrs['W']:.3g} for W ({lrs['b']:g} divided by its fan-in, {fan_in}) and {lrs['b']:g} for b")
         rec.update({
             "push": "W f + b (1,024 numbers; W and b start at zero; float32), added to every caption token of the "
@@ -963,30 +995,23 @@ class AnimaRunner(_sr.SanaRunner):
             pass
         return rec
 
-    def _connector_train(self, arm: "ax.ConnectorArm", feats: dict, phrases: list, bank: dict) -> dict:
-        """W and b trained by Anima's objective, everything else frozen: plain Adam, no weight decay, the fan-in
-        rule's learning rates; each step = CONNECTOR_BATCH training images in a shuffled order (a fresh order every
-        pass), each paired with a random training phrase of its class. Returns the weights, their saves after every
-        pass, the trace (loss and push sizes) and the learning rates."""
+    def _connector_train(self, arm: "ax.ConnectorArm", ci: dict, bank: dict) -> dict:
+        """W and b trained by Anima's objective, everything else frozen: plain Adam, no weight decay, the arm's learning
+        rates (connector_lrs); each step = CONNECTOR_BATCH training images in a shuffled order (a fresh order every
+        pass), each paired with a random training input of its class (ci: _connector_inputs). Returns the weights,
+        their saves after every pass, the trace (loss and push sizes) and the learning rates."""
         import torch
         pipe = self._eval_pipe()
         dev = getattr(pipe, "device", "cuda")
         classes = ax.CONNECTOR_CLASSES
         torch.manual_seed(arm.seed)                      # the objective's noise and timesteps
         g = torch.Generator().manual_seed(arm.seed)      # the batch order and the phrase draws
-        if arm.source == "onehot":
-            inputs = torch.eye(len(classes))
-            pool = {c: [i] for i, c in enumerate(classes)}
-        else:
-            inputs = feats[arm.source]
-            pool = {c: [i for i, p in enumerate(phrases) if p["class"] == c and p["split"] == "train"] for c in classes}
-        if not all(pool.values()):
-            raise ValueError(f"a class without training inputs: {({c: len(v) for c, v in pool.items()})}")
-        inputs = inputs.to(dev, torch.float32)
+        pool = ci["pool"]
+        inputs = ci["inputs"].to(dev, torch.float32)
         width = getattr(pipe, "context_width", 1024)
         W = torch.zeros(width, inputs.shape[1], device=dev, requires_grad=True)
         b = torch.zeros(width, device=dev, requires_grad=True)
-        lrs = ax.connector_lrs(arm.source, inputs.shape[1])
+        lrs = ax.connector_lrs(arm.source, inputs.shape[1], contrast_l1=ci["contrast_l1"])
         opt = torch.optim.Adam([{"params": [W], "lr": lrs["W"]}, {"params": [b], "lr": lrs["b"]}], weight_decay=0.0)
         steps, bs, n = ax.CONNECTOR_STEPS, ax.CONNECTOR_BATCH, len(bank["classes"])
         eta = _sr._Eta(self.TAG, f"{arm.id.split('_')[0]} training", steps, unit="steps", every=float("inf"))
@@ -1023,20 +1048,18 @@ class AnimaRunner(_sr.SanaRunner):
         return {"W": W.detach(), "b": b.detach(), "saves": saves, "trace": trace, "lrs": lrs,
                 "seconds": time.time() - eta.t0}
 
-    def _connector_eval(self, arm: "ax.ConnectorArm", trained: dict, feats: dict, phrases: list, base: dict) -> dict:
+    def _connector_eval(self, arm: "ax.ConnectorArm", trained: dict, ci: dict, phrases: list, base: dict) -> dict:
         """Every evaluation set of the arm: the held-out cells with the set's push on both guidance branches, scored
         against the same cells without a push; the registered reads over them."""
         import numpy as np
         import torch
         W, b = trained["W"], trained["b"]
         sets = ax.connector_eval_sets(phrases, arm.source)
-        row_of = {p["text"]: i for i, p in enumerate(phrases)}
         short = arm.id.split("_")[0]
         eta = _sr._Eta(self.TAG, f"{short} scoring", len(sets) * len(base["prompts"]))
         diffs, rows, imgs = {}, {}, {}
         for key, (c, split, text) in sets.items():
-            f = (torch.eye(len(ax.CONNECTOR_CLASSES))[ax.CONNECTOR_CLASSES.index(c)] if text is None
-                 else feats[arm.source][row_of[text]])
+            f = ci["inputs"][ci["row_of"][c if text is None else text]]
             with torch.no_grad():
                 push = f.to(W.device, W.dtype) @ W.T + b
             ims = self._render_tracked(base["prompts"], base["seeds"], eta, context_add=push, uncond_add=push)
@@ -1060,8 +1083,8 @@ class AnimaRunner(_sr.SanaRunner):
         """One connector: the README first, the training, the weights shipped, the evaluation, the result."""
         from safetensors.torch import save_file
         bdir = f"experiments/{arm.id}"
-        fan_in = len(ax.CONNECTOR_CLASSES) if arm.source == "onehot" else int(feats[arm.source].shape[1])
-        recipe = self._connector_recipe(arm, fan_in)
+        ci = self._connector_inputs(arm, feats, phrases)
+        recipe = self._connector_recipe(arm, ci)
         meta = {"id": arm.id, "title": arm.title, "date": ax.DATE, "kind": "beatrix_connector", "status": "running",
                 "recipe": recipe, "phrases": None if arm.source == "onehot" else phrases}
 
@@ -1073,20 +1096,25 @@ class AnimaRunner(_sr.SanaRunner):
         (out_dir / "connector").mkdir(parents=True, exist_ok=True)
         print(f"\n[{self.TAG}] ===== {arm.id}: {arm.title} =====", flush=True)
         t0 = time.time()
+        proj = ci["projection"]
+        how = ("((f - mu) @ V.T / scale) @ W.T + b" if proj is not None else "f @ W.T + b")
         try:
-            tr = self._connector_train(arm, feats, phrases, bank)
+            tr = self._connector_train(arm, ci, bank)
             files: dict = {}
             for step, (w, bb) in tr["saves"].items():
                 p = out_dir / "connector" / f"step{step:04d}.safetensors"
-                save_file({"W": w.contiguous(), "b": bb.contiguous()}, str(p),
+                tensors = {"W": w.contiguous(), "b": bb.contiguous()}
+                if proj is not None:                     # the input projection travels with the weights
+                    tensors.update({k: proj[k].contiguous() for k in ("mu", "V", "scale")})
+                save_file(tensors, str(p),
                           metadata={"experiment": arm.id, "input": arm.source, "step": str(step),
-                                    "push": "f @ W.T + b, added to every caption token of the adapter's output, on both "
+                                    "push": f"{how}, added to every caption token of the adapter's output, on both "
                                             "guidance branches"})
                 files[f"{bdir}/connector/{p.name}"] = p
             (out_dir / "trace.json").write_text(json.dumps(tr["trace"], indent=1), encoding="utf-8")
             files[f"{bdir}/trace.json"] = out_dir / "trace.json"
             repo.commit(files, f"{arm.id}: connector weights, training trace")    # the weights ship before the evaluation
-            ev = self._connector_eval(arm, tr, feats, phrases, base)
+            ev = self._connector_eval(arm, tr, ci, phrases, base)
         except Exception as e:  # noqa: BLE001
             meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
             metas[arm.id] = meta
@@ -1135,18 +1163,31 @@ class AnimaRunner(_sr.SanaRunner):
                 continue
             m["result"]["cross"] = cross
             m["summary"] = ax.connector_summary(m["result"]["reads"])
-            if arm.id == ax.CONNECTOR_IDS[1] and "control" in cross:
-                m["summary"] += f"; against e013: {cross['control']['OUTCOME']}"
+            for c in (cross.get("controls") or {}).values():
+                if arm.id == c["random"]:
+                    m["summary"] += f"; against {c['beatrix'].split('_')[0]}: {c['OUTCOME']}"
             bdir = f"experiments/{arm.id}"
             files[f"{bdir}/meta.json"] = sx.dumps(m)
             files[f"{bdir}/README.md"] = ax.render_connector_readme(arm, m, m.get("recipe", {}), m.get("phrases"))
         if files:
             self._safe(lambda: repo.commit(files, "connectors: the reads across arms"))
             self._safe(lambda: self._publish_index(repo, metas))
-            if "control" in cross:
-                c = cross["control"]
-                print(f"[{self.TAG}] across arms: Beatrix's held-out effect {c['beatrix_heldout_effect']:+.3f}, the "
-                      f"untrained trunk's {c['random_heldout_effect']:+.3f} -> {c['OUTCOME']}", flush=True)
+            for c in (cross.get("controls") or {}).values():
+                print(f"[{self.TAG}] across arms ({c['beatrix'].split('_')[0]} vs {c['random'].split('_')[0]}): Beatrix's "
+                      f"held-out effect {c['beatrix_heldout_effect']:+.3f}, the untrained trunk's "
+                      f"{c['random_heldout_effect']:+.3f} -> {c['OUTCOME']}", flush=True)
+
+
+def connector_whitening(F, train_rows: list, k: int) -> dict:
+    """The top-k principal components of F's training rows, whitened: {'mu' [D], 'V' [k, D], 'scale' [k]} such that
+    (F - mu) @ V.T / scale has unit variance per component over the training rows (float64 SVD; k capped at the
+    training rows' rank). Fit on the training rows only: held-out rows are projected, never fitted."""
+    import torch
+    X = F[train_rows].double()
+    mu = X.mean(0)
+    _, S, Vh = torch.linalg.svd(X - mu, full_matrices=False)
+    k = min(int(k), int((S > S[0] * 1e-6).sum()))
+    return {"mu": mu.float(), "V": Vh[:k].float().contiguous(), "scale": (S[:k] / (len(train_rows) - 1) ** 0.5).float()}
 
 
 def _wd_tagger(repo_id: str, tags: list[str]):

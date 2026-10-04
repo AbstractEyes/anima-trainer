@@ -428,6 +428,7 @@ class ConnectorArm:
     seed: int                        # training seed (batch order, phrase draws, noise, timesteps)
     question: str
     changed: str = "none (the reference connector)"
+    whiten_k: "int | None" = None    # the features projected on the top k whitened components of the training phrases
 
 
 CONNECTOR_ARMS = (
@@ -446,8 +447,27 @@ CONNECTOR_ARMS = (
                  "onehot", 15, changed="the input is the mood class itself (one-hot), not an encoder's features",
                  question="How far can a push of this form move the image when nothing has to be read from text? (The "
                           "reference the encoder arms are read against; trained classes only.)"),
+    # e013 read NOT LEARNED: in the raw 4,096-feature basis the phrase-dependent part of the push barely moved in 720 steps.
+    # The re-run whitens the features onto the training phrases' main directions and sets the map's learning rate so its
+    # class contrast moves at the free vector's pace (all choices from the training phrases only).
+    ConnectorArm("e016_beatrix_mood_connector_whitened",
+                 "Beatrix's mood phrases steer the image through a learned push, whitened input", "trained", 16,
+                 changed="the features are projected on the top 16 whitened principal components of the training phrases, "
+                         "and the map's learning rate is set so its class contrast moves at the free vector's pace "
+                         "(e013 learned too slowly to read)",
+                 question="Trained on mood images with neutral captions, does a push computed from Beatrix's states for a "
+                          "mood phrase steer the image that way, for the phrases it trained on and for mood phrases it "
+                          "never saw?", whiten_k=16),
+    ConnectorArm("e017_beatrix_random_trunk_connector_whitened",
+                 "Control: the same whitened connector on an untrained Beatrix of the same shape", "random", 17,
+                 changed="e016's connector (whitened input, the free vector's pace) on the features of a randomly "
+                         "initialised trunk of the same shape (seed 0), whitened on its own training phrases",
+                 question="Does e016's held-out effect come from what Beatrix learned, or would any fixed random features of "
+                          "the phrase text carry it? (A control that must fail on the held-out phrases.)", whiten_k=16),
 )
 CONNECTOR_IDS = [a.id for a in CONNECTOR_ARMS]
+CONNECTOR_PAIRS = ((CONNECTOR_IDS[0], CONNECTOR_IDS[1]), (CONNECTOR_IDS[3], CONNECTOR_IDS[4]))   # (Beatrix, untrained)
+CONNECTOR_FREE = CONNECTOR_IDS[2]
 CONNECTOR_FEATURES = "beatrix/mood_phrases_mini-beatrix-3_step212000.safetensors"   # in the data repo
 CONNECTOR_CHECKPOINT = "AbstractPhil/alephllm-mini-beatrix-training, mini-beatrix-3 at step 212,000"
 CONNECTOR_CLASSES = ("up", "down", "neutral")
@@ -465,14 +485,18 @@ CONNECTOR_GROUPS = {                     # read group -> (class, split or None =
 DIRECTION = {"up": 1, "down": -1, "neutral": 0}
 
 
-def connector_lrs(source: str, fan_in: int, lr: "float | None" = None) -> dict:
+def connector_lrs(source: str, fan_in: int, lr: "float | None" = None, contrast_l1: "float | None" = None) -> dict:
     """Adam's learning rates for the push's weight W and bias b (lr: CONNECTOR_LR). Adam moves every weight by about
     lr per step, so a linear map's output moves by about lr x the input's L1 norm: dense features (4,096 standardized
     numbers) would move the push thousands of times faster than a one-hot input. The fan-in rule (a matrix's Adam
-    learning rate divided by its fan-in, as in Tensor Programs V) makes the push move about lr per dimension per step
-    in every arm."""
+    learning rate divided by its fan-in, as in Tensor Programs V) bounds the push's movement at about lr per dimension
+    per step (e013, e014). It proved far too slow: only the class contrast moves consistently. With contrast_l1 (the L1
+    size of the up-minus-down class-mean difference of the training inputs; whitened arms), W's rate is set so the
+    class contrast moves at the free vector's pace: lr x 2 / contrast_l1 (the one-hot difference has L1 2)."""
     lr = CONNECTOR_LR if lr is None else lr
-    return {"W": lr if source == "onehot" else lr / fan_in, "b": lr}
+    if source == "onehot":
+        return {"W": lr, "b": lr}
+    return {"W": lr * 2.0 / contrast_l1 if contrast_l1 else lr / fan_in, "b": lr}
 
 
 def connector_eval_sets(phrases: list, source: str) -> dict:
@@ -535,19 +559,26 @@ def connector_summary(reads: dict) -> str:
 
 
 def connector_cross_reads(reads: dict) -> dict:
-    """Across arms ({arm id: connector_reads output}): THE CONTROL FAILS AS IT SHOULD = the random trunk's held-out
-    effect is at most a third of Beatrix's (hers positive); each feature arm's trained effect as a fraction of the free
+    """Across arms ({arm id: connector_reads output}), per (Beatrix, untrained trunk) pair of CONNECTOR_PAIRS: THE CONTROL
+    FAILS AS IT SHOULD = the untrained trunk's held-out effect is at most a third of Beatrix's (hers positive); NOT
+    READABLE when Beatrix's connector did not learn. And each feature arm's trained effect as a fraction of the free
     vector's."""
-    btx, rnd, free = (reads.get(i) for i in CONNECTOR_IDS)
     out: dict = {}
-    if btx and rnd and "heldout_effect" in btx and "heldout_effect" in rnd:
+    for b_id, r_id in CONNECTOR_PAIRS:
+        btx, rnd = reads.get(b_id), reads.get(r_id)
+        if not (btx and rnd and "heldout_effect" in btx and "heldout_effect" in rnd):
+            continue
         hb, hr = btx["heldout_effect"], rnd["heldout_effect"]
-        verdict = ("NO HELD-OUT EFFECT TO CONTROL" if hb <= 0 else
+        verdict = ("NOT READABLE (Beatrix's connector did not learn)" if btx["TRAINED"] == "NOT LEARNED" else
+                   "NO HELD-OUT EFFECT TO CONTROL" if hb <= 0 else
                    "THE CONTROL FAILS AS IT SHOULD" if hr <= hb / 3 else "THE RANDOM TRUNK CARRIES IT TOO")
-        out["control"] = {"beatrix_heldout_effect": hb, "random_heldout_effect": hr, "OUTCOME": verdict}
+        out.setdefault("controls", {})[f"{b_id} vs {r_id}"] = {
+            "beatrix": b_id, "random": r_id, "beatrix_heldout_effect": hb, "random_heldout_effect": hr,
+            "OUTCOME": verdict}
+    free = reads.get(CONNECTOR_FREE)
     if free and free.get("trained_effect"):
         out["of_free_vector"] = {a: r["trained_effect"] / free["trained_effect"] for a, r in reads.items()
-                                 if a != CONNECTOR_IDS[2]}
+                                 if a != CONNECTOR_FREE}
     return out
 
 
@@ -585,6 +616,15 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
            "- **The push** = W f + b (1,024 numbers), added to every caption token of the text adapter's output (what "
            "the image model reads). W and b start at zero, so training starts from the stock model exactly. For the "
            "free vector, f is the mood class as a one-hot vector.",
+           *([f"- **This experiment's input**: the features projected on the top {arm.whiten_k} principal components of "
+              "the training phrases' features and scaled to unit variance per component (mean, components and scale fit "
+              "on the training phrases only, and shipped with the weights). The number of components is the smallest at "
+              "the best leave-one-out accuracy of the training phrases' mood class (nearest class mean); the held-out "
+              "phrases played no part in any choice. The map's learning rate is set so the push's mood contrast moves at "
+              "the free vector's pace: 1e-3 x 2 / (the L1 size of the cheerful-minus-gloomy class-mean difference in that "
+              "space; the free vector's one-hot difference has L1 2). The first connectors (e013, e014) fed the 4,096 "
+              "features in directly at 1e-3 / 4,096, and their phrase-dependent part barely moved in 720 steps."]
+             if arm.whiten_k else []),
            "- **Training**: Anima's own flow-matching objective, computed by the trainer's code (logit-normal "
            "timesteps, the noisy latent (1 - t) x0 + t noise, mean squared error to noise - x0), on the LoRA "
            "experiments' first-draw training images: 192 upbeat, 192 downbeat and 192 neutral renders of the stock "
@@ -638,10 +678,11 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
                        f"{'' if frac is None or v['class'] == 'neutral' else f'{frac:.0%}'} | "
                        f"{v['content_kept']:.3f} | {v['push_norm']:.3f} |")
         cross = r.get("cross") or {}
-        if cross.get("control"):
-            c = cross["control"]
-            out += ["", f"Across arms: Beatrix's held-out effect {c['beatrix_heldout_effect']:+.3f}, the untrained "
-                        f"trunk's {c['random_heldout_effect']:+.3f}: **{c['OUTCOME']}**."]
+        for c in (cross.get("controls") or {}).values():
+            if arm.id in (c["beatrix"], c["random"]):
+                out += ["", f"Across arms ({c['beatrix'].split('_')[0]} against {c['random'].split('_')[0]}): Beatrix's "
+                            f"held-out effect {c['beatrix_heldout_effect']:+.3f}, the untrained trunk's "
+                            f"{c['random_heldout_effect']:+.3f}: **{c['OUTCOME']}**."]
         if cross.get("of_free_vector"):
             out += ["", "Trained effect as a fraction of the free vector's: " + ", ".join(
                 f"{a.split('_')[0]} {v:.2f}" for a, v in cross["of_free_vector"].items()) + "."]
@@ -663,8 +704,11 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
     else:
         out += ["## Result", "Running.", ""]
     out += ["## Files",
-            "- `connector/stepNNNN.safetensors`: W and b after every pass over the training images (float32; the push "
-            "for features f is f @ W.T + b).",
+            ("- `connector/stepNNNN.safetensors`: W and b after every pass over the training images, with the input "
+             "projection mu, V, scale (float32; the push for features f is ((f - mu) @ V.T / scale) @ W.T + b)."
+             if arm.whiten_k else
+             "- `connector/stepNNNN.safetensors`: W and b after every pass over the training images (float32; the push "
+             "for features f is f @ W.T + b)."),
             "- `trace.json`: the training loss and the push's size per class during training.",
             "- `result.json`: every cell's score, the reads, the per-phrase effects.",
             "- `sheet.jpg`: the contact sheet.", "", "## References", refs, ""]

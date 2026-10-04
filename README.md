@@ -294,7 +294,7 @@ a.setup()                  # GPU + the fork + the three model files
 a.run_flavor_test()        # e001: the stock model
 a.run_attribute_screen()   # e012: attribute sliders on the stock model
 a.run_sequence()           # e002..e011: the LoRA arms
-a.run_beatrix_connectors() # e013-e015: a push from Beatrix's phrase features, and its two controls
+a.run_beatrix_connectors() # e013-e017: a push from Beatrix's phrase features, and its controls
 ```
 
 - **Recipe** (from the model card): Anima-Base v1.0; LoRA rank 32 at 2e-5 (half and double as arms), the
@@ -321,6 +321,10 @@ a.run_beatrix_connectors() # e013-e015: a push from Beatrix's phrase features, a
   plain Adam with the fan-in rule's learning rates, everything else frozen; the push goes on both guidance
   branches at sampling, as a LoRA acts. e014 is the same on an untrained Beatrix (it must fail on phrases
   never trained on), e015 a free learned vector per mood (the reference). Scored on the held-out scenes.
+  e013 read NOT LEARNED (the map's phrase-dependent part barely moved in 720 steps on the raw 4,096 features),
+  so e016 / e017 re-run e013 / e014 on the features whitened onto the training phrases' top 16 principal
+  components (fit on the training phrases only), with the map's rate set so its mood contrast moves at the
+  free vector's pace.
 - **Progress:** every long step prints the size of the job, then done / total, time spent and time left.
 
 > **Licence.** Anima's weights are under the CircleStone Labs Non-Commercial License (a derivative of

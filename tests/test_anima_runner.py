@@ -485,12 +485,16 @@ PHRASES = ([{"class": "up", "split": "train", "text": t} for t in ("cheerful and
 
 def test_connector_registry_and_rules():
     assert ax.CONNECTOR_IDS == ["e013_beatrix_mood_connector", "e014_beatrix_random_trunk_connector",
-                                "e015_free_vector_connector"]
-    assert [a.source for a in ax.CONNECTOR_ARMS] == ["trained", "random", "onehot"]
-    assert len({a.seed for a in ax.CONNECTOR_ARMS}) == 3 and not set(ax.CONNECTOR_IDS) & set(ax.SEQUENCE_IDS)
+                                "e015_free_vector_connector", "e016_beatrix_mood_connector_whitened",
+                                "e017_beatrix_random_trunk_connector_whitened"]
+    assert [a.source for a in ax.CONNECTOR_ARMS] == ["trained", "random", "onehot", "trained", "random"]
+    assert [a.whiten_k for a in ax.CONNECTOR_ARMS] == [None, None, None, 16, 16]
+    assert ax.CONNECTOR_PAIRS == ((ax.CONNECTOR_IDS[0], ax.CONNECTOR_IDS[1]), (ax.CONNECTOR_IDS[3], ax.CONNECTOR_IDS[4]))
+    assert len({a.seed for a in ax.CONNECTOR_ARMS}) == 5 and not set(ax.CONNECTOR_IDS) & set(ax.SEQUENCE_IDS)
     assert ax.CONNECTOR_STEPS * ax.CONNECTOR_BATCH == 5 * 576 and ax.CONNECTOR_SAVE_EVERY * ax.CONNECTOR_BATCH == 576
-    assert ax.connector_lrs("trained", 4096) == {"W": 1e-3 / 4096, "b": 1e-3}          # the fan-in rule
+    assert ax.connector_lrs("trained", 4096) == {"W": 1e-3 / 4096, "b": 1e-3}          # the fan-in rule (e013, e014)
     assert ax.connector_lrs("onehot", 3) == {"W": 1e-3, "b": 1e-3}
+    assert ax.connector_lrs("trained", 16, contrast_l1=5.0) == {"W": 1e-3 * 2 / 5.0, "b": 1e-3}   # the free vector's pace
     sets = ax.connector_eval_sets(PHRASES, "trained")
     assert list(sets)[:4] == ["up/train/cheerful and upbeat", "up/train/joyful and uplifting", "up/heldout/elated",
                               "up/heldout/blissful"]
@@ -514,9 +518,16 @@ def test_connector_registry_and_rules():
     assert ax.connector_reads(diffs(1.0, 0.6, -0.9, 0.2, 0.0), sets)["HELD_OUT"] == "HELD-OUT WORDS CARRY IT ONE WAY"
     flat = ax.connector_reads(diffs(1.0, 0.05, -0.9, 0.05, 0.0), sets)
     ids = ax.CONNECTOR_IDS
-    assert ax.connector_cross_reads({ids[0]: good, ids[1]: flat})["control"]["OUTCOME"] == "THE CONTROL FAILS AS IT SHOULD"
+
+    def control(reads, pair=0):
+        b_id, r_id = ax.CONNECTOR_PAIRS[pair]
+        return ax.connector_cross_reads(reads)["controls"][f"{b_id} vs {r_id}"]["OUTCOME"]
+
+    assert control({ids[0]: good, ids[1]: flat}) == "THE CONTROL FAILS AS IT SHOULD"
+    assert control({ids[3]: good, ids[4]: flat}, pair=1) == "THE CONTROL FAILS AS IT SHOULD"
     leaky = ax.connector_reads(diffs(1.0, 0.4, -0.9, -0.3, 0.0), sets)
-    assert ax.connector_cross_reads({ids[0]: good, ids[1]: leaky})["control"]["OUTCOME"] == "THE RANDOM TRUNK CARRIES IT TOO"
+    assert control({ids[0]: good, ids[1]: leaky}) == "THE RANDOM TRUNK CARRIES IT TOO"
+    assert control({ids[0]: unlearned, ids[1]: flat}).startswith("NOT READABLE")    # no control read without learning
     free = ax.connector_reads({"up": [1.9 + 0.01 * (i % 4) for i in range(16)],
                                "down": [-1.9 + 0.01 * (i % 4) for i in range(16)], "neutral": [0.1] * 16},
                               ax.connector_eval_sets(PHRASES, "onehot"), "onehot")
@@ -524,7 +535,9 @@ def test_connector_registry_and_rules():
     assert ax.connector_cross_reads({ids[0]: good, ids[2]: free})["of_free_vector"][ids[0]] == pytest.approx(0.5, abs=0.01)
     readme = ax.render_connector_readme(ax.CONNECTOR_ARMS[0], {"status": "running"}, {"input": "x"}, PHRASES)
     assert "fixed before the run" in readme and "Running." in readme and "2208.01618" in readme
-    assert "elated, blissful" in readme and "both branches" in readme
+    assert "elated, blissful" in readme and "both branches" in readme and "principal components" not in readme
+    whitened = ax.render_connector_readme(ax.CONNECTOR_ARMS[3], {"status": "running"}, {"input": "x"}, PHRASES)
+    assert "top 16 principal components" in whitened and "(f - mu) @ V.T / scale" in whitened
     import re
     for word in (r"S-1", r"\bPhil\b", r"docket", r"canon/"):           # the repo owner's handle in a repo id is fine
         assert not re.search(word, readme), word
@@ -651,17 +664,28 @@ def test_beatrix_connectors_end_to_end(runner, monkeypatch):
     for c in ax.CONNECTOR_CLASSES:                                    # the three first-draw training sets were drawn
         assert len(list((Path(s.state["data_root"]) / "datasets" / f"{c}_1000" / "images").glob("*.png"))) == 48
     m = repo.metas()
-    r13, r14, r15 = (m[k]["result"]["reads"] for k in ax.CONNECTOR_IDS)
-    assert r13["TRAINED"] == "TRAINED WORDS MOVE IT" and r13["HELD_OUT"] == "HELD-OUT WORDS CARRY IT"
-    assert r13["NEUTRAL"] == "NEUTRAL QUIET"
-    assert r14["heldout_effect"] == pytest.approx(0.0) and r14["HELD_OUT"] != "HELD-OUT WORDS CARRY IT"
+    r13, r14, r15, r16, r17 = (m[k]["result"]["reads"] for k in ax.CONNECTOR_IDS)
+    for r in (r13, r16):
+        assert r["TRAINED"] == "TRAINED WORDS MOVE IT" and r["HELD_OUT"] == "HELD-OUT WORDS CARRY IT"
+        assert r["NEUTRAL"] == "NEUTRAL QUIET"
+    for r in (r14, r17):
+        assert r["heldout_effect"] == pytest.approx(0.0, abs=1e-6) and r["HELD_OUT"] != "HELD-OUT WORDS CARRY IT"
     assert r15["TRAINED"] == "THE CLASS VECTORS MOVE IT" and r15["NEUTRAL"] == "NEUTRAL QUIET" and "HELD_OUT" not in r15
-    e014 = m[ax.CONNECTOR_IDS[1]]
-    assert e014["result"]["cross"]["control"]["OUTCOME"] == "THE CONTROL FAILS AS IT SHOULD"
-    assert e014["summary"].endswith("against e013: THE CONTROL FAILS AS IT SHOULD")
-    assert set(e014["result"]["cross"]["of_free_vector"]) == set(ax.CONNECTOR_IDS[:2])
+    cross = m[ax.CONNECTOR_IDS[1]]["result"]["cross"]
+    assert [c["OUTCOME"] for c in cross["controls"].values()] == ["THE CONTROL FAILS AS IT SHOULD"] * 2
+    assert m[ax.CONNECTOR_IDS[1]]["summary"].endswith("against e013: THE CONTROL FAILS AS IT SHOULD")
+    assert m[ax.CONNECTOR_IDS[4]]["summary"].endswith("against e016: THE CONTROL FAILS AS IT SHOULD")
+    assert set(cross["of_free_vector"]) == {ax.CONNECTOR_IDS[i] for i in (0, 1, 3, 4)}
     assert m[ax.CONNECTOR_IDS[0]]["result"]["learning_rates"] == {"W": 0.05 / 16, "b": 0.05}
     assert m[ax.CONNECTOR_IDS[2]]["result"]["learning_rates"] == {"W": 0.05, "b": 0.05}
+    lr16 = m[ax.CONNECTOR_IDS[3]]["result"]["learning_rates"]
+    assert lr16["b"] == 0.05 and 0.05 * 2 / 20 < lr16["W"] < 0.05 * 2 / 0.5      # 2 / the class contrast's L1 size
+    assert "principal components" in m[ax.CONNECTOR_IDS[3]]["recipe"]["input"]
+    w16 = load(repo.files_[f"experiments/{ax.CONNECTOR_IDS[3]}/connector/step0072.safetensors"])
+    assert w16["V"].shape == (9, 16) and w16["W"].shape == (8, 9)       # k capped at the 10 training phrases' rank
+    f = _fake_features()["trained"][1]                                   # 'joyful and uplifting' through the shipped projection
+    push16 = ((f - w16["mu"]) @ w16["V"].T / w16["scale"]) @ w16["W"].T + w16["b"]
+    assert any(torch.allclose(push16, p, atol=1e-5) for p in pushes)
     for k in ax.CONNECTOR_IDS:
         base = f"experiments/{k}"
         assert m[k]["kind"] == "beatrix_connector" and m[k]["status"] == "done"
@@ -678,7 +702,23 @@ def test_beatrix_connectors_end_to_end(runner, monkeypatch):
     n = len(repo.commits)
     again = s.run_beatrix_connectors()                                # done already: skipped
     assert all(v["status"] == "done" for v in again.values())
-    assert not any(c.startswith(("e013", "e014", "e015")) for c in repo.commits[n:])
+    assert not any(c.startswith(("e013", "e014", "e015", "e016", "e017")) for c in repo.commits[n:])
+
+
+def test_connector_whitening_is_fit_on_the_training_rows_only():
+    g = torch.Generator().manual_seed(1)
+    F = torch.randn(30, 12, generator=g) * torch.linspace(3, 0.1, 12)
+    train = list(range(20))
+    p = ar.connector_whitening(F, train, 4)
+    Z = (F - p["mu"]) @ p["V"].T / p["scale"]
+    assert p["V"].shape == (4, 12)
+    assert torch.allclose(Z[train].mean(0), torch.zeros(4), atol=1e-5)
+    assert torch.allclose(Z[train].std(0), torch.ones(4), atol=1e-4)         # unit variance on the training rows
+    held = F.clone()
+    held[20:] += 100.0                                                         # held-out rows never move the fit
+    q = ar.connector_whitening(held, train, 4)
+    assert torch.allclose(q["mu"], p["mu"]) and torch.allclose(q["scale"], p["scale"])
+    assert ar.connector_whitening(F, [0, 1, 2], 16)["V"].shape[0] == 2         # k capped at the training rows' rank
 
 
 def test_config_validation_refuses_master_weights_without_plain_adam():

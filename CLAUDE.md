@@ -520,8 +520,16 @@ metadata) or a one-hot class (e015). Training in the kernel: `AnimaPipe.train_lo
 no_grad, adds the push, checkpoints the blocks. Plain Adam wd 0; `connector_lrs()` = the fan-in rule (dense W at
 lr / fan_in: Adam moves an output by ~lr x the input's L1 norm). Sampling: the push on BOTH guidance branches
 (`generate(uncond_add=)`), as a LoRA acts; e001's dial stays conditional-only. Reads: `connector_reads()` (groups
-pooled over cells x phrases; NOT LEARNED blocks the held-out verdict), `connector_cross_reads()` (the untrained trunk
-<= 1/3 of Beatrix's held-out effect). Weights ship per pass to `experiments/<id>/connector/` before the evaluation.
+pooled over cells x phrases; NOT LEARNED blocks the held-out verdict), `connector_cross_reads()` (per
+`CONNECTOR_PAIRS` (Beatrix, untrained): the untrained trunk <= 1/3 of Beatrix's held-out effect; NOT READABLE when
+Beatrix did not learn). Weights ship per pass to `experiments/<id>/connector/` before the evaluation. LESSON (e013,
+NOT LEARNED): on the raw 4,096 features at lr / fan_in the shared bias b learned the training set's look (|b| 1.06)
+while the phrase-dependent part barely moved (|W (up - down)| .06): only the class contrast moves consistently, and
+Adam's per-weight normalization in a 4,096-wide correlated basis wastes most of W's movement outside it. e016 / e017
+(`ConnectorArm.whiten_k = 16`): `connector_whitening()` (top-k PCs of the TRAINING phrases, unit variance, float64
+SVD, k capped at rank; mu / V / scale ship with the weights) and `connector_lrs(contrast_l1=)` = lr x 2 / the L1 size
+of the training inputs' up-minus-down class-mean difference (the free vector's pace). `_connector_inputs()` builds
+every arm's input rows.
 
 ### Training previews — `SamplesConfig` → `[samples]`
 `TrainConfig.samples = SamplesConfig(prompts=[...])` renders a `[samples]` table into the lora toml
