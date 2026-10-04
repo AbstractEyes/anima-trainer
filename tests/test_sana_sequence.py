@@ -471,3 +471,54 @@ def test_progress_reads_the_trainer_log(tmp_path):
     assert sr._progress(log) == "step 120 (41 samples/s)"
     log.write_text("steps: 480 loss: 0.9 iter time (s): 0.1 samples/sec: 41.3\nTRAINING COMPLETE!\n", encoding="utf-8")
     assert sr._progress(log) == "saving"
+
+
+def test_progress_with_a_total_gives_the_time_left(tmp_path):
+    log = tmp_path / "train.log"
+    log.write_text("steps: 120 loss: 0.9 iter time (s): 0.5 samples/sec: 8.0\n", encoding="utf-8")
+    assert sr._progress(log, 480) == "step 120/480 (8 samples/s, about 3m00s left)"     # 360 steps x 0.5 s
+
+
+def test_hms():
+    assert [sr._hms(s) for s in (0, 35.4, 60, 250, 3600, 3900, 7322)] == \
+        ["0s", "35s", "1m00s", "4m10s", "1h00m", "1h05m", "2h02m"]
+
+
+def test_eta_lines_report_time_spent_and_left(monkeypatch, capsys):
+    now = [1000.0]
+    monkeypatch.setattr(sr.time, "time", lambda: now[0])
+    eta = sr._Eta("anima", "e001", 100, every=30.0)
+    now[0] += 10
+    eta.add(8)                                       # 10 s after the start: within `every`, no line yet
+    assert capsys.readouterr().out == ""
+    now[0] += 30
+    eta.add(12)                                      # 20 done in 40 s -> 80 left = 160 s
+    assert capsys.readouterr().out == "[anima] e001: 20/100 images, 40s spent, about 2m40s left\n"
+    now[0] += 1
+    eta.add(80)                                      # the last line always prints, with no time left
+    assert capsys.readouterr().out == "[anima] e001: 100/100 images, 41s spent\n"
+
+
+def test_train_eta_from_the_trainer_steps():
+    assert sr._train_eta("e002 training", 75, None, None, 480) == \
+        "e002 training: starting (loading the model, caching the training set), 1m15s spent"
+    # steps 10 -> 110 took 50 s: 0.5 s a step, 370 to go
+    assert sr._train_eta("e002 training", 120, (10, 100.0), (110, 150.0), 480) == \
+        "e002 training: step 110/480, 2m00s spent, about 3m05s left"
+    assert sr._train_eta("t", 5, (1, 0.0), (1, 0.0), None) == "t: step 1, 5s spent"
+
+
+def test_render_tracked_is_render_in_its_own_batches(runner):
+    s, *_ = runner
+    s.cfg.gen_batch = 3
+    seen = []
+    real = s._render
+
+    def spy(prompts, seeds, **kw):
+        seen.append(list(seeds))
+        return real(prompts, seeds, **kw)
+
+    s._render = spy
+    eta = sr._Eta("t", "x", 7, every=1e9)
+    out = s._render_tracked([f"p{i}" for i in range(7)], list(range(7)), eta)
+    assert seen == [[0, 1, 2], [3, 4, 5], [6]] and len(out) == 7 and eta.done == 7

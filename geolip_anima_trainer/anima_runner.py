@@ -558,14 +558,15 @@ class AnimaRunner(_sr.SanaRunner):
         self._assert_stock()
         seeds = list(ax.FLAVOR_TEST_SEEDS)
         cells = [(si, sd) for si in range(len(SUBJECTS)) for sd in seeds]
-        print(f"[anima] e001: {3 + len(ax.DIAL_SITES) * len(ax.DIAL_ALPHAS)} sets of {len(cells)} images (the words: "
-              f"neutral, upbeat, downbeat; the dial: {len(ax.DIAL_SITES)} sites x {len(ax.DIAL_ALPHAS)} strengths), "
-              "one line per set", flush=True)
+        n_sets = 3 + len(ax.DIAL_SITES) * len(ax.DIAL_ALPHAS)
+        print(f"[anima] e001: {n_sets} sets of {len(cells)} images (the words: neutral, upbeat, downbeat; the dial: "
+              f"{len(ax.DIAL_SITES)} sites x {len(ax.DIAL_ALPHAS)} strengths), one line per set", flush=True)
+        eta = _sr._Eta(self.TAG, "e001", n_sets * len(cells))
         S = [sd for _, sd in cells]
         P = {f: [ax.TEMPLATES[f][0].format(s=SUBJECTS[si]) for si, _ in cells] for f in ("neutral", "up", "down")}
         imgs, feats, scores = {}, {}, {}
         for f in ("neutral", "up", "down"):                       # the words
-            imgs[f] = self._render(P[f], S)
+            imgs[f] = self._render_tracked(P[f], S, eta)
             feats[f], sc = self._score(imgs[f])
             scores[f] = [float(x) for x in sc]
             print(f"[anima] e001 words: {f} mean mood score {np.mean(scores[f]):+.3f}", flush=True)
@@ -596,7 +597,8 @@ class AnimaRunner(_sr.SanaRunner):
             by_alpha, kept, sheet_cols = {0.0: scores["neutral"]}, {0.0: 1.0}, {0.0: imgs["neutral"]}
             for a in ax.DIAL_ALPHAS:
                 vec = dirs[site] * a
-                ims = self._render(P["neutral"], S, **({"source_add": vec} if site == "source" else {"context_add": vec}))
+                ims = self._render_tracked(P["neutral"], S, eta,
+                                           **({"source_add": vec} if site == "source" else {"context_add": vec}))
                 fa, sc = self._score(ims)
                 by_alpha[a] = [float(x) for x in sc]
                 kept[a] = float(np.mean((fa * feats["neutral"]).sum(-1)))

@@ -179,9 +179,13 @@ def _folder_files(folder: "str | Path", prefix: str, allow: "list[str] | None" =
     return out
 
 
-def _progress(log: "str | Path") -> str:
+_STEP_LINE = re.compile(r"steps: (\d+) loss: \S+ iter time \(s\): ([\d.]+) samples/sec: ([\d.]+)")
+
+
+def _progress(log: "str | Path", total: "int | None" = None) -> str:
     """A trainer's state from the tail of its log: 'step N (S samples/s)' from the trainer's 'steps: N loss: ...
-    samples/sec: S' lines, 'saving' once it is done, else 'starting'."""
+    iter time (s): T samples/sec: S' lines ('step N/total (S samples/s, about X left)' when the total is known),
+    'saving' once it is done, else 'starting'."""
     try:
         with open(log, "rb") as f:
             f.seek(0, 2)
@@ -191,11 +195,56 @@ def _progress(log: "str | Path") -> str:
         return "starting"
     if "TRAINING COMPLETE" in tail:
         return "saving"
-    hits = re.findall(r"steps: (\d+) loss: [\d.]+ .*?samples/sec: ([\d.]+)", tail)
-    if hits:
-        step, rate = hits[-1]
-        return f"step {step} ({float(rate):.0f} samples/s)"
-    return "starting"
+    hits = _STEP_LINE.findall(tail)
+    if not hits:
+        return "starting"
+    step, iter_s, rate = int(hits[-1][0]), float(hits[-1][1]), float(hits[-1][2])
+    if total is None:
+        return f"step {step} ({rate:.0f} samples/s)"
+    return f"step {step}/{total} ({rate:.0f} samples/s, about {_hms(max(0, total - step) * iter_s)} left)"
+
+
+def _train_eta(label: str, spent: float, first: "tuple | None", latest: "tuple | None", total: "int | None") -> str:
+    """'label: step N/total, X spent, about Y left' from the first and latest (step, time) read from a trainer's log."""
+    if latest is None:
+        return f"{label}: starting (loading the model, caching the training set), {_hms(spent)} spent"
+    out = f"{label}: step {latest[0]}" + (f"/{total}" if total else "") + f", {_hms(spent)} spent"
+    if total and latest[0] > first[0]:
+        per_step = (latest[1] - first[1]) / (latest[0] - first[0])
+        out += f", about {_hms(max(0, total - latest[0]) * per_step)} left"
+    return out
+
+
+def _hms(seconds: float) -> str:
+    """A duration as '1h05m', '4m10s' or '35s'."""
+    s = max(0, int(round(seconds)))
+    if s >= 3600:
+        return f"{s // 3600}h{s % 3600 // 60:02d}m"
+    return f"{s // 60}m{s % 60:02d}s" if s >= 60 else f"{s}s"
+
+
+class _Eta:
+    """Time spent and time left on a job of known size, as '[tag] label: done/total unit, X spent, about Y left':
+    at most one line per `every` seconds, and always the last one."""
+
+    def __init__(self, tag: str, label: str, total: int, unit: str = "images", every: float = 30.0):
+        self.tag, self.label, self.total, self.unit, self.every = tag, label, int(total), unit, every
+        self.done, self.t0 = 0, time.time()
+        self.last = self.t0
+
+    def add(self, n: int = 1) -> None:
+        self.done += n
+        now = time.time()
+        if self.done >= self.total or now - self.last >= self.every:
+            self.last = now
+            print(f"[{self.tag}] {self.line()}", flush=True)
+
+    def line(self) -> str:
+        spent = time.time() - self.t0
+        out = f"{self.label}: {self.done}/{self.total} {self.unit}, {_hms(spent)} spent"
+        if 0 < self.done < self.total:
+            out += f", about {_hms(spent / self.done * (self.total - self.done))} left"
+        return out
 
 
 def _free_ports(start: int = 29510):
@@ -425,6 +474,26 @@ class SanaRunner(_RunnerMixin):
             out += _generate(pipe, prompts[i:i + b], seeds[i:i + b], res)
         return out
 
+    def _render_tracked(self, prompts: list[str], seeds: list[int], eta: "_Eta | None" = None, **kw) -> list:
+        """_render in gen_batch chunks (the batches the renderers form themselves, so the images are the same),
+        counting each chunk into `eta` (time spent / time left lines)."""
+        out, b = [], self.cfg.gen_batch
+        for i in range(0, len(prompts), b):
+            out += self._render(prompts[i:i + b], seeds[i:i + b], **kw)
+            if eta is not None:
+                eta.add(len(prompts[i:i + b]))
+        return out
+
+    def _total_steps(self) -> int:
+        """Training steps per arm: the training set in micro-batches, times the epochs."""
+        n = len(TRAIN) * self.cfg.seeds_per_subject
+        return -(-n // (self.cfg.micro_batch * self.cfg.num_gpus)) * self.cfg.epochs
+
+    def _missing(self, flavor: str, seed_base: int) -> int:
+        """Images of a training set not rendered yet."""
+        img_dir = Path(self._need("data_root")) / "datasets" / f"{flavor}_{seed_base}" / "images"
+        return sum(not (img_dir / f"{it['name']}.png").is_file() for it in self._items(flavor, seed_base))
+
     def _judge(self):
         if self._judge_fns is None:
             print(f"[{self.TAG}] loading the CLIP judge ({CLIP_JUDGE}; a 1.7 GB download the first time)...", flush=True)
@@ -481,9 +550,9 @@ class SanaRunner(_RunnerMixin):
               f"{len(HELD_OUT)} subjects held out for evaluate())")
         return str(out)
 
-    def _render_dataset(self, flavor: str, seed_base: int) -> Path:
+    def _render_dataset(self, flavor: str, seed_base: int, eta: "_Eta | None" = None) -> Path:
         """{data_root}/datasets/<flavor>_<seed_base>/images (+ items.jsonl and sheet.jpg beside it, never
-        inside the image folder the trainer scans). Skips images already rendered."""
+        inside the image folder the trainer scans). Skips images already rendered; counts each chunk into `eta`."""
         root = Path(self._need("data_root")) / "datasets" / f"{flavor}_{seed_base}"
         img_dir = root / "images"
         img_dir.mkdir(parents=True, exist_ok=True)
@@ -498,6 +567,8 @@ class SanaRunner(_RunnerMixin):
                 for it, img in zip(chunk, self._render([c["prompt"] for c in chunk], [c["seed"] for c in chunk])):
                     img.save(img_dir / f"{it['name']}.png")
                     (img_dir / f"{it['name']}.txt").write_text(it["caption"], encoding="utf-8")
+                if eta is not None:
+                    eta.add(len(chunk))
             print(f"[{self.TAG}] rendered {len(todo)} {flavor} training images (seeds {seed_base}+) -> {img_dir}", flush=True)
         if not (root / "sheet.jpg").is_file():
             from PIL import Image
@@ -573,30 +644,42 @@ class SanaRunner(_RunnerMixin):
         return rc
 
     @staticmethod
-    def _follow(log: str, on_tick=None, tick_s: float = 60.0):
+    def _follow(log: str, on_tick=None, tick_s: float = 60.0, *, tag: str = "sana", label: str = "training",
+                total_steps: "int | None" = None, eta_s: float = 60.0):
         """A launch() monitor that prints the trainer's log into the cell as it grows (a Colab cell does not
-        always show a child process's own output), calling on_tick() every tick_s seconds (uploads)."""
+        always show a child process's own output), calling on_tick() every tick_s seconds (uploads), and every
+        eta_s seconds a line with the time spent and, once the trainer logs steps, the step and the time left
+        (at the pace since the first logged step)."""
         def monitor(proc) -> None:
-            last = time.monotonic()
+            t0 = last = last_eta = time.monotonic()
+            first = latest = None                         # (step, time) of the first / latest step line read
             try:
                 with open(log, "r", encoding="utf-8", errors="replace") as f:
                     while True:
                         line = f.readline()
                         if line:
                             print(line, end="", flush=True)
+                            m = _STEP_LINE.search(line)
+                            if m:
+                                latest = (int(m.group(1)), time.monotonic())
+                                first = first or latest
                             continue
                         if proc.poll() is not None:
                             print(f.read(), end="", flush=True)
                             return
-                        if on_tick is not None and time.monotonic() - last >= tick_s:
-                            last = time.monotonic()
+                        now = time.monotonic()
+                        if on_tick is not None and now - last >= tick_s:
+                            last = now
                             try:
                                 on_tick()
                             except Exception as e:  # noqa: BLE001 — an upload hiccup must not stop the run
-                                print(f"[sana] upload during training failed ({e}); it is retried at the end", flush=True)
+                                print(f"[{tag}] upload during training failed ({e}); it is retried at the end", flush=True)
+                        if now - last_eta >= eta_s:
+                            last_eta = now
+                            print(f"[{tag}] {_train_eta(label, now - t0, first, latest, total_steps)}", flush=True)
                         time.sleep(1.0)
             except KeyboardInterrupt:
-                print(f"\n[sana] stopped following; the trainer (pid {proc.pid}) keeps running — s.tail() to watch")
+                print(f"\n[{tag}] stopped following; the trainer (pid {proc.pid}) keeps running — s.tail() to watch")
                 raise
         return monitor
 
@@ -645,12 +728,19 @@ class SanaRunner(_RunnerMixin):
         if not todo:
             return metas
         t0 = time.time()
-        for key in dict.fromkeys((a.flavor, a.seed_base) for a in todo):   # every training set, stock, first
-            self._render_dataset(*key)
+        keys = list(dict.fromkeys((a.flavor, a.seed_base) for a in todo))   # every training set, stock, first
+        need = sum(self._missing(*k) for k in keys)
+        saves = len(range(self.cfg.save_every_n_epochs, self.cfg.epochs + 1, self.cfg.save_every_n_epochs))
+        print(f"[{self.TAG}] the job: {need} training images to render ({len(keys)} sets), then {len(todo)} trainings "
+              f"x {self._total_steps()} steps, each scored on {len(self._cells()[0]) * (saves + 1)} images", flush=True)
+        eta = _Eta(self.TAG, "training sets", need) if need else None
+        for key in keys:
+            self._render_dataset(*key, eta=eta)
         self._baseline()                                                      # the shared no-LoRA cells
-        print(f"[{self.TAG}] training sets + baseline ready in {time.time() - t0:.0f} s", flush=True)
+        print(f"[{self.TAG}] training sets + baseline ready in {_hms(time.time() - t0)}", flush=True)
+        arms_eta = _Eta(self.TAG, "sequence", len(todo), unit="arms done", every=0)
         if parallel > 1:
-            self._run_parallel(todo, repo, metas, parallel=parallel, stop_on_error=stop_on_error)
+            self._run_parallel(todo, repo, metas, parallel=parallel, stop_on_error=stop_on_error, arms_eta=arms_eta)
         else:
             for spec in todo:
                 try:
@@ -659,6 +749,7 @@ class SanaRunner(_RunnerMixin):
                     self._record_failure(spec, repo, metas, e)
                     if stop_on_error:
                         raise
+                arms_eta.add()
                 self._safe(lambda: self._publish_index(repo, metas))
         reads = sx.sequence_reads({k: m for k, m in metas.items() if m.get("status") == "done"}, self.BED.roles)
         print(f"[{self.TAG}] reads across the sequence:", json.dumps(reads, indent=1, default=float), flush=True)
@@ -674,7 +765,8 @@ class SanaRunner(_RunnerMixin):
         self._safe(lambda: self._publish_index(repo, metas))
         print(f"[{self.TAG}] {spec.id} FAILED: {e}", flush=True)
 
-    def _run_parallel(self, todo: list, repo: "_HubRepo", metas: dict, *, parallel: int, stop_on_error: bool) -> None:
+    def _run_parallel(self, todo: list, repo: "_HubRepo", metas: dict, *, parallel: int, stop_on_error: bool,
+                      arms_eta: "_Eta | None" = None) -> None:
         """Up to `parallel` trainers at once, each with its own deepspeed port; an arm waits while another arm on the same
         training set is training (one writer per cache). A finished trainer's arm is evaluated here while the others keep
         training. On a failure (stop_on_error) no new arm starts; the running ones finish and are evaluated, then it raises.
@@ -725,10 +817,12 @@ class SanaRunner(_RunnerMixin):
                     except Exception as e:  # noqa: BLE001
                         self._record_failure(r["spec"], repo, metas, e)
                         error = e if stop_on_error and error is None else error
+                    if arms_eta is not None:
+                        arms_eta.add()
                     self._safe(lambda: self._publish_index(repo, metas))
                 if running and time.time() - last_status >= 30:
                     last_status = time.time()
-                    print(f"[{self.TAG}] " + " | ".join(f"{a.split('_')[0]} {_progress(r['ctx']['log'])}"
+                    print(f"[{self.TAG}] " + " | ".join(f"{a.split('_')[0]} {_progress(r['ctx']['log'], r['ctx'].get('steps'))}"
                                                  for a, r in running.items())
                           + (f" | waiting: {', '.join(s.id.split('_')[0] for s in queue)}" if queue else ""), flush=True)
         except KeyboardInterrupt:
@@ -767,7 +861,7 @@ class SanaRunner(_RunnerMixin):
         if self._base is None:
             self._assert_stock()
             cells, prompts, seeds = self._cells()
-            imgs = self._render(prompts, seeds)
+            imgs = self._render_tracked(prompts, seeds, _Eta(self.TAG, "baseline (no LoRA)", len(prompts)))
             feats, scores = self._score(imgs)
             self._base = {"images": imgs, "feats": feats, "scores": [float(x) for x in scores],
                           "pixels": [_pixel_stats(im) for im in imgs]}
@@ -793,7 +887,7 @@ class SanaRunner(_RunnerMixin):
         start.update(_folder_files(img_dir.parent, f"{base}/data", allow=["items.jsonl", "sheet.jpg"]))
         repo.commit(start, f"{spec.id}: started (README, config, training-set list)")
         return {"arm": arm, "base": base, "out_dir": out_dir, "log": log, "recipe": recipe, "lora_toml": lora_toml,
-                "uploaded": set()}
+                "uploaded": set(), "steps": self._total_steps()}
 
     @staticmethod
     def _epoch_files(ctx: dict, *, final: bool = False) -> dict:
@@ -819,7 +913,8 @@ class SanaRunner(_RunnerMixin):
         plan = _launch.build_plan(config_toml=str(ctx["lora_toml"]), num_gpus=self.cfg.num_gpus)
         t0 = time.time()
         _launch.launch(plan, log_path=str(ctx["log"]),
-                       monitor=self._follow(str(ctx["log"]), on_tick=ship_epochs, tick_s=300.0))
+                       monitor=self._follow(str(ctx["log"]), on_tick=ship_epochs, tick_s=300.0, tag=self.TAG,
+                                            label=f"{spec.id} training", total_steps=ctx["steps"]))
         return self._arm_finish(spec, repo, metas, ctx, time.time() - t0)
 
     def _after_train(self, spec: "sx.ArmSpec", ctx: dict, epochs: list) -> "dict | None":
@@ -847,12 +942,13 @@ class SanaRunner(_RunnerMixin):
         pipe = self._eval_pipe()
         final_n = epochs[-1][0]
         rows, per_cell, by_epoch, final_imgs = [], {}, {}, {}
+        eta = _Eta(self.TAG, f"{spec.id} scoring", len(prompts) * (len(epochs) + 1))
         for n, d in epochs:
             name = f"{spec.id.split('_')[0]}_ep{n}"
             pipe.load_lora_weights(str(d), weight_name="adapter_model.safetensors", adapter_name=name)
             for sc in ([0.5, 1.0] if n == final_n else [1.0]):
                 pipe.set_adapters([name], adapter_weights=[sc])
-                imgs = self._render(prompts, seeds)
+                imgs = self._render_tracked(prompts, seeds, eta)
                 feats, scores = self._score(imgs)
                 diffs = [float(s - s0) for s, s0 in zip(scores, b["scores"])]
                 keep = [float(x) for x in (feats * b["feats"]).sum(-1)]
