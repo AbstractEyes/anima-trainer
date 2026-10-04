@@ -15,13 +15,16 @@ Every experiment lives in its own folder of one model repo (default AbstractPhil
     experiments/<id>/logs/             the training log
 
 Pure Python (no torch); the runner (sana_runner.SanaRunner.run_sequence) does the GPU work.
+
+The rules and the layout are shared by every model bed; what differs between beds (the model, its repo, the prompt
+wording, the reference learning rate, the README text) is one Bed record: SANA here, ANIMA in anima_experiments.py.
 """
 
 from __future__ import annotations
 
 import json
 import statistics
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 DEFAULT_REPO = "AbstractPhil/geolip-beatrix-sana"
 BASE_MODEL = "Efficient-Large-Model/Sana_600M_512px_diffusers"
@@ -94,11 +97,42 @@ DRAW_ROLES = {"up": ("up", 1e-4), "neutral": ("neutral", 1e-4), "down": ("down",
               "lr_half": ("up", 5e-5), "lr_double": ("up", 2e-4)}
 
 
+@dataclass(frozen=True)
+class Bed:
+    """What differs between the model beds: the model and its repos, the prompt wording, the sequence and its
+    reference learning rate, and the public README text. The rules and the folder layout are shared."""
+    key: str                                  # 'sana' | 'anima'
+    model_name: str                           # as the READMEs name it
+    base_model: str                           # the HF repo of the weights
+    repo: str                                 # the experiments repo (one folder per experiment)
+    model_type: str                           # the diffusion-pipe model type
+    templates: dict                           # flavor -> two prompt templates ({s} = the scene)
+    neutral_caption: str                      # every training image's caption, and the evaluation prompt
+    sequence: tuple                           # the LoRA arms (ArmSpec), in order
+    roles: dict                               # role inside a draw -> (flavor, learning rate)
+    reference_note: str                       # which arm each change is made from (arm README)
+    lora_files: str                           # the arm README's line for lora/epochN
+    title: str                                # the repo README's heading
+    intro: str                                # the repo README's opening paragraph
+    tools: str                                # the repo README's Tools section
+    licence: str                              # the repo README's Licences section
+    yaml_license: str                         # the model-card licence field
+    tags: tuple
+    judge_text: str
+    references: tuple = ()
+    extra_meta_kinds: tuple = field(default=())   # experiment kinds besides 'lora' the index lists (all are listed)
+
+    @property
+    def reference_lr(self) -> float:
+        return self.roles["up"][1]
+
+
 def items_for(subjects: list[str], train_idx: list[int], flavor: str, *, seeds_per_subject: int = 8,
-              seed_base: int = 1000, caption_template: str = "a photo of {s}") -> list[dict]:
+              seed_base: int = 1000, caption_template: str = "a photo of {s}",
+              templates: "dict | None" = None) -> list[dict]:
     """The training set: each training subject x seed -> a prompt of `flavor` (its two templates alternating),
     captioned with the neutral caption."""
-    tps = FLAVOR_TEMPLATES[flavor]
+    tps = (templates or FLAVOR_TEMPLATES)[flavor]
     out = []
     for si in train_idx:
         s = subjects[si]
@@ -158,14 +192,14 @@ def replicate_read(a: dict, b: dict) -> str:
     return "REPLICATES" if both and close else ("BOTH WORK, SIZES DIFFER" if both else "DOES NOT REPLICATE")
 
 
-def roles_of_draw(metas: dict, seed_base: int) -> dict:
+def roles_of_draw(metas: dict, seed_base: int, roles: "dict | None" = None) -> dict:
     """{role: meta} for the done LoRA arms trained on the draw of images starting at seed_base."""
     out = {}
     for m in metas.values():
         s = m.get("spec") or {}
         if m.get("kind") != "lora" or s.get("seed_base") != seed_base or "final" not in m:
             continue
-        for role, (flavor, lr) in DRAW_ROLES.items():
+        for role, (flavor, lr) in (roles or DRAW_ROLES).items():
             if s.get("flavor") == flavor and abs(float(s.get("lr", 0.0)) - lr) < 1e-12:
                 out[role] = m
     return out
@@ -192,18 +226,18 @@ def draw_reads(roles: dict) -> dict:
     return out
 
 
-def sequence_reads(metas: dict) -> dict:
+def sequence_reads(metas: dict, roles: "dict | None" = None) -> dict:
     """The cross-arm reads over whatever arms are done (keyed by arm id; each meta carries 'final' and
     'final_diffs'): per draw of training images, the replicate of the upbeat arm across draws, and SETTLED /
     UNSETTLED for every read present on two draws (the same verdict on both = SETTLED)."""
     out: dict = {}
     draws = sorted({(m.get("spec") or {}).get("seed_base") for m in metas.values()
                     if m.get("kind") == "lora" and "final" in m} - {None})
-    per = {d: draw_reads(roles_of_draw(metas, d)) for d in draws}
+    per = {d: draw_reads(roles_of_draw(metas, d, roles)) for d in draws}
     for d in draws:
         if per[d]:
             out[f"draw_{d}"] = per[d]
-    ups = [roles_of_draw(metas, d).get("up") for d in draws]
+    ups = [roles_of_draw(metas, d, roles).get("up") for d in draws]
     ups = [u for u in ups if u]
     if len(ups) >= 2:
         out["replicate"] = replicate_read(ups[0]["final"], ups[1]["final"])
@@ -252,14 +286,24 @@ def _fmt(x, nd=3, sign=True):
     return f"{x:+.{nd}f}" if sign else f"{x:.{nd}f}"
 
 
-def render_reads(reads: dict | None) -> str:
+def reference_arm(spec: ArmSpec, bed: "Bed | None" = None) -> "ArmSpec | None":
+    """The upbeat arm at the reference learning rate on the same draw of images: what a control is read against."""
+    bed = bed or SANA
+    for a in bed.sequence:
+        if a.flavor == "up" and a.seed_base == spec.seed_base and abs(a.lr - bed.reference_lr) < 1e-12:
+            return a
+    return None
+
+
+def render_reads(reads: dict | None, bed: "Bed | None" = None) -> str:
     """The cross-arm reads in plain words (empty until two related arms are done)."""
+    bed = bed or SANA
     if not reads:
         return ""
     draws = sorted(int(k.split("_")[1]) for k in reads if k.startswith("draw_"))
     out = ["## Reads across the LoRA sequence (rules fixed before the runs)",
-           "Each draw is one independent set of training images (seeds N to N+7); its upbeat LoRA at learning rate 1e-4 "
-           "is the reference the control, the mirror and the learning rates are read against.", "",
+           f"Each draw is one independent set of training images (seeds N to N+7); its upbeat LoRA at learning rate "
+           f"{bed.reference_lr:g} is the reference the control, the mirror and the learning rates are read against.", "",
            "| read | " + " | ".join(f"draw {d}-{d + 7}" for d in draws) + " |",
            "|---|" + "---|" * len(draws)]
 
@@ -297,29 +341,25 @@ def render_reads(reads: dict | None) -> str:
     return "\n".join(out) + "\n"
 
 
-def render_repo_readme(metas: list[dict], reads: dict | None = None) -> str:
+def render_repo_readme(metas: list[dict], reads: dict | None = None, bed: "Bed | None" = None) -> str:
+    bed = bed or SANA
     rows = []
     for m in sorted(metas, key=lambda m: m["id"]):
         status = m.get("status", "")
         res = m.get("summary") or {"running": "running", "failed": "failed (see its log)"}.get(status, status)
         rows.append(f"| [`{m['id']}`](experiments/{m['id']}/) | {m.get('date', '')} | {m.get('title', '')} | {res} |")
-    refs = "\n".join(f"- {t}. {u}" for t, u in REFERENCES)
-    reads_md = render_reads(reads)
+    refs = "\n".join(f"- {t}. {u}" for t, u in bed.references)
+    reads_md = render_reads(reads, bed)
+    tags = "\n".join(f"- {t}" for t in bed.tags)
     return f"""---
-license: apache-2.0
-base_model: {BASE_MODEL}
+license: {bed.yaml_license}
+base_model: {bed.base_model}
 tags:
-- sana
-- lora
-- diffusers
-- text-to-image
-- experiments
+{tags}
 ---
-# geolip-beatrix-sana
+# {bed.title}
 
-Experiments on the way to conditioning [Sana](https://github.com/NVlabs/Sana), a fast text-to-image diffusion model, on
-Beatrix, a byte-level language model from the geolip line, through a trained connector. Sana 600M at 512 px is the test
-bed: small enough to train and measure in minutes. The repo also keeps the experiments that led here.
+{bed.intro}
 
 Each experiment has its own folder under `experiments/` with a README (the question, the recipe, the rule fixed before
 the run, the result), `meta.json`, and its configuration, weights, evaluation and logs where it has them.
@@ -331,50 +371,51 @@ the run, the result), `meta.json`, and its configuration, weights, evaluation an
 
 {reads_md}
 ## How the mood experiments are measured
-{JUDGE_TEXT}
+{bed.judge_text}
 
 The LoRA experiments train on 24 everyday scenes and are scored on 8 scenes they never saw (4 seeds each, 32 paired
 cells): each cell compares the same prompt and seed with and without the LoRA.
 
 ## Tools
-Training: [diffusion-pipe](https://github.com/AbstractEyes/diffusion-pipe) (the AbstractEyes fork, model type `sana`),
-driven by [anima-trainer](https://github.com/AbstractEyes/anima-trainer) (`notebooks/sana_colab_train.ipynb`). The LoRAs
-are in diffusers format: `pipe.load_lora_weights("experiments/<id>/lora/epochN", weight_name="adapter_model.safetensors")`.
+{bed.tools}
 
 ## References
 {refs}
 
 ## Licences
-Sana's weights are Apache-2.0; its Gemma-2-2B-IT text encoder is under Google's
-[Gemma Terms of Use](https://ai.google.dev/gemma/terms). The LoRAs and results here are Apache-2.0.
+{bed.licence}
 """
 
 
-def render_arm_readme(spec: ArmSpec, recipe: dict, meta: dict | None = None) -> str:
+def render_arm_readme(spec: ArmSpec, recipe: dict, meta: dict | None = None, bed: "Bed | None" = None) -> str:
+    bed = bed or SANA
     rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
     dname = {1: "upward", -1: "downward", 0: "either way"}[spec.direction]
     if spec.direction == 0:
-        rule = ("A control: the numbers are reported, and read against e004: the control is QUIET when its mean effect "
-                "is at most one third of e004's, and MOVES otherwise. The net read (e004 minus this control, per cell) "
-                "says the mood comes from the images when its mean is above 0, at least 75% of the cells are positive "
-                "and the mean is beyond 3 standard errors.")
+        ref = reference_arm(spec, bed)
+        rid = ref.id.split("_")[0] if ref else "the upbeat LoRA of the same draw"
+        rule = (f"A control: the numbers are reported, and read against {rid} (the upbeat LoRA on the same draw of "
+                f"images): the control is QUIET when its mean effect is at most one third of {rid}'s, and MOVES "
+                f"otherwise. The net read ({rid} minus this control, per cell) says the mood comes from the images when "
+                "its mean is above 0, at least 75% of the cells are positive and the mean is beyond 3 standard errors.")
     else:
         rule = (f"Paired over the 32 held-out cells, the final LoRA at scale 1 minus no LoRA, read {dname}: "
                 f"**FLAVOR LORA** = the mean moves {dname}, at least 75% of the cells move that way, and the mean is "
                 "beyond 3 standard errors; **NO EFFECT** = the mean is within 2 standard errors of zero or under 60% "
                 "of the cells move that way; **MIXED** otherwise.")
+    caption = bed.neutral_caption.format(s="<scene>")
     out = [f"# {spec.id}: {spec.title}", "",
-           f"Date: {spec.date}. Model: Sana 600M 512px ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})). "
-           "Trainer: diffusion-pipe (AbstractEyes fork, model type `sana`) through anima-trainer.", "",
+           f"Date: {spec.date}. Model: {bed.model_name} ([{bed.base_model}](https://huggingface.co/{bed.base_model})). "
+           f"Trainer: diffusion-pipe (AbstractEyes fork, model type `{bed.model_type}`) through anima-trainer.", "",
            "## Question", spec.question, "",
            "## Training data",
            f"192 images rendered by the stock model from {FLAVOR_WORDS[spec.flavor]} prompts (24 scenes x 8 seeds, "
            f"seeds {spec.seed_base}-{spec.seed_base + 7}, the two {FLAVOR_WORDS[spec.flavor]} templates alternating), "
-           "each captioned with the neutral prompt \"a photo of <scene>\". Eight more scenes are held out for the "
+           f"each captioned with the neutral prompt \"{caption}\". Eight more scenes are held out for the "
            "evaluation. The item list is in `data/items.jsonl`.", "",
-           f"Changed from the reference recipe (e004; on the second draw of images, e007): {spec.changed}.", "",
+           f"Changed from the reference recipe ({bed.reference_note}): {spec.changed}.", "",
            "## Recipe", "| setting | value |", "|---|---|", rec, "",
-           "## The rule (fixed before the run)", rule, "", JUDGE_TEXT, ""]
+           "## The rule (fixed before the run)", rule, "", bed.judge_text, ""]
     if meta and meta.get("status") == "done":
         beside = meta.get("trained_beside")
         out += ["## Result", meta.get("summary", ""), ""]
@@ -405,7 +446,7 @@ def render_arm_readme(spec: ArmSpec, recipe: dict, meta: dict | None = None) -> 
     else:
         out += ["## Result", "Running.", ""]
     out += ["## Files",
-            "- `lora/epochN/adapter_model.safetensors`: every saved epoch (diffusers format).",
+            f"- `lora/epochN/adapter_model.safetensors`: {bed.lora_files}",
             "- `samples/`: the trainer's own preview images at each save.",
             "- `eval/`: `final.json` (every cell), `epochs.json` (the effect at each epoch), the contact sheets.",
             "- `config/`: the training configuration. `logs/train.log`: the trainer's log.", ""]
@@ -415,6 +456,27 @@ def render_arm_readme(spec: ArmSpec, recipe: dict, meta: dict | None = None) -> 
 def arm_meta(spec: ArmSpec, status: str, **kw) -> dict:
     return {"id": spec.id, "title": spec.title, "date": spec.date, "kind": "lora", "status": status,
             "spec": asdict(spec), **kw}
+
+
+SANA = Bed(
+    key="sana", model_name="Sana 600M 512px", base_model=BASE_MODEL, repo=DEFAULT_REPO, model_type="sana",
+    templates=FLAVOR_TEMPLATES, neutral_caption="a photo of {s}", sequence=tuple(SEQUENCE), roles=DRAW_ROLES,
+    reference_note="e004; on the second draw of images, e007",
+    lora_files="every saved epoch (diffusers format).",
+    title="geolip-beatrix-sana",
+    intro=("Experiments on the way to conditioning [Sana](https://github.com/NVlabs/Sana), a fast text-to-image diffusion "
+           "model, on\nBeatrix, a byte-level language model from the geolip line, through a trained connector. Sana 600M "
+           "at 512 px is the test\nbed: small enough to train and measure in minutes. The repo also keeps the experiments "
+           "that led here."),
+    tools=("Training: [diffusion-pipe](https://github.com/AbstractEyes/diffusion-pipe) (the AbstractEyes fork, model type "
+           "`sana`),\ndriven by [anima-trainer](https://github.com/AbstractEyes/anima-trainer) "
+           "(`notebooks/sana_colab_train.ipynb`). The LoRAs\nare in diffusers format: "
+           "`pipe.load_lora_weights(\"experiments/<id>/lora/epochN\", weight_name=\"adapter_model.safetensors\")`."),
+    licence=("Sana's weights are Apache-2.0; its Gemma-2-2B-IT text encoder is under Google's\n"
+             "[Gemma Terms of Use](https://ai.google.dev/gemma/terms). The LoRAs and results here are Apache-2.0."),
+    yaml_license="apache-2.0", tags=("sana", "lora", "diffusers", "text-to-image", "experiments"),
+    judge_text=JUDGE_TEXT, references=tuple(REFERENCES))
+BED = SANA
 
 
 def dumps(obj) -> bytes:

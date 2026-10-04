@@ -150,6 +150,11 @@ class RunConfig:
     map_num_proc: int | None = None
     steps_per_print: int = 10
     blocks_to_swap: int = 0          # 0 = disabled; VRAM is abundant.
+    # fp32 MASTER weights over the bf16 trainable leaves (the AbstractEyes fork's MasterWeightsAdam, [optimizer]
+    # type 'adam' only). Without it a plain optimizer steps directly on bf16 leaves and any update under half a
+    # bf16 ULP at the weight's magnitude rounds to nothing (a LoRA's A matrix at Anima's 2e-5 learning rate).
+    # Emitted only when True, so existing configs are unchanged.
+    bf16_master_weights: bool = False
 
 
 # =============================================================================
@@ -390,6 +395,8 @@ def render_lora_toml(cfg: TrainConfig) -> str:
         lines.append(f"save_every_n_steps = {r.save_every_n_steps}")
     if r.map_num_proc is not None:    # decode-worker pool (omitted -> diffusion-pipe default)
         lines.append(f"map_num_proc = {r.map_num_proc}")
+    if r.bf16_master_weights:         # fp32 masters over the bf16 trainable weights (fork: utils/master_adam.py)
+        lines.append("bf16_master_weights = true")
 
     m = cfg.model
     if m.type == "sana":
@@ -670,6 +677,11 @@ def validate(cfg: TrainConfig, *, strict: bool = True) -> TrainConfig:
             warns.append(f"{label}={val}: fp8/e4m3 degrades this lineage; bf16 only on 96GB.")
     if cfg.model.dtype != "bfloat16":
         warns.append(f"model.dtype={cfg.model.dtype}: the brief mandates bf16 throughout.")
+    if cfg.run.bf16_master_weights:
+        if cfg.optimizer.type.lower() != "adam":
+            errs.append(f"bf16_master_weights needs [optimizer] type 'adam' (got {cfg.optimizer.type!r}).")
+        if cfg.model.dtype != "bfloat16":
+            errs.append(f"bf16_master_weights needs model.dtype 'bfloat16' (got {cfg.model.dtype!r}).")
     if cfg.run.blocks_to_swap or cfg.run.activation_checkpointing:
         warns.append("block_swap/activation_checkpointing enabled: unnecessary on 96GB, slower.")
 

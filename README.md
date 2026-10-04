@@ -197,6 +197,12 @@ cache → two-phase train):
   through diffusers and scored on held-out subjects, and each experiment uploads into its own folder of
   [AbstractPhil/geolip-beatrix-sana](https://huggingface.co/AbstractPhil/geolip-beatrix-sana). See
   [Sana](#sana-diffusers-format) and `notebooks/README.md`.
+- **`anima_colab_experiments.ipynb`** — the same experiment system on **Anima**
+  (`geolip_anima_trainer.anima_runner.AnimaRunner`): e001 measures the stock model (mood words, a mood
+  direction added to the conditioning before and after the LLM adapter, the conditioning norms), then the
+  LoRA arms, each into its own folder of
+  [AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). See
+  [Anima experiments](#anima-experiments-the-flavor-bed).
 
 ## Programmatic / sweeps
 
@@ -261,12 +267,47 @@ What differs from Anima:
 - **Colab**: `notebooks/sana_colab_train.ipynb` + `geolip_anima_trainer.sana_runner.SanaRunner` run a
   whole LoRA end to end (install with the fork, data, configs, training, a diffusers load of the LoRA,
   an evaluation on held-out prompts, an optional private HF backup).
-- **Status**: the parity checks above ran on Windows against the diffusers pipeline; LoRA training itself
-  (deepspeed, Linux) has not yet been run end to end. The Colab notebook is the first run.
+- **Status**: the parity checks above ran on Windows against the diffusers pipeline, and LoRA training has
+  since run end to end on Colab (an RTX PRO 6000): six LoRA experiments, each loaded back through
+  diffusers and scored (geolip-beatrix-sana e004-e009).
+- **Side by side**: `s.run_sequence(parallel=3)` trains up to three arms at once on one card (each its own
+  trainer process and rendezvous port; two arms on the same training set never overlap); the notebook
+  evaluates finished arms while the others train.
 
 > **Licences.** The Sana diffusers checkpoints are Apache-2.0; the bundled Gemma-2-2B-IT text encoder
 > is under Google's [Gemma Terms of Use](https://ai.google.dev/gemma/terms) and
 > [Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy).
+
+## Anima experiments (the flavor bed)
+
+`geolip_anima_trainer.anima_runner.AnimaRunner` runs the Sana experiment system on Anima (the same
+sequence machinery, verdict rules and repo layout; `anima_experiments.py` holds the Anima registry and
+README text, `sana_experiments.Bed` what differs between the two). Notebook:
+`notebooks/anima_colab_experiments.ipynb`; experiments repo:
+[AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima).
+
+```python
+from geolip_anima_trainer.anima_runner import AnimaRunner
+a = AnimaRunner()          # Anima-Base v1.0, 768 px
+a.setup()                  # GPU + the fork + the three model files
+a.run_flavor_test()        # e001: the stock model
+a.run_sequence()           # e002..e011: the LoRA arms
+```
+
+- **Recipe** (from the model card): Anima-Base v1.0; LoRA rank 32 at 2e-5 (half and double as arms), the
+  LLM adapter frozen; plain Adam, weight decay 0, **fp32 master weights** over the bf16 LoRA
+  (`RunConfig.bf16_master_weights`, the fork's `MasterWeightsAdam`: without it, Adam steps on bf16 weights
+  lose every update under half a bf16 step); prompts with the card's quality prefix and negative prompt.
+- **Rendering** happens in the notebook process with the fork's own Anima model code (`AnimaPipe`: Qwen3
+  0.6B, the LLM adapter, the DiT, the Qwen-Image VAE; the Euler flow sampler of the training previews,
+  batched over prompts). Trained LoRAs (ComfyUI format) are applied by forward hooks (`LoraHooks`), so the
+  stock weights never change. The first arm of a session compares this renderer with the trainer's own
+  preview images (stock and with the LoRA) and records the pixel difference in the arm's `meta.json`.
+- **e001** adds a mood direction to the conditioning at two sites: the Qwen3 states the LLM adapter reads,
+  and the adapter's output the DiT cross-attends to (both 1,024 wide).
+
+> **Licence.** Anima's weights are under the CircleStone Labs Non-Commercial License (a derivative of
+> NVIDIA Cosmos-Predict2-2B, NVIDIA Open Model License); LoRAs trained on it share those terms.
 
 ## Targets at a glance
 | | Local (smoke-test) | Training target |

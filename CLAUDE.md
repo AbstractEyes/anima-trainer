@@ -473,7 +473,32 @@ resident across arms. Verdicts (`sana_experiments`): `arm_outcome(diffs, directi
 meta.json (re-read before each publish, so folders added meanwhile survive). A failed arm uploads meta
 `failed` + its log and stops the run; a rerun skips arms whose meta says done. Public prose only in the
 generated READMEs (a test bans in-house words). `tests/test_sana_sequence.py` runs the whole sequence
-against a fake trainer, pipeline and hub.
+against a fake trainer, pipeline and hub. `run_sequence(parallel=N)` trains up to N arms at once (each its own
+trainer via `launch.spawn` + `LaunchPlan.master_port` on a free port; never two running arms on one training
+set, so each cache has one writer; finished arms evaluated in the kernel while the others train; on a failure
+no new arm starts, the running ones finish, then it raises; Ctrl-C terminates the trainers it started). A
+control's summary reads against the upbeat arm of its OWN draw (`sana_experiments.reference_arm`).
+
+### Anima experiments — `anima_runner.py` + `anima_experiments.py` + `anima_colab_experiments.ipynb`
+The Sana sequence machinery on Anima (2026-10-03), uploading to `AbstractPhil/geolip-beatrix-anima`. What
+differs between beds is one `sana_experiments.Bed` record (model, repo, prompt wording, sequence + reference
+lr, README text): `SANA` / `anima_experiments.ANIMA`; the runner holds it as `BED` (+ `GEN_*`, `NEGATIVE`).
+`AnimaRunner(SanaRunner)`: `setup()` downloads the three files (`base="base-v1.0"`; the card: LoRAs train on
+Base); `run_flavor_test()` = e001 (words, the conditioning norms, a mood dial at the `source` site = the
+Qwen3 states the LLM adapter reads and the `context` site = the adapter output the DiT cross-attends to);
+`run_sequence()` = e002-e011. Recipe from the model card: rank 32 at 2e-5, `llm_adapter_lr = 0`, plain Adam
+wd 0 + `bf16_master_weights = true` (RunConfig field, emitted only when True; validate() requires type 'adam'
+and bf16 — without masters, Adam on bf16 leaves drops every update under half a bf16 step: the card's 2e-5
+on LoRA A values ~0.02 is exactly that regime), 768 px, 30 steps / guidance 4.5 / shift 3, the card's quality
+prefix + negative prompt, "illustration" wording (the card: no realism). Rendering: `AnimaPipe` loads the
+fork's `models/cosmos_predict2.py` IN the kernel (fork dir on sys.path, cwd = fork while the tokenizers load,
+`utils.common.AUTOCAST_DTYPE` set before import; it refuses a foreign `utils`/`models` already imported) and
+runs the previews' Euler sampler batched over prompts (per-image seeded noise, per-image VAE decode).
+LoRAs: `LoraHooks` (ComfyUI keys `diffusion_model.<path>.lora_A/B.weight`, alpha/r from adapter_config.json,
+zero-B modules skipped — the frozen LLM adapter's LoRA) as forward hooks; stock weights never change. The
+first arm per session compares the kernel renders against the trainer's own step-0 and final-epoch previews
+(`_after_train`; `renderer_parity` in meta, MATCHES <= 2 levels mean). `tests/test_anima_runner.py`: the
+hooks against merged weights on a CPU model, the config, the registry/READMEs, the sequence and e001 with fakes.
 
 ### Training previews — `SamplesConfig` → `[samples]`
 `TrainConfig.samples = SamplesConfig(prompts=[...])` renders a `[samples]` table into the lora toml

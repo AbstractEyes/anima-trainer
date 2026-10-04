@@ -129,7 +129,7 @@ def _drop_torchao() -> bool:
         version = md.version("torchao")
     except md.PackageNotFoundError:
         return False
-    print(f"[sana] uninstalling torchao {version}: peft refuses it when building LoRA layers", flush=True)
+    print(f"[setup] uninstalling torchao {version}: peft refuses it when building LoRA layers", flush=True)
     subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "-q", "torchao"], check=False)
     return True
 
@@ -256,7 +256,7 @@ class _HubRepo:
                 code = getattr(getattr(e, "response", None), "status_code", None)
                 if wait is None or code in (401, 403, 404):
                     raise
-                print(f"[sana] upload '{msg}' failed ({type(e).__name__}: {str(e)[:120]}); retry in {wait} s", flush=True)
+                print(f"[hub] upload '{msg}' failed ({type(e).__name__}: {str(e)[:120]}); retry in {wait} s", flush=True)
                 time.sleep(wait)
 
     def put(self, path_in_repo: str, data: "bytes | str", msg: str, *, retry: bool = True) -> None:
@@ -315,10 +315,15 @@ class SanaConfig:
 
 class SanaRunner(_RunnerMixin):
     """Stateful Sana orchestrator (one method per notebook cell, idempotent, run in order). State is
-    in-memory (mirrored to {data_root}/sana_state.json); a fresh runtime re-runs setup() first."""
+    in-memory (mirrored to {data_root}/sana_state.json); a fresh runtime re-runs setup() first.
+    The sequence machinery is shared with anima_runner.AnimaRunner: what differs per model is BED (the experiment
+    registry + README text) and the generation settings below."""
     TAG = "sana"
     STATE_FILE = "sana_state.json"
     EXPECT_SM = None                             # any CUDA GPU with bf16 runs the 600M recipe
+    BED = sx.SANA
+    GEN_STEPS, GEN_CFG, GEN_SHIFT = GEN_STEPS, GEN_CFG, 3.0
+    NEGATIVE = ""                                # the previews' negative prompt (the stock pipeline renders without one)
 
     def __init__(self, config: "SanaConfig | None" = None, **overrides):
         self.cfg = config or SanaConfig.from_env(**overrides)
@@ -379,11 +384,15 @@ class SanaRunner(_RunnerMixin):
             if c and Path(c, "models", "sana.py").is_file():
                 os.environ["ANIMA_DIFFUSION_PIPE"] = c
                 self.state["diffusion_pipe"] = c
-                print(f"[sana] diffusion-pipe with Sana: {c}")
+                print(f"[{self.TAG}] diffusion-pipe (the AbstractEyes fork): {c}")
                 return c
         raise RuntimeError("no diffusion-pipe with models/sana.py found — run the bootstrap cell with "
                            "anima_colab.install(..., dp_url=anima_colab.DP_FORK_URL), or point "
                            "ANIMA_DIFFUSION_PIPE at an AbstractEyes diffusion-pipe checkout.")
+
+    def _need_model(self) -> None:
+        """setup() has located the model (the shared sequence code asks before any GPU work)."""
+        self._need("diffusers_path")
 
     def _download_model(self) -> str:
         if self.cfg.diffusers_path:
@@ -421,7 +430,12 @@ class SanaRunner(_RunnerMixin):
 
     def _cells(self) -> tuple[list[tuple[int, int]], list[str], list[int]]:
         cells = [(si, seed) for si in HELD_OUT for seed in self.cfg.eval_seeds]
-        return cells, [NEUTRAL_TEMPLATE.format(s=SUBJECTS[si]) for si, _ in cells], [s for _, s in cells]
+        return cells, [self.BED.neutral_caption.format(s=SUBJECTS[si]) for si, _ in cells], [s for _, s in cells]
+
+    def _items(self, flavor: str = "up", seed_base: int = 1000) -> list[dict]:
+        """A training-set plan in this bed's wording (each training scene x seed, captioned neutrally)."""
+        return sx.items_for(SUBJECTS, TRAIN, flavor, seeds_per_subject=self.cfg.seeds_per_subject, seed_base=seed_base,
+                            caption_template=self.BED.neutral_caption, templates=self.BED.templates)
 
     def _assert_stock(self) -> None:
         """No LoRA may be loaded while stock images are rendered (training sets, the baseline)."""
@@ -452,7 +466,7 @@ class SanaRunner(_RunnerMixin):
             return str(d)
         self._need("resolution")
         out = self._render_dataset("up", 1000)
-        self.state.update(dataset_dir=str(out), n_images=len(mood_items(self.cfg.seeds_per_subject)))
+        self.state.update(dataset_dir=str(out), n_images=len(self._items()))
         self._save_state()
         print(f"[sana] dataset: {out} ({self.state['n_images']} upbeat images captioned neutrally; "
               f"{len(HELD_OUT)} subjects held out for evaluate())")
@@ -464,7 +478,7 @@ class SanaRunner(_RunnerMixin):
         root = Path(self._need("data_root")) / "datasets" / f"{flavor}_{seed_base}"
         img_dir = root / "images"
         img_dir.mkdir(parents=True, exist_ok=True)
-        items = mood_items(self.cfg.seeds_per_subject, flavor, seed_base)
+        items = self._items(flavor, seed_base)
         (root / "items.jsonl").write_text("".join(json.dumps(it) + "\n" for it in items), encoding="utf-8")
         todo = [it for it in items if not (img_dir / f"{it['name']}.png").is_file()]
         if todo:
@@ -474,7 +488,7 @@ class SanaRunner(_RunnerMixin):
                 for it, img in zip(chunk, self._render([c["prompt"] for c in chunk], [c["seed"] for c in chunk])):
                     img.save(img_dir / f"{it['name']}.png")
                     (img_dir / f"{it['name']}.txt").write_text(it["caption"], encoding="utf-8")
-            print(f"[sana] rendered {len(todo)} {flavor} training images (seeds {seed_base}+) -> {img_dir}", flush=True)
+            print(f"[{self.TAG}] rendered {len(todo)} {flavor} training images (seeds {seed_base}+) -> {img_dir}", flush=True)
         if not (root / "sheet.jpg").is_file():
             from PIL import Image
             firsts = [Image.open(img_dir / f"{it['name']}.png") for it in items[::self.cfg.seeds_per_subject]]
@@ -488,9 +502,10 @@ class SanaRunner(_RunnerMixin):
         model = _api.sana_model(self._need("diffusers_path"))
         prompts = self.cfg.preview_prompts
         if prompts is None and held_out_previews:
-            prompts = [NEUTRAL_TEMPLATE.format(s=SUBJECTS[i]) for i in HELD_OUT[:4]]
-        samples = _api.SamplesConfig(prompts=list(prompts), negative_prompt="", width=res, height=res,
-                                     steps=GEN_STEPS, cfg=GEN_CFG, shift=3.0, seed=42) if prompts else None
+            prompts = [self.BED.neutral_caption.format(s=SUBJECTS[i]) for i in HELD_OUT[:4]]
+        samples = _api.SamplesConfig(prompts=list(prompts), negative_prompt=self.NEGATIVE, width=res, height=res,
+                                     steps=self.GEN_STEPS, cfg=self.GEN_CFG, shift=self.GEN_SHIFT,
+                                     seed=42) if prompts else None
         opt = _api.preset_optimizer(model)
         opt.lr = lr
         cfg = _api.TrainConfig(
@@ -600,20 +615,21 @@ class SanaRunner(_RunnerMixin):
         cfg.repo_id. Arms the repo already lists as done are skipped (a rerun resumes). parallel > 1 trains that many
         arms side by side on the card (each its own trainer process and port; two arms on the same training set never
         overlap, so its cache has one writer); the evaluations run here, one at a time. Returns the metas."""
-        self._need("diffusers_path")
+        self._need_model()
         _drop_torchao()                                  # a kernel set up before this check existed
         repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
-        specs = [a for a in sx.SEQUENCE if arms is None or a.id in arms]
-        unknown = set(arms or []) - {a.id for a in sx.SEQUENCE}
+        seq = self.BED.sequence
+        specs = [a for a in seq if arms is None or a.id in arms]
+        unknown = set(arms or []) - {a.id for a in seq}
         if unknown:
-            raise ValueError(f"unknown arm(s) {sorted(unknown)}; the sequence is {sx.SEQUENCE_IDS}")
+            raise ValueError(f"unknown arm(s) {sorted(unknown)}; the sequence is {[a.id for a in seq]}")
         metas = repo.metas()
         try:                                     # the write check, before any GPU minute is spent
             self._publish_index(repo, metas)
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
         todo = [a for a in specs if metas.get(a.id, {}).get("status") != "done"]
-        print(f"[sana] sequence -> {self.cfg.repo_id}: {len(todo)} to run "
+        print(f"[{self.TAG}] sequence -> {self.cfg.repo_id}: {len(todo)} to run "
               f"({', '.join(a.id for a in todo) or 'none'}); done already: "
               f"{', '.join(k for k, m in metas.items() if m.get('status') == 'done') or 'none'}", flush=True)
         if not todo:
@@ -622,7 +638,7 @@ class SanaRunner(_RunnerMixin):
         for key in dict.fromkeys((a.flavor, a.seed_base) for a in todo):   # every training set, stock, first
             self._render_dataset(*key)
         self._baseline()                                                      # the shared no-LoRA cells
-        print(f"[sana] training sets + baseline ready in {time.time() - t0:.0f} s", flush=True)
+        print(f"[{self.TAG}] training sets + baseline ready in {time.time() - t0:.0f} s", flush=True)
         if parallel > 1:
             self._run_parallel(todo, repo, metas, parallel=parallel, stop_on_error=stop_on_error)
         else:
@@ -634,19 +650,19 @@ class SanaRunner(_RunnerMixin):
                     if stop_on_error:
                         raise
                 self._safe(lambda: self._publish_index(repo, metas))
-        reads = sx.sequence_reads({k: m for k, m in metas.items() if m.get("status") == "done"})
-        print("[sana] reads across the sequence:", json.dumps(reads, indent=1, default=float), flush=True)
+        reads = sx.sequence_reads({k: m for k, m in metas.items() if m.get("status") == "done"}, self.BED.roles)
+        print(f"[{self.TAG}] reads across the sequence:", json.dumps(reads, indent=1, default=float), flush=True)
         return metas
 
     def _record_failure(self, spec: "sx.ArmSpec", repo: "_HubRepo", metas: dict, e: Exception) -> None:
         metas[spec.id] = sx.arm_meta(spec, "failed", error=f"{type(e).__name__}: {e}"[:500])
         base = f"experiments/{spec.id}"
         files = {f"{base}/meta.json": sx.dumps(metas[spec.id]),
-                 f"{base}/README.md": sx.render_arm_readme(spec, self._recipe(spec.lr), metas[spec.id])}
+                 f"{base}/README.md": sx.render_arm_readme(spec, self._recipe(spec.lr), metas[spec.id], self.BED)}
         files.update(_folder_files(Path(self.state["data_root"]) / "experiments" / spec.id / "logs", f"{base}/logs"))
         self._safe(lambda: repo.commit(files, f"{spec.id}: failed"))
         self._safe(lambda: self._publish_index(repo, metas))
-        print(f"[sana] {spec.id} FAILED: {e}", flush=True)
+        print(f"[{self.TAG}] {spec.id} FAILED: {e}", flush=True)
 
     def _run_parallel(self, todo: list, repo: "_HubRepo", metas: dict, *, parallel: int, stop_on_error: bool) -> None:
         """Up to `parallel` trainers at once, each with its own deepspeed port; an arm waits while another arm on the same
@@ -677,7 +693,7 @@ class SanaRunner(_RunnerMixin):
                         r["beside"].add(spec.id)
                     running[spec.id] = {"spec": spec, "ctx": ctx, "proc": proc, "t0": time.time(),
                                         "shipped": time.time(), "beside": set(running)}
-                    print(f"[sana] {spec.id} training (pid {proc.pid}); on the card now: {', '.join(running)}", flush=True)
+                    print(f"[{self.TAG}] {spec.id} training (pid {proc.pid}); on the card now: {', '.join(running)}", flush=True)
                 if error is not None and not running:
                     break
                 time.sleep(5)
@@ -702,14 +718,14 @@ class SanaRunner(_RunnerMixin):
                     self._safe(lambda: self._publish_index(repo, metas))
                 if running and time.time() - last_status >= 30:
                     last_status = time.time()
-                    print("[sana] " + " | ".join(f"{a.split('_')[0]} {_progress(r['ctx']['log'])}"
+                    print(f"[{self.TAG}] " + " | ".join(f"{a.split('_')[0]} {_progress(r['ctx']['log'])}"
                                                  for a, r in running.items())
                           + (f" | waiting: {', '.join(s.id.split('_')[0] for s in queue)}" if queue else ""), flush=True)
         except KeyboardInterrupt:
             for aid, r in running.items():
                 r["proc"].terminate()                 # the deepspeed launcher stops its trainer on SIGTERM
-                print(f"[sana] stopped {aid} (pid {r['proc'].pid})", flush=True)
-            print("[sana] interrupted; run_sequence() again resumes from the arms already done", flush=True)
+                print(f"[{self.TAG}] stopped {aid} (pid {r['proc'].pid})", flush=True)
+            print(f"[{self.TAG}] interrupted; run_sequence() again resumes from the arms already done", flush=True)
             raise
         if error is not None:
             raise error
@@ -719,15 +735,16 @@ class SanaRunner(_RunnerMixin):
         try:
             fn()
         except Exception as e:  # noqa: BLE001
-            print(f"[sana] (upload failed: {e})", flush=True)
+            print(f"[hub] (upload failed: {e})", flush=True)
 
     def _publish_index(self, repo: "_HubRepo", metas: dict) -> None:
         """The repo README from EVERY folder's meta.json (re-read now: other folders may have been added while
         this sequence ran), this session's newer metas winning."""
         merged = {**repo.metas(), **metas}
         done = {k: m for k, m in merged.items() if m.get("status") == "done"}
-        reads = sx.sequence_reads(done)
-        repo.put("README.md", sx.render_repo_readme(list(merged.values()), reads), "README: the experiment index")
+        reads = sx.sequence_reads(done, self.BED.roles)
+        repo.put("README.md", sx.render_repo_readme(list(merged.values()), reads, self.BED),
+                 "README: the experiment index")
 
     def _baseline(self) -> dict:
         """The held-out cells rendered WITHOUT a LoRA (once per session; every arm is paired against them)."""
@@ -738,7 +755,7 @@ class SanaRunner(_RunnerMixin):
             feats, scores = self._score(imgs)
             self._base = {"images": imgs, "feats": feats, "scores": [float(x) for x in scores],
                           "pixels": [_pixel_stats(im) for im in imgs]}
-            print(f"[sana] baseline: {len(imgs)} held-out cells, mean mood score {sum(self._base['scores']) / len(imgs):+.3f}",
+            print(f"[{self.TAG}] baseline: {len(imgs)} held-out cells, mean mood score {sum(self._base['scores']) / len(imgs):+.3f}",
                   flush=True)
         return self._base
 
@@ -753,9 +770,9 @@ class SanaRunner(_RunnerMixin):
             d.mkdir(parents=True, exist_ok=True)
         recipe = self._recipe(spec.lr)
         lora_toml, _ = self._render_config(str(img_dir), str(out_dir), str(cfg_dir), lr=spec.lr, held_out_previews=True)
-        print(f"\n[sana] ===== {spec.id}: {spec.title} =====", flush=True)
+        print(f"\n[{self.TAG}] ===== {spec.id}: {spec.title} =====", flush=True)
         start = {f"{base}/meta.json": sx.dumps(sx.arm_meta(spec, "running", recipe=recipe)),
-                 f"{base}/README.md": sx.render_arm_readme(spec, recipe)}
+                 f"{base}/README.md": sx.render_arm_readme(spec, recipe, None, self.BED)}
         start.update(_folder_files(cfg_dir, f"{base}/config"))
         start.update(_folder_files(img_dir.parent, f"{base}/data", allow=["items.jsonl", "sheet.jpg"]))
         repo.commit(start, f"{spec.id}: started (README, config, training-set list)")
@@ -789,6 +806,10 @@ class SanaRunner(_RunnerMixin):
                        monitor=self._follow(str(ctx["log"]), on_tick=ship_epochs, tick_s=300.0))
         return self._arm_finish(spec, repo, metas, ctx, time.time() - t0)
 
+    def _after_train(self, spec: "sx.ArmSpec", ctx: dict, epochs: list) -> "dict | None":
+        """A bed's check between training and the evaluation (none for Sana: its renderer is the stock pipeline)."""
+        return None
+
     def _arm_finish(self, spec: "sx.ArmSpec", repo: "_HubRepo", metas: dict, ctx: dict, train_s: float,
                     beside: "list[str] | None" = None) -> dict:
         """A trained arm: its weights + previews + log in one commit, then the evaluation and the result commit.
@@ -802,6 +823,7 @@ class SanaRunner(_RunnerMixin):
         trained.update(_folder_files(log.parent, f"{base}/logs"))
         trained.update(_folder_files(epochs[-1][1].parent / "samples", f"{base}/samples"))
         repo.commit(trained, f"{spec.id}: LoRA epochs, previews, log")
+        parity = self._after_train(spec, ctx, epochs)
 
         # ---- evaluation: every saved epoch at scale 1, the final one also at 0.5 ----
         cells, prompts, seeds = self._cells()
@@ -829,7 +851,7 @@ class SanaRunner(_RunnerMixin):
                     final_imgs[sc] = imgs
                     per_cell[str(sc)] = [{"subject": SUBJECTS[si], "seed": s, "score": float(v), "diff": dd, "content_kept": k}
                                          for (si, s), v, dd, k in zip(cells, scores, diffs, keep)]
-                print(f"[sana] {spec.id} epoch {n} scale {sc}: effect {rd['mean']:+.3f} +- {rd['se']:.3f} -> "
+                print(f"[{self.TAG}] {spec.id} epoch {n} scale {sc}: effect {rd['mean']:+.3f} +- {rd['se']:.3f} -> "
                       f"{rd['OUTCOME']} | content kept {np.mean(keep):.3f}", flush=True)
             pipe.unload_lora_weights()
         final = next(r for r in rows if r["epoch"] == final_n and r["scale"] == 1.0)
@@ -852,12 +874,13 @@ class SanaRunner(_RunnerMixin):
                            baseline=baseline, first_epoch_beyond_3se=first, train_seconds=round(train_s),
                            summary=self._summary(spec, final, metas),
                            finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
-                           **({"trained_beside": beside} if beside else {}))
+                           **({"trained_beside": beside} if beside else {}),
+                           **({"renderer_parity": parity} if parity else {}))
         done = _folder_files(ev, f"{base}/eval")
         done[f"{base}/meta.json"] = sx.dumps(meta)
-        done[f"{base}/README.md"] = sx.render_arm_readme(spec, recipe, meta)
+        done[f"{base}/README.md"] = sx.render_arm_readme(spec, recipe, meta, self.BED)
         repo.commit(done, f"{spec.id}: evaluation + result")
-        print(f"[sana] {spec.id} done: {meta['summary']}", flush=True)
+        print(f"[{self.TAG}] {spec.id} done: {meta['summary']}", flush=True)
         try:
             from IPython.display import Image as _Img, display
             display(_Img(filename=str(ev / "sheet_final.jpg")))
@@ -865,12 +888,14 @@ class SanaRunner(_RunnerMixin):
             pass
         return meta
 
-    @staticmethod
-    def _summary(spec: "sx.ArmSpec", final: dict, metas: dict) -> str:
+    def _summary(self, spec: "sx.ArmSpec", final: dict, metas: dict) -> str:
         eff = f"{final['mean']:+.2f} +- {final['se']:.2f}"
-        if spec.direction == 0:
-            ref = metas.get("e004_lora_mood_up", {}).get("final")
-            tail = f"; {sx.control_read(final['mean'], ref['mean'])} against e004" if ref else ""
+        if spec.direction == 0:                  # read against the upbeat arm of the SAME draw of images
+            ref_spec = sx.reference_arm(spec, self.BED)
+            ref = metas.get(ref_spec.id, {}) if ref_spec else {}
+            ref = ref.get("final") if ref.get("status") == "done" else None
+            tail = (f"; {sx.control_read(final['mean'], ref['mean'])} against {ref_spec.id.split('_')[0]}"
+                    if ref else "")
             return f"control: mood effect {eff} at scale 1{tail}"
         frac = final.get("frac_pos", final.get("frac_neg"))
         return f"{final['OUTCOME']}: mood effect {eff} at scale 1, {frac:.0%} of 32 held-out cells the expected way"
