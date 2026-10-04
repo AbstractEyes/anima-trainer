@@ -10,6 +10,7 @@ handful of `a.<step>()` calls and all logic lives here.
     a.run_flavor_test()        # e001: the stock model (mood words, a mood dial at two conditioning sites, the norms)
     a.run_attribute_screen()   # e012: attribute words, attribute sliders after the adapter, their cross-talk
     a.run_sequence()           # e002..: the LoRA arms (anima_experiments.SEQUENCE)
+    a.run_beatrix_connectors() # e013-e015: a push from Beatrix's phrase features (+ an untrained trunk, a free vector)
 
 Rendering. Every image (the training sets, the no-LoRA baseline, the evaluations, e001) is made in this process by
 AnimaPipe, which loads the fork's own Anima model code (models/cosmos_predict2.py: Qwen3 0.6B -> the LLM adapter ->
@@ -193,7 +194,10 @@ class AnimaPipe:
     (Qwen3 0.6B, prompts padded to 512 tokens), layer chain and Euler flow sampler the trainer's previews use, batched
     over prompts (each image keeps its own seeded noise), each image decoded on its own as the previews do. The
     diffusers-style LoRA calls the sequence uses (load_lora_weights / set_adapters / unload_lora_weights /
-    get_list_adapters) go to LoraHooks."""
+    get_list_adapters) go to LoraHooks. train_loss() is the trainer's objective with a push added after the adapter,
+    for the connector experiments (every model weight stays frozen)."""
+    device = "cuda"
+    context_width = 1024                         # the adapter's output, which the DiT cross-attends to
 
     def __init__(self, fork_dir: str, transformer_path: str, vae_path: str, llm_path: str):
         import torch
@@ -225,6 +229,8 @@ class AnimaPipe:
         self.layers = m.to_layers()
         self.adapter_at = next(i for i, l in enumerate(self.layers) if type(l).__name__ == "LLMAdapterLayer")
         self._te = m.get_call_text_encoder_fn(m.text_encoder)
+        self._vae_fn = m.get_call_vae_fn(m.vae.model)
+        self._loss_fn = m.get_loss_fn()
         self.lora = LoraHooks(m.transformer)
 
     # ---- text -> conditioning ----------------------------------------------------------------------
@@ -248,8 +254,47 @@ class AnimaPipe:
 
     @staticmethod
     def add_at_tokens(states, mask, vec):
-        """states + vec at every token the mask marks (padding untouched)."""
+        """states + vec at every token the mask marks (padding untouched); vec is [D] or per image [B, 1, D]."""
         return states + mask.to(states.dtype)[..., None] * vec.to(states.device, states.dtype)
+
+    def encode_images(self, imgs: list, res: int):
+        """Latents [B, 16, 1, res/8, res/8] of PIL images by the trainer's own path: fitted to res x res
+        (utils.image_resize.convert_crop_and_resize), scaled to [-1, 1] (ToTensor + Normalize(.5, .5)), then the VAE
+        encode with its latent scale (the fork's get_call_vae_fn)."""
+        import torch
+        from torchvision import transforms
+        from utils.image_resize import convert_crop_and_resize
+        to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
+        x = torch.stack([to_tensor(convert_crop_and_resize(im, (res, res))) for im in imgs]).unsqueeze(2)
+        with torch.no_grad():
+            return self._vae_fn(x)["latents"]
+
+    # ---- training a push (the connector experiments) ------------------------------------------------------
+    def train_forward(self, x, t, conds: tuple, push):
+        """The layer chain with a graph for the push only: the embeddings and the frozen adapter run without one, the
+        push [B, 1024] is added to every caption token after the adapter, and the transformer blocks are recomputed
+        in the backward pass (activation checkpointing)."""
+        import torch
+        from torch.utils.checkpoint import checkpoint
+        inputs = (x, t, *conds)
+        with torch.no_grad():
+            for layer in self.layers[:self.adapter_at + 1]:
+                inputs = layer(inputs)
+        x_, temb, ctx, *rest = (v.detach() for v in inputs)
+        inputs = (x_, temb, self.add_at_tokens(ctx, conds[3], push[:, None, :]), *rest)
+        for layer in self.layers[self.adapter_at + 1:-1]:
+            inputs = checkpoint(layer, inputs, use_reentrant=False)
+        return self.layers[-1](inputs)
+
+    def train_loss(self, latents, conds: tuple, push):
+        """The trainer's objective on one batch (models/cosmos_predict2.py prepare_inputs + get_loss_fn: logit-normal
+        t, x_t = (1 - t) x0 + t noise, mean squared error to noise - x0, no mask) with `push` added after the adapter."""
+        import torch
+        pe, am, ids, tm = conds
+        feats, (target, _) = self.model.prepare_inputs({"latents": latents, "mask": None, "prompt_embeds": pe,
+                                                        "attn_mask": am, "t5_input_ids": ids, "t5_attn_mask": tm})
+        x, t, *c = feats
+        return self._loss_fn(self.train_forward(x, t, tuple(c), push), (target, torch.tensor([])))
 
     # ---- sampling ---------------------------------------------------------------------------------
     def _forward(self, x, t, conds: tuple, context_add=None):
@@ -262,9 +307,10 @@ class AnimaPipe:
         return inputs
 
     def generate(self, prompts: list[str], seeds: list[int], *, res: int, steps: int, cfg: float, shift: float,
-                 negative: str = "", batch: int = 8, source_add=None, context_add=None) -> list:
+                 negative: str = "", batch: int = 8, source_add=None, context_add=None, uncond_add=None) -> list:
         """PIL images, one per (prompt, seed). source_add / context_add: a 1024-vector added to every prompt token
-        before / after the LLM adapter, on the conditional branch only (the negative prompt is left unchanged)."""
+        before / after the LLM adapter, on the conditional branch; uncond_add: the same after the adapter on the
+        negative prompt's branch (a trained push goes on both branches, as a LoRA acts; e001's dial on neither)."""
         import torch
         from utils.previews import to_pil
         if len(prompts) != len(seeds):
@@ -288,7 +334,7 @@ class AnimaPipe:
                     t = (step / 1000).float().reshape(1).repeat(n)
                     v = self._forward(x, t, conds, context_add).float()
                     if un is not None:
-                        vu = self._forward(x, t, un).float()
+                        vu = self._forward(x, t, un, uncond_add).float()
                         v = vu + cfg * (v - vu)
                     x = sch.step(v, step, x, return_dict=False)[0]
                 for b in range(n):                                     # decoded one by one, as the previews do
@@ -336,6 +382,7 @@ class AnimaRunner(_sr.SanaRunner):
         self._pipe = None
         self._judge_fns = None
         self._base = None
+        self._cbase = None
 
     # ---- setup ------------------------------------------------------------------------------------
     def setup(self) -> dict:
@@ -765,6 +812,341 @@ class AnimaRunner(_sr.SanaRunner):
                 "cells": [{"character": ax.CHARACTERS[ci][0], "seed": sd,
                            **{k: {a: judge[k][a][n] for a in judge[k]} for k in judge}}
                           for n, (ci, sd) in enumerate(cells)]}
+
+    # ---- e013-e015: Beatrix as a second conditioning source (a learned push after the adapter) ----------------
+    def run_beatrix_connectors(self, arms: "list[str] | None" = None, *, force: bool = False) -> dict:
+        """e013-e015, each into its own folder of cfg.repo_id: a push computed from Beatrix's features for a mood
+        phrase (e013), the same from an untrained trunk of the same shape (e014) and a free learned vector per mood
+        class (e015), trained in this process by Anima's own objective on the mood LoRAs' first-draw training images
+        and scored on the held-out scenes. Arms the repo lists as done are skipped (force=True reruns them)."""
+        self._need_model()
+        _drop_torchao()
+        repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
+        metas = repo.metas()
+        try:
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        unknown = set(arms or []) - set(ax.CONNECTOR_IDS)
+        if unknown:
+            raise ValueError(f"unknown connector arm(s) {sorted(unknown)}; they are {ax.CONNECTOR_IDS}")
+        specs = [a for a in ax.CONNECTOR_ARMS if arms is None or a.id in arms]
+        todo = [a for a in specs if force or metas.get(a.id, {}).get("status") != "done"]
+        print(f"[{self.TAG}] connectors -> {self.cfg.repo_id}: {len(todo)} to run "
+              f"({', '.join(a.id for a in todo) or 'none'}); done already: "
+              f"{', '.join(a.id for a in specs if a not in todo) or 'none'}", flush=True)
+        if todo:
+            t0 = time.time()
+            self._eval_pipe()
+            self._assert_stock()
+            self._judge()                          # the judge before any GPU minute: a judge fault fails at once
+            feats, phrases = self._connector_features()
+            bank = self._connector_bank()
+            base = self._connector_baseline()
+            n_score = sum(len(ax.connector_eval_sets(phrases, a.source)) for a in todo) * len(base["prompts"])
+            print(f"[{self.TAG}] the job: {len(todo)} connectors x {ax.CONNECTOR_STEPS} steps of {ax.CONNECTOR_BATCH} "
+                  f"images, then {n_score} images to score; data + baseline ready in {_sr._hms(time.time() - t0)}",
+                  flush=True)
+            arms_eta = _sr._Eta(self.TAG, "connectors", len(todo), unit="arms done", every=0)
+            for arm in todo:
+                metas[arm.id] = self._connector_arm(arm, repo, metas, feats, phrases, bank, base)
+                arms_eta.add()
+                self._safe(lambda: self._publish_index(repo, metas))
+        self._connector_cross(repo, metas)
+        return {a.id: metas.get(a.id) for a in specs}
+
+    def _connector_features(self) -> tuple:
+        """({'trained', 'random': [phrases, 4096] float32}, the phrase table [{class, split, text}]) from the features
+        file in the data repo (computed once with Beatrix outside the notebook: the notebook never runs Beatrix)."""
+        from huggingface_hub import hf_hub_download
+        from safetensors import safe_open
+        repo = self.cfg.data_repo_id or _ts.DATA_REPO
+        path = hf_hub_download(repo, ax.CONNECTOR_FEATURES, repo_type="dataset", token=self.state.get("hf_token") or None)
+        with safe_open(path, framework="pt") as f:
+            phrases = json.loads(f.metadata()["phrases"])
+            feats = {k: f.get_tensor(k).float() for k in ("trained", "random")}
+        if any(v.shape[0] != len(phrases) for v in feats.values()):
+            raise ValueError(f"{ax.CONNECTOR_FEATURES}: {len(phrases)} phrases, features "
+                             f"{[tuple(v.shape) for v in feats.values()]}")
+        print(f"[{self.TAG}] Beatrix features: {len(phrases)} phrases x {feats['trained'].shape[1]} "
+              f"({repo}/{ax.CONNECTOR_FEATURES})", flush=True)
+        return feats, phrases
+
+    def _connector_bank(self) -> dict:
+        """The training data on the GPU: the LoRA arms' first-draw sets of the three classes (pulled from the data
+        repo, or drawn when absent), their latents by the trainer's VAE path and the conditioning of their captions."""
+        import torch
+        from PIL import Image
+        pipe = self._eval_pipe()
+        keys = [(c, ax.CONNECTOR_DRAW) for c in ax.CONNECTOR_CLASSES]
+        for k in keys:
+            self._pull_set(*k)
+        need = sum(self._missing(*k) for k in keys)
+        eta = _sr._Eta(self.TAG, "training sets", need) if need else None
+        items = []
+        for c, sb in keys:
+            img_dir = self._render_dataset(c, sb, eta=eta)
+            self._push_set(c, sb)
+            items += [(c, img_dir / f"{it['name']}.png", it["caption"]) for it in self._items(c, sb)]
+        captions = sorted({cap for _, _, cap in items})
+        res = self._need("resolution")
+        eta = _sr._Eta(self.TAG, "training latents", len(items))
+        lat = []
+        for i in range(0, len(items), self.cfg.gen_batch):
+            chunk = items[i:i + self.cfg.gen_batch]
+            lat.append(pipe.encode_images([Image.open(p) for _, p, _ in chunk], res))
+            eta.add(len(chunk))
+        dev = getattr(pipe, "device", "cuda")
+        classes = [c for c, _, _ in items]
+        bank = {"latents": torch.cat(lat).to(dev), "classes": classes,
+                "cap_index": torch.tensor([captions.index(cap) for _, _, cap in items], device=dev),
+                "conds": tuple(t.to(dev) for t in pipe.encode(captions))}
+        counts = ", ".join(f"{c} {classes.count(c)}" for c in ax.CONNECTOR_CLASSES)
+        print(f"[{self.TAG}] connector data: {len(items)} images ({counts}), {len(captions)} captions, latents "
+              f"{tuple(bank['latents'].shape)}", flush=True)
+        return bank
+
+    def _connector_baseline(self) -> dict:
+        """The connector evaluation's cells without a push (once per session; every set is paired against them)."""
+        if self._cbase is None:
+            import numpy as np
+            self._assert_stock()
+            cells = [(si, sd) for si in HELD_OUT for sd in ax.CONNECTOR_SEEDS]
+            prompts = [self.BED.neutral_caption.format(s=SUBJECTS[si]) for si, _ in cells]
+            seeds = [sd for _, sd in cells]
+            imgs = self._render_tracked(prompts, seeds, _sr._Eta(self.TAG, "connector baseline (no push)", len(prompts)))
+            feats, scores = self._score(imgs)
+            self._cbase = {"cells": cells, "prompts": prompts, "seeds": seeds, "images": imgs, "feats": feats,
+                           "scores": [float(x) for x in scores]}
+            print(f"[{self.TAG}] connector baseline: {len(imgs)} held-out cells, mean mood score "
+                  f"{np.mean(self._cbase['scores']):+.3f}", flush=True)
+        return self._cbase
+
+    def _connector_recipe(self, arm: "ax.ConnectorArm", fan_in: int) -> dict:
+        lrs = ax.connector_lrs(arm.source, fan_in)
+        data_repo, d = self.cfg.data_repo_id or _ts.DATA_REPO, ax.CONNECTOR_DRAW
+        rec = {"image model": "Anima-Base v1.0, frozen (no LoRA)",
+               "input": {"trained": f"Beatrix ({ax.CONNECTOR_CHECKPOINT}): her features for the phrase ({fan_in} "
+                                    "numbers)",
+                         "random": f"an untrained Beatrix of the same shape (random initialisation, seed 0): its features "
+                                   f"for the phrase ({fan_in} numbers), standardized the same way",
+                         "onehot": "the mood class as a one-hot vector (3 numbers); no encoder"}[arm.source]}
+        if arm.source != "onehot":
+            rec["features file"] = f"https://huggingface.co/datasets/{data_repo}/blob/main/{ax.CONNECTOR_FEATURES}"
+        lr = (f"{lrs['W']:g} for W and b" if arm.source == "onehot" else
+              f"{lrs['W']:.3g} for W ({lrs['b']:g} divided by its fan-in, {fan_in}) and {lrs['b']:g} for b")
+        rec.update({
+            "push": "W f + b (1,024 numbers; W and b start at zero; float32), added to every caption token of the "
+                    "adapter's output; at sampling on both guidance branches",
+            "training images": f"the LoRA experiments' first draw: 192 upbeat, 192 downbeat and 192 neutral renders "
+                               f"(24 scenes x seeds {d}-{d + 7}), all captioned with the neutral prompt",
+            "pairing": ("each image with its class" if arm.source == "onehot" else
+                        "each image with a random training phrase of its class, drawn anew every step"),
+            "objective": "Anima's flow matching as the trainer computes it: logit-normal timesteps (no shift), mean "
+                         "squared error to noise - x0",
+            "optimizer": f"Adam, no weight decay, no warmup; learning rate {lr}",
+            "length": f"{ax.CONNECTOR_STEPS} steps x {ax.CONNECTOR_BATCH} images = 5 passes over the 576 images; the "
+                      "weights saved after every pass",
+            "training seed": str(arm.seed),
+            "evaluation": f"8 held-out scenes x seeds {', '.join(map(str, ax.CONNECTOR_SEEDS))} = 16 cells; Euler, "
+                          f"{self.GEN_STEPS} steps, guidance {self.GEN_CFG}, shift {self.GEN_SHIFT:g}, "
+                          f"{self._need('resolution')} px, the card's quality prefix and negative prompt"})
+        try:                                             # the exact training images, when the data repo holds them
+            links = []
+            for c in ax.CONNECTOR_CLASSES if self.cfg.data_repo_id else ():
+                folder = _ts.hub_folder(f"{c}_{d}", _ts.render_spec_of(self), self._items(c, d))
+                if _ts.on_hub(self.state.get("hf_token"), data_repo, folder):
+                    links.append(f"[{c}](https://huggingface.co/datasets/{data_repo}/tree/main/{folder})")
+            if links:
+                rec["training image folders"] = ", ".join(links)
+        except Exception:  # noqa: BLE001 - links are optional
+            pass
+        return rec
+
+    def _connector_train(self, arm: "ax.ConnectorArm", feats: dict, phrases: list, bank: dict) -> dict:
+        """W and b trained by Anima's objective, everything else frozen: plain Adam, no weight decay, the fan-in
+        rule's learning rates; each step = CONNECTOR_BATCH training images in a shuffled order (a fresh order every
+        pass), each paired with a random training phrase of its class. Returns the weights, their saves after every
+        pass, the trace (loss and push sizes) and the learning rates."""
+        import torch
+        pipe = self._eval_pipe()
+        dev = getattr(pipe, "device", "cuda")
+        classes = ax.CONNECTOR_CLASSES
+        torch.manual_seed(arm.seed)                      # the objective's noise and timesteps
+        g = torch.Generator().manual_seed(arm.seed)      # the batch order and the phrase draws
+        if arm.source == "onehot":
+            inputs = torch.eye(len(classes))
+            pool = {c: [i] for i, c in enumerate(classes)}
+        else:
+            inputs = feats[arm.source]
+            pool = {c: [i for i, p in enumerate(phrases) if p["class"] == c and p["split"] == "train"] for c in classes}
+        if not all(pool.values()):
+            raise ValueError(f"a class without training inputs: {({c: len(v) for c, v in pool.items()})}")
+        inputs = inputs.to(dev, torch.float32)
+        width = getattr(pipe, "context_width", 1024)
+        W = torch.zeros(width, inputs.shape[1], device=dev, requires_grad=True)
+        b = torch.zeros(width, device=dev, requires_grad=True)
+        lrs = ax.connector_lrs(arm.source, inputs.shape[1])
+        opt = torch.optim.Adam([{"params": [W], "lr": lrs["W"]}, {"params": [b], "lr": lrs["b"]}], weight_decay=0.0)
+        steps, bs, n = ax.CONNECTOR_STEPS, ax.CONNECTOR_BATCH, len(bank["classes"])
+        eta = _sr._Eta(self.TAG, f"{arm.id.split('_')[0]} training", steps, unit="steps", every=float("inf"))
+        order, window, trace, saves, last = [], [], [], {}, time.time()
+        for step in range(1, steps + 1):
+            if not order:
+                order = torch.randperm(n, generator=g).tolist()
+            idx, order = order[:bs], order[bs:]
+            rows = []
+            for i in idx:
+                cand = pool[bank["classes"][i]]
+                rows.append(cand[int(torch.randint(len(cand), (1,), generator=g))])
+            ii = torch.tensor(idx, device=dev)
+            push = inputs[rows] @ W.T + b
+            loss = pipe.train_loss(bank["latents"][ii], tuple(t[bank["cap_index"][ii]] for t in bank["conds"]), push)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"{arm.id}: the loss is not finite at step {step}")
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            window.append(float(loss.detach()))
+            eta.add(1)
+            if step % ax.CONNECTOR_TRACE_EVERY == 0 or step == steps:
+                with torch.no_grad():
+                    norms = {c: float((inputs[pool[c]] @ W.T + b).norm(dim=-1).mean()) for c in classes}
+                trace.append({"step": step, "loss": sum(window) / len(window), "push_norm": norms})
+                window = []
+            if step % ax.CONNECTOR_SAVE_EVERY == 0 or step == steps:
+                saves[step] = (W.detach().cpu().clone(), b.detach().cpu().clone())
+            if trace and step < steps and time.time() - last >= 30:
+                last = time.time()
+                print(f"[{self.TAG}] {eta.line()} | loss {trace[-1]['loss']:.4f} | push size "
+                      + " / ".join(f"{c} {v:.3f}" for c, v in trace[-1]["push_norm"].items()), flush=True)
+        return {"W": W.detach(), "b": b.detach(), "saves": saves, "trace": trace, "lrs": lrs,
+                "seconds": time.time() - eta.t0}
+
+    def _connector_eval(self, arm: "ax.ConnectorArm", trained: dict, feats: dict, phrases: list, base: dict) -> dict:
+        """Every evaluation set of the arm: the held-out cells with the set's push on both guidance branches, scored
+        against the same cells without a push; the registered reads over them."""
+        import numpy as np
+        import torch
+        W, b = trained["W"], trained["b"]
+        sets = ax.connector_eval_sets(phrases, arm.source)
+        row_of = {p["text"]: i for i, p in enumerate(phrases)}
+        short = arm.id.split("_")[0]
+        eta = _sr._Eta(self.TAG, f"{short} scoring", len(sets) * len(base["prompts"]))
+        diffs, rows, imgs = {}, {}, {}
+        for key, (c, split, text) in sets.items():
+            f = (torch.eye(len(ax.CONNECTOR_CLASSES))[ax.CONNECTOR_CLASSES.index(c)] if text is None
+                 else feats[arm.source][row_of[text]])
+            with torch.no_grad():
+                push = f.to(W.device, W.dtype) @ W.T + b
+            ims = self._render_tracked(base["prompts"], base["seeds"], eta, context_add=push, uncond_add=push)
+            fe, sc = self._score(ims)
+            d = [float(s - s0) for s, s0 in zip(sc, base["scores"])]
+            keep = [float(x) for x in (fe * base["feats"]).sum(-1)]
+            r = sx.arm_outcome(d, ax.DIRECTION[c])
+            r["OUTCOME"] = {"FLAVOR LORA": "MOVES IT"}.get(r["OUTCOME"], r["OUTCOME"])
+            rows[key] = {"class": c, "split": split, "phrase": text, **r, "content_kept": float(np.mean(keep)),
+                         "push_norm": float(push.norm()), "mood_score": float(np.mean(sc)), "diffs": d, "kept": keep}
+            diffs[key], imgs[key] = d, ims
+            print(f"[{self.TAG}] {short} {text or c + ' vector'}: effect {r['mean']:+.3f} +- {r['se']:.3f}, content kept "
+                  f"{np.mean(keep):.3f}, push size {float(push.norm()):.3f}", flush=True)
+        reads = ax.connector_reads(diffs, sets, arm.source)
+        for v in reads["groups"].values():
+            v["content_kept"] = float(np.mean([rows[k]["content_kept"] for k in v["sets"]]))
+        return {"reads": reads, "rows": rows, "images": imgs, "sets": sets}
+
+    def _connector_arm(self, arm: "ax.ConnectorArm", repo: "_HubRepo", metas: dict, feats: dict, phrases: list,
+                       bank: dict, base: dict) -> dict:
+        """One connector: the README first, the training, the weights shipped, the evaluation, the result."""
+        from safetensors.torch import save_file
+        bdir = f"experiments/{arm.id}"
+        fan_in = len(ax.CONNECTOR_CLASSES) if arm.source == "onehot" else int(feats[arm.source].shape[1])
+        recipe = self._connector_recipe(arm, fan_in)
+        meta = {"id": arm.id, "title": arm.title, "date": ax.DATE, "kind": "beatrix_connector", "status": "running",
+                "recipe": recipe, "phrases": None if arm.source == "onehot" else phrases}
+
+        def readme() -> str:
+            return ax.render_connector_readme(arm, meta, recipe, meta["phrases"])
+
+        repo.commit({f"{bdir}/meta.json": sx.dumps(meta), f"{bdir}/README.md": readme()}, f"{arm.id}: started (README)")
+        out_dir = Path(self._need("data_root")) / "experiments" / arm.id
+        (out_dir / "connector").mkdir(parents=True, exist_ok=True)
+        print(f"\n[{self.TAG}] ===== {arm.id}: {arm.title} =====", flush=True)
+        t0 = time.time()
+        try:
+            tr = self._connector_train(arm, feats, phrases, bank)
+            files: dict = {}
+            for step, (w, bb) in tr["saves"].items():
+                p = out_dir / "connector" / f"step{step:04d}.safetensors"
+                save_file({"W": w.contiguous(), "b": bb.contiguous()}, str(p),
+                          metadata={"experiment": arm.id, "input": arm.source, "step": str(step),
+                                    "push": "f @ W.T + b, added to every caption token of the adapter's output, on both "
+                                            "guidance branches"})
+                files[f"{bdir}/connector/{p.name}"] = p
+            (out_dir / "trace.json").write_text(json.dumps(tr["trace"], indent=1), encoding="utf-8")
+            files[f"{bdir}/trace.json"] = out_dir / "trace.json"
+            repo.commit(files, f"{arm.id}: connector weights, training trace")    # the weights ship before the evaluation
+            ev = self._connector_eval(arm, tr, feats, phrases, base)
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            metas[arm.id] = meta
+            self._safe(lambda: repo.commit({f"{bdir}/meta.json": sx.dumps(meta), f"{bdir}/README.md": readme()},
+                                           f"{arm.id}: failed"))
+            self._safe(lambda: self._publish_index(repo, metas))
+            raise
+        sets, rows = ev["sets"], ev["rows"]
+        firsts = list(dict.fromkeys((c, s) for c, s, _ in sets.values()))
+        cols = [next(k for k, v in sets.items() if (v[0], v[1]) == cs) for cs in firsts]
+        idx = [i for i, (_, sd) in enumerate(base["cells"]) if sd == ax.CONNECTOR_SEEDS[0]]
+        _grid([[base["images"][i]] + [ev["images"][k][i] for k in cols] for i in idx], out_dir / "sheet.jpg")
+        lora = {a: {"mean": m["final"]["mean"], "se": m["final"]["se"], "OUTCOME": m["final"]["OUTCOME"]}
+                for a, m in sorted(metas.items()) if a in ax.SEQUENCE_IDS and m.get("status") == "done" and m.get("final")}
+        result = {"reads": ev["reads"],
+                  "sets": {k: {kk: vv for kk, vv in v.items() if kk not in ("diffs", "kept")} for k, v in rows.items()},
+                  "trace_last": tr["trace"][-1], "learning_rates": tr["lrs"], "train_seconds": round(tr["seconds"]),
+                  "lora_baselines": lora, "sheet_columns": ["no push"] + cols}
+        meta.update(status="done", result=result, summary=ax.connector_summary(ev["reads"]),
+                    seconds=round(time.time() - t0), finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        full = {**result, "baseline_scores": base["scores"],
+                "cells": [{"scene": SUBJECTS[si], "seed": sd} for si, sd in base["cells"]],
+                "per_cell": {k: {"diffs": v["diffs"], "content_kept": v["kept"]} for k, v in rows.items()}}
+        (out_dir / "result.json").write_text(json.dumps(full, indent=1, default=float), encoding="utf-8")
+        repo.commit({f"{bdir}/meta.json": sx.dumps(meta), f"{bdir}/README.md": readme(),
+                     f"{bdir}/result.json": out_dir / "result.json", f"{bdir}/sheet.jpg": out_dir / "sheet.jpg"},
+                    f"{arm.id}: evaluation + result")
+        print(f"[{self.TAG}] {arm.id} done in {_sr._hms(meta['seconds'])}: {meta['summary']}", flush=True)
+        try:
+            from IPython.display import Image as _Img, display
+            display(_Img(filename=str(out_dir / "sheet.jpg")))
+        except Exception:  # noqa: BLE001
+            pass
+        return meta
+
+    def _connector_cross(self, repo: "_HubRepo", metas: dict) -> None:
+        """The reads across arms (the untrained trunk against Beatrix; each against the free vector), once the arms
+        they need are done: written into every done arm's result, summary and README in one commit."""
+        done = [(a, metas[a.id]) for a in ax.CONNECTOR_ARMS if (metas.get(a.id) or {}).get("status") == "done"]
+        cross = ax.connector_cross_reads({a.id: m["result"]["reads"] for a, m in done})
+        if not cross:
+            return
+        files: dict = {}
+        for arm, m in done:
+            if m["result"].get("cross") == cross:
+                continue
+            m["result"]["cross"] = cross
+            m["summary"] = ax.connector_summary(m["result"]["reads"])
+            if arm.id == ax.CONNECTOR_IDS[1] and "control" in cross:
+                m["summary"] += f"; against e013: {cross['control']['OUTCOME']}"
+            bdir = f"experiments/{arm.id}"
+            files[f"{bdir}/meta.json"] = sx.dumps(m)
+            files[f"{bdir}/README.md"] = ax.render_connector_readme(arm, m, m.get("recipe", {}), m.get("phrases"))
+        if files:
+            self._safe(lambda: repo.commit(files, "connectors: the reads across arms"))
+            self._safe(lambda: self._publish_index(repo, metas))
+            if "control" in cross:
+                c = cross["control"]
+                print(f"[{self.TAG}] across arms: Beatrix's held-out effect {c['beatrix_heldout_effect']:+.3f}, the "
+                      f"untrained trunk's {c['random_heldout_effect']:+.3f} -> {c['OUTCOME']}", flush=True)
 
 
 def _wd_tagger(repo_id: str, tags: list[str]):

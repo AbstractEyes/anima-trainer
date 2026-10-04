@@ -200,8 +200,8 @@ cache → two-phase train):
 - **`anima_colab_experiments.ipynb`** — the same experiment system on **Anima**
   (`geolip_anima_trainer.anima_runner.AnimaRunner`): e001 measures the stock model (mood words, a mood
   direction added to the conditioning before and after the LLM adapter, the conditioning norms), e012
-  screens character attributes as sliders (judged by an anime tagger), then the LoRA arms, each into its own
-  folder of
+  screens character attributes as sliders (judged by an anime tagger), then the LoRA arms, then e013-e015
+  steer the image with Beatrix's own phrase features through a learned push, each into its own folder of
   [AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). See
   [Anima experiments](#anima-experiments-the-flavor-bed).
 
@@ -294,6 +294,7 @@ a.setup()                  # GPU + the fork + the three model files
 a.run_flavor_test()        # e001: the stock model
 a.run_attribute_screen()   # e012: attribute sliders on the stock model
 a.run_sequence()           # e002..e011: the LoRA arms
+a.run_beatrix_connectors() # e013-e015: a push from Beatrix's phrase features, and its two controls
 ```
 
 - **Recipe** (from the model card): Anima-Base v1.0; LoRA rank 32 at 2e-5 (half and double as arms), the
@@ -313,6 +314,13 @@ a.run_sequence()           # e002..e011: the LoRA arms
   direction added after the adapter act as a slider, and does each slider leave the other attributes alone
   (cross-talk, and the overlap of the directions). The judge is the
   [WD EVA02-Large tagger v3](https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3).
+- **e013-e015** condition the image on a second source: a push W f + b added after the adapter, where f is
+  Beatrix's feature vector for a mood phrase (read once from her checkpoint and kept in the data repo, so
+  Beatrix never runs in the notebook). W and b start at zero and are the only trained numbers: Anima's own
+  objective (`AnimaPipe.train_loss`: the fork's `prepare_inputs` + loss) on the LoRA arms' first-draw images,
+  plain Adam with the fan-in rule's learning rates, everything else frozen; the push goes on both guidance
+  branches at sampling, as a LoRA acts. e014 is the same on an untrained Beatrix (it must fail on phrases
+  never trained on), e015 a free learned vector per mood (the reference). Scored on the held-out scenes.
 - **Progress:** every long step prints the size of the job, then done / total, time spent and time left.
 
 > **Licence.** Anima's weights are under the CircleStone Labs Non-Commercial License (a derivative of

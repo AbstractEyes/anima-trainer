@@ -472,6 +472,215 @@ def test_training_sets_are_kept_and_reused_by_a_fresh_runtime(runner, fake_hub, 
     assert repo.metas()["e002_lora_mood_up"]["status"] == "done"
 
 
+# ---- e013-e015: the connector experiments ------------------------------------------------------------------
+PHRASES = ([{"class": "up", "split": "train", "text": t} for t in ("cheerful and upbeat", "joyful and uplifting", "happy",
+                                                                   "sunny")]
+           + [{"class": "up", "split": "heldout", "text": t} for t in ("elated", "blissful")]
+           + [{"class": "down", "split": "train", "text": t} for t in ("gloomy and downbeat", "somber and melancholy",
+                                                                     "sad", "bleak")]
+           + [{"class": "down", "split": "heldout", "text": t} for t in ("mournful", "dismal")]
+           + [{"class": "neutral", "split": "train", "text": t} for t in ("plain", "everyday")]
+           + [{"class": "neutral", "split": "heldout", "text": "typical"}])
+
+
+def test_connector_registry_and_rules():
+    assert ax.CONNECTOR_IDS == ["e013_beatrix_mood_connector", "e014_beatrix_random_trunk_connector",
+                                "e015_free_vector_connector"]
+    assert [a.source for a in ax.CONNECTOR_ARMS] == ["trained", "random", "onehot"]
+    assert len({a.seed for a in ax.CONNECTOR_ARMS}) == 3 and not set(ax.CONNECTOR_IDS) & set(ax.SEQUENCE_IDS)
+    assert ax.CONNECTOR_STEPS * ax.CONNECTOR_BATCH == 5 * 576 and ax.CONNECTOR_SAVE_EVERY * ax.CONNECTOR_BATCH == 576
+    assert ax.connector_lrs("trained", 4096) == {"W": 1e-3 / 4096, "b": 1e-3}          # the fan-in rule
+    assert ax.connector_lrs("onehot", 3) == {"W": 1e-3, "b": 1e-3}
+    sets = ax.connector_eval_sets(PHRASES, "trained")
+    assert list(sets)[:4] == ["up/train/cheerful and upbeat", "up/train/joyful and uplifting", "up/heldout/elated",
+                              "up/heldout/blissful"]
+    assert len(sets) == 9 and sets["neutral/heldout/typical"] == ("neutral", "heldout", "typical")
+    assert ax.connector_eval_sets(PHRASES, "onehot") == {c: (c, "train", None) for c in ax.CONNECTOR_CLASSES}
+    with pytest.raises(ValueError, match="no training phrase"):
+        ax.connector_eval_sets([p for p in PHRASES if p["text"] != "joyful and uplifting"], "trained")
+
+    def diffs(up_tr, up_ho, dn_tr, dn_ho, neu):
+        vals = {"up/train": up_tr, "up/heldout": up_ho, "down/train": dn_tr, "down/heldout": dn_ho,
+                "neutral/heldout": neu}
+        return {k: [vals[k.rsplit("/", 1)[0]] + 0.01 * (i % 4) for i in range(16)] for k in sets}
+
+    good = ax.connector_reads(diffs(1.0, 0.6, -0.9, -0.5, 0.1), sets)
+    assert good["TRAINED"] == "TRAINED WORDS MOVE IT" and good["HELD_OUT"] == "HELD-OUT WORDS CARRY IT"
+    assert good["NEUTRAL"] == "NEUTRAL QUIET" and good["groups"]["heldout_up"]["n"] == 32
+    assert good["heldout_effect"] == pytest.approx(0.55) and good["trained_effect"] == pytest.approx(0.95)
+    unlearned = ax.connector_reads(diffs(1.0, 0.6, 0.0, -0.5, 0.5), sets)
+    assert unlearned["TRAINED"] == "NOT LEARNED" and unlearned["HELD_OUT"] == "NOT LEARNED"
+    assert unlearned["NEUTRAL"] == "NEUTRAL MOVES"
+    assert ax.connector_reads(diffs(1.0, 0.6, -0.9, 0.2, 0.0), sets)["HELD_OUT"] == "HELD-OUT WORDS CARRY IT ONE WAY"
+    flat = ax.connector_reads(diffs(1.0, 0.05, -0.9, 0.05, 0.0), sets)
+    ids = ax.CONNECTOR_IDS
+    assert ax.connector_cross_reads({ids[0]: good, ids[1]: flat})["control"]["OUTCOME"] == "THE CONTROL FAILS AS IT SHOULD"
+    leaky = ax.connector_reads(diffs(1.0, 0.4, -0.9, -0.3, 0.0), sets)
+    assert ax.connector_cross_reads({ids[0]: good, ids[1]: leaky})["control"]["OUTCOME"] == "THE RANDOM TRUNK CARRIES IT TOO"
+    free = ax.connector_reads({"up": [1.9 + 0.01 * (i % 4) for i in range(16)],
+                               "down": [-1.9 + 0.01 * (i % 4) for i in range(16)], "neutral": [0.1] * 16},
+                              ax.connector_eval_sets(PHRASES, "onehot"), "onehot")
+    assert free["TRAINED"] == "THE CLASS VECTORS MOVE IT" and "HELD_OUT" not in free and free["NEUTRAL"] == "NEUTRAL QUIET"
+    assert ax.connector_cross_reads({ids[0]: good, ids[2]: free})["of_free_vector"][ids[0]] == pytest.approx(0.5, abs=0.01)
+    readme = ax.render_connector_readme(ax.CONNECTOR_ARMS[0], {"status": "running"}, {"input": "x"}, PHRASES)
+    assert "fixed before the run" in readme and "Running." in readme and "2208.01618" in readme
+    assert "elated, blissful" in readme and "both branches" in readme
+    import re
+    for word in (r"S-1", r"\bPhil\b", r"docket", r"canon/"):           # the repo owner's handle in a repo id is fine
+        assert not re.search(word, readme), word
+
+
+def test_train_forward_builds_a_graph_for_the_push_only():
+    """The fork's layer protocol on tiny modules: the embeddings and the adapter run without a graph, the push reaches
+    every caption token after the adapter (padding untouched) with the exact gradient through the checkpointed blocks,
+    and train_loss = the fork's prepare_inputs + its loss function with an empty mask."""
+    from torch import nn
+
+    class Initial(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = nn.Parameter(torch.ones(()))
+
+        def forward(self, inputs):
+            x, t, pe, am, ids, tm = inputs
+            return (x * self.w, t, pe, ids, am, tm, torch.zeros(1), torch.zeros(1), t)
+
+    class Adapter(nn.Module):
+        def forward(self, inputs):
+            x, temb, pe, ids, am, tm, rope, adaln, t = inputs
+            return (x, temb, pe * 2, rope, adaln, t)
+
+    class Block(nn.Module):
+        def forward(self, inputs):
+            x, temb, ctx, rope, adaln, t = inputs
+            return (x + ctx.sum(1, keepdim=True), temb, ctx, rope, adaln, t)
+
+    class Final(nn.Module):
+        def forward(self, inputs):
+            return inputs[0]
+
+    p = object.__new__(ar.AnimaPipe)
+    p.layers, p.adapter_at = [Initial(), Adapter(), Block(), Block(), Final()], 1
+    x, pe = torch.zeros(2, 1, 3), torch.ones(2, 4, 3)
+    tm = torch.tensor([[1, 1, 0, 0], [1, 1, 1, 0]])
+    push = torch.zeros(2, 3, requires_grad=True)
+    out = p.train_forward(x, torch.zeros(2, 1), (pe, tm, tm, tm), push)
+    assert torch.allclose(out, torch.full((2, 1, 3), 16.0))          # 2 blocks x 4 tokens x 2 (the adapter)
+    out.sum().backward()
+    assert p.layers[0].w.grad is None                                  # nothing before the push is in the graph
+    assert torch.allclose(push.grad, torch.tensor([[4.0] * 3, [6.0] * 3]))   # 2 blocks x the image's caption tokens
+
+    class Model:
+        def prepare_inputs(self, inputs):
+            assert inputs["mask"] is None
+            lat = inputs["latents"]
+            return ((lat, torch.zeros(lat.shape[0], 1), inputs["prompt_embeds"], inputs["attn_mask"],
+                     inputs["t5_input_ids"], inputs["t5_attn_mask"]), (torch.ones_like(lat), None))
+
+    seen = {}
+
+    def loss_fn(output, label):
+        seen["mask"] = label[1]
+        return ((output - label[0]) ** 2).mean()
+
+    p.model, p._loss_fn = Model(), loss_fn
+    loss = p.train_loss(x, (pe, tm, tm, tm), torch.zeros(2, 3, requires_grad=True))
+    assert seen["mask"].numel() == 0 and float(loss.detach()) == pytest.approx(15.0 ** 2)
+
+
+class FakeConnectorPipe:
+    """Anima reduced to one number: an image's latent is its mood (+1 upbeat, -1 downbeat, 0 neutral) and the loss asks
+    the push's first coordinate to equal it."""
+    device, context_width = "cpu", 8
+
+    def get_list_adapters(self):
+        return {}
+
+    def encode(self, prompts):
+        n = len(prompts)
+        return (torch.zeros(n, 4, 8), torch.ones(n, 4, dtype=torch.long), torch.zeros(n, 4, dtype=torch.long),
+                torch.ones(n, 4, dtype=torch.long))
+
+    def encode_images(self, imgs, res):
+        assert res == 768
+        return torch.stack([torch.full((2, 1, 2, 2), (int(np.asarray(im)[0, 0, 0]) - 128) / 20) for im in imgs])
+
+    def train_loss(self, latents, conds, push):
+        assert len(conds) == 4 and conds[0].shape[0] == latents.shape[0] == push.shape[0]
+        return ((push[:, 0] - latents.flatten(1).mean(1)) ** 2).mean() + 0.01 * (push[:, 1:] ** 2).mean()
+
+
+def _fake_features(dim: int = 16) -> dict:
+    """Beatrix's features carry the class on a fixed direction (held-out phrases too); the untrained trunk's are noise
+    for the training phrases and zero for the held-out ones (so its held-out push is its bias alone)."""
+    g = torch.Generator().manual_seed(0)
+    u = torch.sign(torch.randn(dim, generator=g))
+    sign = {"up": 1.0, "down": -1.0, "neutral": 0.0}
+    return {"trained": torch.stack([sign[p["class"]] * u + 0.1 * torch.randn(dim, generator=g) for p in PHRASES]),
+            "random": torch.stack([torch.zeros(dim) if p["split"] == "heldout" else torch.randn(dim, generator=g)
+                                   for p in PHRASES])}
+
+
+def test_beatrix_connectors_end_to_end(runner, monkeypatch):
+    from PIL import Image
+    from safetensors.torch import load
+    s, repo, _, _ = runner
+    s._pipe = FakeConnectorPipe()
+    for k, v in (("CONNECTOR_STEPS", 72), ("CONNECTOR_SAVE_EVERY", 36), ("CONNECTOR_TRACE_EVERY", 12),
+                 ("CONNECTOR_LR", 0.05)):
+        monkeypatch.setattr(ax, k, v)
+    monkeypatch.setattr(s, "_connector_features", lambda: (_fake_features(), PHRASES))
+    pushes, loaded = [], []
+
+    def mood(p):
+        return 1.0 if "cheerful" in p or "joyful" in p else -1.0 if "gloomy" in p or "somber" in p else 0.0
+
+    def render(prompts, seeds, source_add=None, context_add=None, uncond_add=None):
+        assert source_add is None and (context_add is None) == (uncond_add is None)
+        if context_add is not None:
+            assert torch.equal(context_add, uncond_add)              # a trained push goes on both guidance branches
+            pushes.append(context_add)
+        shift = float(context_add[0]) if context_add is not None else 0.0
+        return [Image.new("RGB", (8, 8), (min(255, max(0, int(round(128 + 20 * (mood(p) + shift))))),) * 3)
+                for p in prompts]
+
+    monkeypatch.setattr(s, "_render", render)
+    monkeypatch.setattr(s, "_judge", lambda: loaded.append("clip"))
+    out = s.run_beatrix_connectors()
+    assert loaded == ["clip"] and set(out) == set(ax.CONNECTOR_IDS)
+    for c in ax.CONNECTOR_CLASSES:                                    # the three first-draw training sets were drawn
+        assert len(list((Path(s.state["data_root"]) / "datasets" / f"{c}_1000" / "images").glob("*.png"))) == 48
+    m = repo.metas()
+    r13, r14, r15 = (m[k]["result"]["reads"] for k in ax.CONNECTOR_IDS)
+    assert r13["TRAINED"] == "TRAINED WORDS MOVE IT" and r13["HELD_OUT"] == "HELD-OUT WORDS CARRY IT"
+    assert r13["NEUTRAL"] == "NEUTRAL QUIET"
+    assert r14["heldout_effect"] == pytest.approx(0.0) and r14["HELD_OUT"] != "HELD-OUT WORDS CARRY IT"
+    assert r15["TRAINED"] == "THE CLASS VECTORS MOVE IT" and r15["NEUTRAL"] == "NEUTRAL QUIET" and "HELD_OUT" not in r15
+    e014 = m[ax.CONNECTOR_IDS[1]]
+    assert e014["result"]["cross"]["control"]["OUTCOME"] == "THE CONTROL FAILS AS IT SHOULD"
+    assert e014["summary"].endswith("against e013: THE CONTROL FAILS AS IT SHOULD")
+    assert set(e014["result"]["cross"]["of_free_vector"]) == set(ax.CONNECTOR_IDS[:2])
+    assert m[ax.CONNECTOR_IDS[0]]["result"]["learning_rates"] == {"W": 0.05 / 16, "b": 0.05}
+    assert m[ax.CONNECTOR_IDS[2]]["result"]["learning_rates"] == {"W": 0.05, "b": 0.05}
+    for k in ax.CONNECTOR_IDS:
+        base = f"experiments/{k}"
+        assert m[k]["kind"] == "beatrix_connector" and m[k]["status"] == "done"
+        for f in ("meta.json", "README.md", "result.json", "sheet.jpg", "trace.json", "connector/step0036.safetensors",
+                  "connector/step0072.safetensors"):
+            assert f"{base}/{f}" in repo.files_, f
+        assert k in repo.files_["README.md"].decode()
+    assert len(json.loads(repo.files_[f"experiments/{ax.CONNECTOR_IDS[0]}/result.json"])["per_cell"]) == 9
+    w = load(repo.files_[f"experiments/{ax.CONNECTOR_IDS[0]}/connector/step0072.safetensors"])
+    push = _fake_features()["trained"][1] @ w["W"].T + w["b"]          # 'joyful and uplifting' from the shipped weights
+    assert any(torch.allclose(push, p) for p in pushes)
+    readme = repo.files_[f"experiments/{ax.CONNECTOR_IDS[0]}/README.md"].decode()
+    assert "HELD-OUT WORDS CARRY IT" in readme and "| elated (held out) | up |" in readme
+    n = len(repo.commits)
+    again = s.run_beatrix_connectors()                                # done already: skipped
+    assert all(v["status"] == "done" for v in again.values())
+    assert not any(c.startswith(("e013", "e014", "e015")) for c in repo.commits[n:])
+
+
 def test_config_validation_refuses_master_weights_without_plain_adam():
     from geolip_anima_trainer import api
     cfg = api.TrainConfig(run=api.RunConfig(output_dir="o", bf16_master_weights=True), model=api.ModelConfig(),

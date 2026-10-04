@@ -70,8 +70,8 @@ Sana's weights are Apache-2.0; its Gemma-2-2B-IT text encoder is under the Gemma
 The same experiment system on **Anima** (Anima-Base v1.0 at 768 px), uploaded one folder per experiment
 into [AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). Thin
 shell over `geolip_anima_trainer.anima_runner.AnimaRunner`: the same bootstrap, then `setup()` →
-`run_flavor_test()` → `run_attribute_screen()` → `run_sequence()`. Every long step prints the job's size,
-then done / total, time spent and time left.
+`run_flavor_test()` → `run_attribute_screen()` → `run_sequence()` → `run_beatrix_connectors()`. Every long
+step prints the job's size, then done / total, time spent and time left.
 
 - **e001** (`run_flavor_test`): 32 scenes × {neutral, upbeat, downbeat} words × 2 seeds; the conditioning
   norms of the 32 neutral prompts at two sites (the Qwen3 states the LLM adapter reads, and the adapter's
@@ -81,6 +81,11 @@ then done / total, time spent and time left.
   cross-talk between sliders; judged by the WD EVA02-Large tagger v3 (352 images, ~20 min).
 - **The LoRA arms** (`anima_experiments.SEQUENCE`): e002 upbeat, e003 the control, e004 downbeat, e005 a
   fresh draw, e006 / e007 half / double the learning rate, then e008–e011 the second draw.
+- **e013–e015** (`run_beatrix_connectors`): a push after the adapter computed from Beatrix's features for a
+  mood phrase (e013), the same on an untrained Beatrix (e014, must fail on unseen phrases), a free vector
+  per mood (e015); each trained 720 steps in the notebook by Anima's own objective on the first-draw training
+  images, then scored on the held-out scenes (16 cells per phrase; about an hour for the three). The
+  features come from `beatrix/` in the data repo.
 - **Recipe** (from the model card): rank 32 at 2e-5, the LLM adapter frozen, plain Adam with weight decay 0
   and fp32 master weights, 10 epochs at micro-batch 4, the card's quality prefix and negative prompt;
   evaluation at 30 steps, guidance 4.5, shift 3.

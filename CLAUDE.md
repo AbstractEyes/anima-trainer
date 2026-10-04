@@ -512,6 +512,16 @@ drawn set at `sets/<flavor>_<seed_base>-<key>` (key = sha256 of the render setti
 every item); `run_sequence` pulls a matching set before drawing (`_pull_set`, verified image by image and caption by
 caption) and pushes each set once drawn (`_push_set`); the arm's recipe links its training images;
 `a.save_training_sets()` / `ts.upload_local_sets(a)` upload by hand. Changing any render setting changes the key.
+CONNECTORS (`run_beatrix_connectors()` = e013-e015, `anima_experiments.CONNECTOR_ARMS`): push = f @ W.T + b at the
+`context` site (every caption token after the adapter), W/b zero-init fp32, the only trained tensors; f = Beatrix's
+phrase features (`CONNECTOR_FEATURES` in the data repo: `trained` / `random` [74, 4096] + the phrase table in the
+metadata) or a one-hot class (e015). Training in the kernel: `AnimaPipe.train_loss` = the fork's `prepare_inputs`
+(logit-normal t, no shift) + `get_loss_fn` with an empty mask; `train_forward` runs the embeddings + adapter under
+no_grad, adds the push, checkpoints the blocks. Plain Adam wd 0; `connector_lrs()` = the fan-in rule (dense W at
+lr / fan_in: Adam moves an output by ~lr x the input's L1 norm). Sampling: the push on BOTH guidance branches
+(`generate(uncond_add=)`), as a LoRA acts; e001's dial stays conditional-only. Reads: `connector_reads()` (groups
+pooled over cells x phrases; NOT LEARNED blocks the held-out verdict), `connector_cross_reads()` (the untrained trunk
+<= 1/3 of Beatrix's held-out effect). Weights ship per pass to `experiments/<id>/connector/` before the evaluation.
 
 ### Training previews — `SamplesConfig` → `[samples]`
 `TrainConfig.samples = SamplesConfig(prompts=[...])` renders a `[samples]` table into the lora toml

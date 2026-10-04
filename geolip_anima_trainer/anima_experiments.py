@@ -10,12 +10,15 @@ stays frozen, a rank-32 LoRA starts at learning rate 2e-5, sampling at 30-50 ste
 prefix "masterpiece, best quality, score_7, safe, " and the negative prompt it recommends.
 
 e001 measures the stock bed (the words, a mood direction added to the conditioning at two sites, the conditioning
-norms); e002 onward are the LoRA arms, the Sana design at Anima's learning rates.
+norms); e002-e011 are the LoRA arms, the Sana design at Anima's learning rates; e012 screens attribute sliders on the
+stock model; e013-e015 condition the image on Beatrix's own states through a learned push (and its two controls).
 
 Pure Python (no torch); anima_runner.AnimaRunner does the GPU work.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from .sana_experiments import ArmSpec, Bed
 
@@ -412,4 +415,257 @@ def render_attribute_screen_readme(meta: dict, recipe: dict) -> str:
         out += ["## Result", "Running.", ""]
     out += ["## Files", "- `result.json`: every cell's scores, the reads, the cross-talk and the direction overlaps.",
             "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
+    return "\n".join(out)
+
+
+# ---- e013-e015: Beatrix as a second conditioning source (a learned push after the adapter) ------------------------
+@dataclass(frozen=True)
+class ConnectorArm:
+    """One connector experiment: where its input comes from, its training seed and what it asks."""
+    id: str
+    title: str
+    source: str                      # 'trained' | 'random': that trunk's phrase features; 'onehot': the class, no encoder
+    seed: int                        # training seed (batch order, phrase draws, noise, timesteps)
+    question: str
+    changed: str = "none (the reference connector)"
+
+
+CONNECTOR_ARMS = (
+    ConnectorArm("e013_beatrix_mood_connector", "Beatrix's mood phrases steer the image through a learned push",
+                 "trained", 13,
+                 question="Trained on mood images with neutral captions, does a push computed from Beatrix's states for a "
+                          "mood phrase steer the image that way, for the phrases it trained on and for mood phrases it "
+                          "never saw?"),
+    ConnectorArm("e014_beatrix_random_trunk_connector",
+                 "Control: the same connector on an untrained Beatrix of the same shape", "random", 14,
+                 changed="the features come from a randomly initialised trunk of the same shape (seed 0), standardized "
+                         "the same way",
+                 question="Does the held-out effect come from what Beatrix learned, or would any fixed random features of "
+                          "the phrase text carry it? (A control that must fail on the held-out phrases.)"),
+    ConnectorArm("e015_free_vector_connector", "Capacity reference: one free learned vector per mood class, no encoder",
+                 "onehot", 15, changed="the input is the mood class itself (one-hot), not an encoder's features",
+                 question="How far can a push of this form move the image when nothing has to be read from text? (The "
+                          "reference the encoder arms are read against; trained classes only.)"),
+)
+CONNECTOR_IDS = [a.id for a in CONNECTOR_ARMS]
+CONNECTOR_FEATURES = "beatrix/mood_phrases_mini-beatrix-3_step212000.safetensors"   # in the data repo
+CONNECTOR_CHECKPOINT = "AbstractPhil/alephllm-mini-beatrix-training, mini-beatrix-3 at step 212,000"
+CONNECTOR_CLASSES = ("up", "down", "neutral")
+CONNECTOR_DRAW = 1000                    # the training images: the LoRA arms' first draw (seeds 1000-1007) per class
+CONNECTOR_STEPS, CONNECTOR_BATCH, CONNECTOR_LR = 720, 4, 1e-3
+CONNECTOR_SAVE_EVERY = 144               # one pass over the 576 training images (5 passes)
+CONNECTOR_TRACE_EVERY = 24
+CONNECTOR_SEEDS = (101, 202)             # the evaluation: the 8 held-out scenes x these seeds = 16 cells
+EVAL_TRAIN_PHRASES = {"up": ("cheerful and upbeat", "joyful and uplifting"),
+                      "down": ("gloomy and downbeat", "somber and melancholy")}
+CONNECTOR_GROUPS = {                     # read group -> (class, split or None = every split, expected direction)
+    "trained_up": ("up", "train", 1), "trained_down": ("down", "train", -1),
+    "heldout_up": ("up", "heldout", 1), "heldout_down": ("down", "heldout", -1),
+    "neutral": ("neutral", None, 0)}
+DIRECTION = {"up": 1, "down": -1, "neutral": 0}
+
+
+def connector_lrs(source: str, fan_in: int, lr: "float | None" = None) -> dict:
+    """Adam's learning rates for the push's weight W and bias b (lr: CONNECTOR_LR). Adam moves every weight by about
+    lr per step, so a linear map's output moves by about lr x the input's L1 norm: dense features (4,096 standardized
+    numbers) would move the push thousands of times faster than a one-hot input. The fan-in rule (a matrix's Adam
+    learning rate divided by its fan-in, as in Tensor Programs V) makes the push move about lr per dimension per step
+    in every arm."""
+    lr = CONNECTOR_LR if lr is None else lr
+    return {"W": lr if source == "onehot" else lr / fan_in, "b": lr}
+
+
+def connector_eval_sets(phrases: list, source: str) -> dict:
+    """Every evaluation set of an arm, in render order: {key: (class, split, phrase text or None)}. Feature arms: per
+    class the two training phrases of EVAL_TRAIN_PHRASES and every held-out phrase (neutral: its held-out phrases);
+    the free vector: one set per class (its learned vector)."""
+    if source == "onehot":
+        return {c: (c, "train", None) for c in CONNECTOR_CLASSES}
+    out: dict = {}
+    for c in CONNECTOR_CLASSES:
+        for t in EVAL_TRAIN_PHRASES.get(c, ()):
+            if not any(p["text"] == t and p["class"] == c and p["split"] == "train" for p in phrases):
+                raise ValueError(f"the features file has no training phrase {t!r} of class {c}")
+            out[f"{c}/train/{t}"] = (c, "train", t)
+        for p in phrases:
+            if p["class"] == c and p["split"] == "heldout":
+                out[f"{c}/heldout/{p['text']}"] = (c, "heldout", p["text"])
+    return out
+
+
+def connector_reads(diffs: dict, sets: dict, source: str = "trained") -> dict:
+    """The rule fixed before the runs, on paired (push minus no push) mood-score differences {set key: [per cell]}:
+    per group (CONNECTOR_GROUPS) the differences pooled over cells x phrases under the LoRA rule, renamed MOVES IT;
+    the trained groups both moving it = TRAINED WORDS MOVE IT (the free vector: THE CLASS VECTORS MOVE IT), else NOT
+    LEARNED (and no held-out verdict is read); both held-out groups moving it = HELD-OUT WORDS CARRY IT; NEUTRAL QUIET
+    = the neutral group's mean is at most a third of the trained upbeat group's."""
+    from .sana_experiments import arm_outcome
+    groups: dict = {}
+    for g, (c, split, d) in CONNECTOR_GROUPS.items():
+        keys = [k for k, (cc, ss, _) in sets.items() if cc == c and (split is None or ss == split)]
+        if keys:
+            r = arm_outcome([x for k in keys for x in diffs[k]], d)
+            r["OUTCOME"] = {"FLAVOR LORA": "MOVES IT"}.get(r["OUTCOME"], r["OUTCOME"])
+            groups[g] = {**r, "sets": keys}
+    trained = all(groups[g]["OUTCOME"] == "MOVES IT" for g in ("trained_up", "trained_down"))
+    moves = "THE CLASS VECTORS MOVE IT" if source == "onehot" else "TRAINED WORDS MOVE IT"
+    out = {"groups": groups, "TRAINED": moves if trained else "NOT LEARNED",
+           "trained_effect": (groups["trained_up"]["mean"] - groups["trained_down"]["mean"]) / 2}
+    if "heldout_up" in groups and "heldout_down" in groups:
+        n = sum(groups[g]["OUTCOME"] == "MOVES IT" for g in ("heldout_up", "heldout_down"))
+        out["HELD_OUT"] = ("NOT LEARNED" if not trained else
+                           {2: "HELD-OUT WORDS CARRY IT", 1: "HELD-OUT WORDS CARRY IT ONE WAY",
+                            0: "HELD-OUT WORDS DO NOT CARRY IT"}[n])
+        out["heldout_effect"] = (groups["heldout_up"]["mean"] - groups["heldout_down"]["mean"]) / 2
+    if "neutral" in groups:
+        quiet = abs(groups["neutral"]["mean"]) <= abs(groups["trained_up"]["mean"]) / 3
+        out["NEUTRAL"] = groups["neutral"]["OUTCOME"] = "NEUTRAL QUIET" if quiet else "NEUTRAL MOVES"
+    return out
+
+
+def connector_summary(reads: dict) -> str:
+    g = reads["groups"]
+    out = (f"{reads['TRAINED']} (upbeat {g['trained_up']['mean']:+.2f}, downbeat {g['trained_down']['mean']:+.2f})")
+    if "HELD_OUT" in reads:
+        out += (f"; {reads['HELD_OUT']} (upbeat {g['heldout_up']['mean']:+.2f}, downbeat "
+                f"{g['heldout_down']['mean']:+.2f})")
+    if "NEUTRAL" in reads:
+        out += f"; {reads['NEUTRAL']} ({g['neutral']['mean']:+.2f})"
+    return out
+
+
+def connector_cross_reads(reads: dict) -> dict:
+    """Across arms ({arm id: connector_reads output}): THE CONTROL FAILS AS IT SHOULD = the random trunk's held-out
+    effect is at most a third of Beatrix's (hers positive); each feature arm's trained effect as a fraction of the free
+    vector's."""
+    btx, rnd, free = (reads.get(i) for i in CONNECTOR_IDS)
+    out: dict = {}
+    if btx and rnd and "heldout_effect" in btx and "heldout_effect" in rnd:
+        hb, hr = btx["heldout_effect"], rnd["heldout_effect"]
+        verdict = ("NO HELD-OUT EFFECT TO CONTROL" if hb <= 0 else
+                   "THE CONTROL FAILS AS IT SHOULD" if hr <= hb / 3 else "THE RANDOM TRUNK CARRIES IT TOO")
+        out["control"] = {"beatrix_heldout_effect": hb, "random_heldout_effect": hr, "OUTCOME": verdict}
+    if free and free.get("trained_effect"):
+        out["of_free_vector"] = {a: r["trained_effect"] / free["trained_effect"] for a, r in reads.items()
+                                 if a != CONNECTOR_IDS[2]}
+    return out
+
+
+CONNECTOR_REFERENCES = (
+    ("Gal, Alaluf, Atzmon, Patashnik, Bermano, Chechik, Cohen-Or, \"An Image is Worth One Word: Personalizing "
+     "Text-to-Image Generation using Textual Inversion\" (2022)", "https://arxiv.org/abs/2208.01618"),
+    ("Hu, Wang, Fang, Fu, Cheng, Yu, \"ELLA: Equip Diffusion Models with LLM for Enhanced Semantic Alignment\" (2024)",
+     "https://arxiv.org/abs/2403.05135"),
+    ("Yang, Hu, Babuschkin, Sidor, Liu, Farhi, Ryder, Pachocki et al., \"Tensor Programs V: Tuning Large Neural "
+     "Networks via Zero-Shot Hyperparameter Transfer\" (2022)", "https://arxiv.org/abs/2203.03466"),
+    ("Kingma, Ba, \"Adam: A Method for Stochastic Optimization\" (2014)", "https://arxiv.org/abs/1412.6980"),
+    ("Ho, Salimans, \"Classifier-Free Diffusion Guidance\" (2022)", "https://arxiv.org/abs/2207.12598"),
+    ("Radford, Kim, Hallacy et al., \"Learning Transferable Visual Models From Natural Language Supervision\" (2021)",
+     "https://arxiv.org/abs/2103.00020"),
+)
+
+
+def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases: "list | None" = None) -> str:
+    """A connector experiment's README: the question, the design and the rule fixed before the run, the result."""
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    refs = "\n".join(f"- {t}: {u}" for t, u in CONNECTOR_REFERENCES)
+    out = [f"# {arm.id}: {arm.title}", "",
+           f"Date: {DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), frozen: the "
+           "only trained numbers are the push's.", "",
+           "## Question", arm.question, "",
+           f"Changed from the reference connector (e013): {arm.changed}.", "",
+           "## Design",
+           f"- **Beatrix** is a byte-level language model from the geolip line ({CONNECTOR_CHECKPOINT}). Her features "
+           "for a phrase: the state of the phrase's last byte after blocks 16, 18, 21 and 24, each normalized (layer "
+           "norm without its affine), concatenated (4,096 numbers) and standardized per feature over a reference set of "
+           "mood words and phrases that holds no word of a held-out phrase. The place was chosen before any training, "
+           "by a probe on 60 single mood words (30 upbeat, 30 downbeat; ridge, 10-fold): .97-.98 accuracy at these "
+           "blocks against .67-.68 for an untrained trunk of the same shape. The features are computed once, outside "
+           "the notebook, and kept in the data repo.",
+           "- **The push** = W f + b (1,024 numbers), added to every caption token of the text adapter's output (what "
+           "the image model reads). W and b start at zero, so training starts from the stock model exactly. For the "
+           "free vector, f is the mood class as a one-hot vector.",
+           "- **Training**: Anima's own flow-matching objective, computed by the trainer's code (logit-normal "
+           "timesteps, the noisy latent (1 - t) x0 + t noise, mean squared error to noise - x0), on the LoRA "
+           "experiments' first-draw training images: 192 upbeat, 192 downbeat and 192 neutral renders of the stock "
+           "model, every one captioned with the neutral prompt. Each image is paired with a random training phrase of "
+           "its class. Everything except W and b is frozen.",
+           "- **Sampling**: the push is added on both branches of classifier-free guidance, as a LoRA acts. It was "
+           "trained without guidance on images drawn with guidance 4.5; on the conditional branch alone, guidance "
+           "would multiply it a second time.",
+           "- **Evaluation**: the 8 held-out scenes (in no training image) x seeds "
+           f"{', '.join(map(str, CONNECTOR_SEEDS))} = 16 cells; the neutral prompt with the push of each evaluated "
+           "phrase, against the same cell without a push. Evaluated: the first two training phrases of each mood and "
+           "every held-out phrase (the free vector: its three class vectors).", ""]
+    if phrases:
+        out += ["| class | training phrases | held-out phrases |", "|---|---|---|"]
+        for c in CONNECTOR_CLASSES:
+            tr = ", ".join(p["text"] for p in phrases if p["class"] == c and p["split"] == "train")
+            ho = ", ".join(p["text"] for p in phrases if p["class"] == c and p["split"] == "heldout")
+            out.append(f"| {c} | {tr} | {ho} |")
+        out += ["", "No word of a held-out phrase appears in a training phrase.", ""]
+    out += ["## Recipe", "| setting | value |", "|---|---|", rec, "",
+            "## The rule (fixed before the run)",
+            "Per group of evaluated sets (trained upbeat, trained downbeat, held-out upbeat, held-out downbeat, "
+            "neutral), the paired differences (push minus no push, per cell and phrase) are pooled and read in the "
+            "group's direction: **MOVES IT** = the mean moves that way, at least 75% of the pairs move that way, and the "
+            "mean is beyond 3 standard errors; **NO EFFECT** = within 2 standard errors of zero or under 60% that way; "
+            "**MIXED** otherwise. **TRAINED WORDS MOVE IT** = both trained groups move it; otherwise the connector is "
+            "**NOT LEARNED** and no verdict on the held-out phrases is read. **HELD-OUT WORDS CARRY IT** = both held-out "
+            "groups move it. **NEUTRAL QUIET** = the neutral phrases' mean effect is at most a third of the trained "
+            "upbeat group's. Across arms: **THE CONTROL FAILS AS IT SHOULD** = the untrained trunk's held-out effect "
+            "(half of upbeat minus downbeat) is at most a third of Beatrix's. Content kept and the push's size are "
+            "reported beside every read.", "", JUDGE_TEXT.replace("no-LoRA image", "no-push image"), ""]
+    if meta.get("status") == "done":
+        r = meta["result"]
+        reads = r["reads"]
+        out += ["## Result", meta.get("summary", ""), "",
+                "| group | effect (mean +- SE) | pairs moving the expected way | content kept | verdict |",
+                "|---|---|---|---|---|"]
+        for g, v in reads["groups"].items():
+            frac = v.get("frac_pos", v.get("frac_neg"))
+            kept = v.get("content_kept")
+            out.append(f"| {g.replace('_', ' ')} | {v['mean']:+.3f} +- {v['se']:.3f} | "
+                       f"{'' if frac is None or g == 'neutral' else f'{frac:.0%}'} | "
+                       f"{'' if kept is None else f'{kept:.3f}'} | **{v['OUTCOME']}** |")
+        out += ["", "| phrase | class | effect (mean +- SE, 16 cells) | cells moving the expected way | content kept | "
+                "push size |", "|---|---|---|---|---|---|"]
+        for k, v in r["sets"].items():
+            frac = v.get("frac_pos", v.get("frac_neg"))
+            name = v["phrase"] or f"the {v['class']} vector"
+            split = "" if v["phrase"] is None else f" ({'trained' if v['split'] == 'train' else 'held out'})"
+            out.append(f"| {name}{split} | {v['class']} | {v['mean']:+.3f} +- {v['se']:.3f} | "
+                       f"{'' if frac is None or v['class'] == 'neutral' else f'{frac:.0%}'} | "
+                       f"{v['content_kept']:.3f} | {v['push_norm']:.3f} |")
+        cross = r.get("cross") or {}
+        if cross.get("control"):
+            c = cross["control"]
+            out += ["", f"Across arms: Beatrix's held-out effect {c['beatrix_heldout_effect']:+.3f}, the untrained "
+                        f"trunk's {c['random_heldout_effect']:+.3f}: **{c['OUTCOME']}**."]
+        if cross.get("of_free_vector"):
+            out += ["", "Trained effect as a fraction of the free vector's: " + ", ".join(
+                f"{a.split('_')[0]} {v:.2f}" for a, v in cross["of_free_vector"].items()) + "."]
+        lora = r.get("lora_baselines") or {}
+        if lora:
+            out += ["", "For scale, the mood LoRAs on the same judge and held-out scenes (their final epoch at scale 1, "
+                        "4 seeds = 32 cells):", "", "| LoRA experiment | effect (mean +- SE) | verdict |", "|---|---|---|"]
+            out += [f"| {a} | {v['mean']:+.3f} +- {v['se']:.3f} | {v['OUTCOME']} |" for a, v in lora.items()]
+        tr = r.get("trace_last")
+        if tr:
+            out += ["", f"End of training (step {tr['step']}): loss {tr['loss']:.4f}; mean push size per class over "
+                        "its training inputs: " + ", ".join(f"{c} {n:.3f}" for c, n in tr["push_norm"].items())
+                    + ". The caption tokens the push is added to have a mean size of about 5.4 (experiment e001)."]
+        out += ["", "![the held-out scenes with and without the push](sheet.jpg)", "",
+                "Rows: the held-out scenes at seed 101. Columns: no push, then one push per column (named in "
+                "`result.json`, `sheet_columns`).", ""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    else:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files",
+            "- `connector/stepNNNN.safetensors`: W and b after every pass over the training images (float32; the push "
+            "for features f is f @ W.T + b).",
+            "- `trace.json`: the training loss and the push's size per class during training.",
+            "- `result.json`: every cell's score, the reads, the per-phrase effects.",
+            "- `sheet.jpg`: the contact sheet.", "", "## References", refs, ""]
     return "\n".join(out)
