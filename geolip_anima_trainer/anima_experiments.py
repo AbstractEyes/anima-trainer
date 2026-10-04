@@ -240,3 +240,176 @@ def render_flavor_test_readme(meta: dict, recipe: dict) -> str:
     out += ["## Files", "- `result.json`: every cell's scores, the reads and the norms.",
             "- `sheet_*.jpg`: contact sheets.", ""]
     return "\n".join(out)
+
+
+# ---- e012: the attribute screen (sliders on the stock model) ------------------------------------------------
+ATTR_TEST_ID = "e012_anima_attribute_screen"
+ATTR_TEST_TITLE = "The stock model: attribute words, attribute sliders after the adapter, and their cross-talk"
+ATTR_SEEDS = (11, 22)
+CHARACTERS = (                                  # adult-coded outfits and settings (no school settings)
+    ("office suit", "modern office"),
+    ("apron over a sweater", "cozy cafe"),
+    ("trench coat", "city street at dusk"),
+    ("sundress", "flower garden"),
+    ("leather jacket", "rooftop at night"),
+    ("lab coat", "laboratory"),
+    ("kimono", "shrine in autumn"),
+    ("knit cardigan", "library"),
+)
+CHARACTER_TEMPLATE = PREFIX + "1girl, solo, {tag}upper body, {outfit}, {setting}."
+# key: (+ tag, - tag or None = the neutral prompt, slider strengths). Age stays adult: pushed upward only.
+ATTRIBUTES = {
+    "hair_length": ("very long hair", "short hair", (-2.0, 2.0)),
+    "hair_colour": ("blonde hair", "black hair", (-2.0, 2.0)),
+    "eye_colour": ("red eyes", "blue eyes", (-2.0, 2.0)),
+    "proportions": ("chibi", None, (-2.0, 2.0)),
+    "age": ("old woman", None, (2.0,)),
+    "style": ("watercolor (medium)", "flat color", (-2.0, 2.0)),
+}
+ATTR_SITE = "context"                           # e001: a uniform push works after the adapter, not before it
+TAGGER = "SmilingWolf/wd-eva02-large-tagger-v3"
+
+
+def attr_cells() -> list[tuple[int, int]]:
+    """(character index, seed) for every cell."""
+    return [(ci, sd) for ci in range(len(CHARACTERS)) for sd in ATTR_SEEDS]
+
+
+def attr_prompt(tag: "str | None", ci: int) -> str:
+    outfit, setting = CHARACTERS[ci]
+    return CHARACTER_TEMPLATE.format(tag=f"{tag}, " if tag else "", outfit=outfit, setting=setting)
+
+
+def attr_sets() -> dict:
+    """Every image set of e012, in render order: {key: (tag or None, slider (attribute, alpha) or None)}."""
+    sets: dict = {"neutral": (None, None)}
+    for a, (plus, minus, _) in ATTRIBUTES.items():
+        sets[f"{a}+"] = (plus, None)
+        if minus:
+            sets[f"{a}-"] = (minus, None)
+    for a, (_, _, alphas) in ATTRIBUTES.items():
+        for al in alphas:
+            sets[f"{a}@{al:+g}"] = (None, (a, al))
+    return sets
+
+
+def attribute_reads(judge: dict) -> dict:
+    """The registered reads from judge scores {set key: {attribute: [score per cell]}} (keys as attr_sets())."""
+    import numpy as np
+    base = judge["neutral"]
+    span, slopes, out = {}, {}, {}
+    for b, (_, minus, _) in ATTRIBUTES.items():
+        lo = judge[f"{b}-"][b] if minus else base[b]
+        span[b] = float(np.mean(np.subtract(judge[f"{b}+"][b], lo)))
+    for a, (_, minus, alphas) in ATTRIBUTES.items():
+        slopes[a] = {b: cell_slopes({0.0: base[b], **{al: judge[f"{a}@{al:+g}"][b] for al in alphas}})
+                     for b in ATTRIBUTES}
+    for a, (_, minus, alphas) in ATTRIBUTES.items():
+        up = flavor_outcome(list(np.subtract(judge[f"{a}+"][a], base[a])), 1, label="THE WORD MOVES IT")
+        down = (flavor_outcome(list(np.subtract(judge[f"{a}-"][a], base[a])), -1, label="THE WORD MOVES IT")
+                if minus else None)
+        dial = flavor_outcome(slopes[a][a], 1, label="A DIAL")
+        cross = {b: (float(np.mean(slopes[a][b])) / span[b] if span[b] else 0.0) for b in ATTRIBUTES}
+        reach = cross[a]
+        worst = max((abs(v) for b, v in cross.items() if b != a), default=0.0)
+        clean = reach > 0 and worst < reach / 3
+        if up["OUTCOME"] != "THE WORD MOVES IT":
+            verdict = "NO HANDLE"
+        elif dial["OUTCOME"] != "A DIAL":
+            verdict = "WORDS ONLY"
+        else:
+            verdict = "SLIDER" if clean else "SLIDER WITH CROSS-TALK"
+        out[a] = {"plus": ATTRIBUTES[a][0], "minus": minus, "alphas": list(alphas), "words_up": up, "words_down": down,
+                  "dial": dial, "span": span[a], "reach": reach, "cross_talk": cross, "worst_cross_talk": worst,
+                  "clean": clean, "OUTCOME": verdict}
+    return out
+
+
+ATTR_REFERENCES = (
+    ("Gandikota, Materzynska, Zhou, Torralba, Bau, \"Concept Sliders: LoRA Adaptors for Precise Control in Diffusion "
+     "Models\" (2023)", "https://arxiv.org/abs/2311.12092"),
+    ("Baumann, Krause, Neumayr, Stracke, Sevi, Hu et al., \"Continuous, Subject-Specific Attribute Control in T2I Models "
+     "by Identifying Semantic Directions\" (2024)", "https://arxiv.org/abs/2403.17064"),
+    ("Brack, Friedrich, Hintersdorf, Struppek, Schramowski, Kersting, \"SEGA: Instructing Diffusion using Semantic "
+     "Dimensions\" (2023)", "https://arxiv.org/abs/2301.12247"),
+    ("Gandikota, Wu, Zhang, Bau, Shechtman, Kolkin, \"SliderSpace: Decomposing the Visual Capabilities of Diffusion "
+     "Models\" (2025)", "https://arxiv.org/abs/2502.01639"),
+    ("SmilingWolf, \"WD EVA02-Large Tagger v3\" (model card, 2024)", f"https://huggingface.co/{TAGGER}"),
+)
+
+
+def render_attribute_screen_readme(meta: dict, recipe: dict) -> str:
+    """e012's README: the question, the design and the rule fixed before the run, and the result when done."""
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    attrs = "\n".join(f"| {a} | {p} | {m or '(none: the plain prompt)'} | {', '.join(f'{x:+g}' for x in al)} |"
+                      for a, (p, m, al) in ATTRIBUTES.items())
+    chars = "; ".join(f"{o} / {s}" for o, s in CHARACTERS)
+    refs = "\n".join(f"- {t}: {u}" for t, u in ATTR_REFERENCES)
+    out = [f"# {ATTR_TEST_ID}: {ATTR_TEST_TITLE}", "",
+           f"Date: {DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Questions",
+           "1. Which character attributes does a tag in the prompt control reliably on this model?",
+           "2. Does each attribute's direction, added to the conditioning after the text adapter, act as a slider?",
+           "3. Does each slider move only its own attribute, or does it drag the others along?", "",
+           "## Design",
+           f"- **Characters**: \"1girl, solo, upper body\" with eight outfits and settings ({chars}) x seeds "
+           f"{', '.join(map(str, ATTR_SEEDS))}: 16 cells per set. All characters are adults; the age slider only "
+           "pushes older.",
+           "- **Attributes** (a tag pair inside the model's own vocabulary):", "",
+           "| attribute | + tag | - tag | slider strengths |", "|---|---|---|---|", attrs, "",
+           "- **Words**: each tag added to the prompt, against the plain prompt.",
+           "- **Sliders**: the attribute's direction (half the mean, over the eight characters, of the + prompt's mean "
+           "token vector minus the - prompt's or the plain prompt's) at the adapter's output, which the image model reads; "
+           "added to every token of the plain prompt at the strengths above (the plain prompt's own images are strength "
+           "0). The negative prompt is left unchanged. Experiment e001 found this site live and the one before the "
+           "adapter dead for such a push.",
+           "- 22 sets x 16 = 352 images.", "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The judge",
+           f"Each image is scored on its pixels by the [WD EVA02-Large tagger v3](https://huggingface.co/{TAGGER}), an "
+           "image tagger trained on Danbooru tags (the vocabulary the attribute tags come from), with its reference "
+           "preprocessing. An attribute's score is the log-odds of its + tag minus the log-odds of its - tag (the + tag "
+           "alone where there is no - tag). *Content kept* is the CLIP ViT-L/14 image cosine to the plain prompt's image "
+           "of the same character and seed.", "",
+           "## The rule (fixed before the run)",
+           "Per character and seed (16 cells), read in the expected direction: **THE WORD MOVES IT** when the mean moves "
+           "that way, at least 75% of the cells move that way and the mean is beyond 3 standard errors; **NO EFFECT** "
+           "within 2 standard errors of zero or under 60% that way; **MIXED** otherwise. The slider read is the per-cell "
+           "least-squares slope of the attribute's score on the strength (**A DIAL** under the same rule). "
+           "**Cross-talk**: slider a's slope on attribute b's score, in units of b's word span (the + word minus the - "
+           "word, or the plain prompt, on b's score); **reach** = slider a on its own attribute in the same units; "
+           "**clean** = every other attribute's cross-talk under a third of the reach. Verdict per attribute: **SLIDER** "
+           "(the word moves it, the slider is a dial, clean), **SLIDER WITH CROSS-TALK** (not clean), **WORDS ONLY** "
+           "(no dial), **NO HANDLE** (the word does not move the judge).", ""]
+    if meta.get("status") == "done":
+        r = meta["result"]["attributes"]
+        out += ["## Result", meta.get("summary", ""), "",
+                "| attribute | + word | - word | slider slope | reach | worst cross-talk | content kept at +2 | verdict |",
+                "|---|---|---|---|---|---|---|---|"]
+        for a, v in r.items():
+            down = (f"{v['words_down']['mean']:+.2f} ({v['words_down']['OUTCOME']})" if v.get("words_down") else "")
+            kept = v.get("content_kept", {}).get("+2")
+            out.append(f"| {a} | {v['words_up']['mean']:+.2f} ({v['words_up']['OUTCOME']}) | {down} | "
+                       f"{v['dial']['mean']:+.3f} +- {v['dial']['se']:.3f} ({v['dial']['OUTCOME']}) | {v['reach']:.2f} | "
+                       f"{v['worst_cross_talk']:.2f} | {'' if kept is None else f'{kept:.3f}'} | **{v['OUTCOME']}** |")
+        names = list(r)
+        out += ["", "Cross-talk (row = slider, column = attribute read; units of that attribute's word span):", "",
+                "| slider | " + " | ".join(names) + " |", "|---|" + "---|" * len(names)]
+        for a in names:
+            out.append(f"| {a} | " + " | ".join(f"{r[a]['cross_talk'][b]:+.2f}" for b in names) + " |")
+        ov = meta["result"].get("overlap", {}).get(ATTR_SITE)
+        if ov:
+            out += ["", "Direction overlap after the adapter (cosine):", "",
+                    "| | " + " | ".join(names) + " |", "|---|" + "---|" * len(names)]
+            for a in names:
+                out.append(f"| {a} | " + " | ".join(f"{ov[a][b]:+.2f}" for b in names) + " |")
+        out += ["", "Sheets (`sheet_<attribute>.jpg`): eight characters at the first seed; columns: the - word (where "
+                "there is one), the slider at -2, the plain prompt, the slider at +2, the + word.", ""]
+        out += [f"![{a}](sheet_{a}.jpg)" for a in names] + [""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    else:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files", "- `result.json`: every cell's scores, the reads, the cross-talk and the direction overlaps.",
+            "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
+    return "\n".join(out)

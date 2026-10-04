@@ -8,6 +8,7 @@ handful of `a.<step>()` calls and all logic lives here.
     a = AnimaRunner()          # Anima-Base v1.0, 768 px; uploads to AbstractPhil/geolip-beatrix-anima
     a.setup()                  # env + HF login + GPU + the diffusion-pipe fork + the three model files (~5.6 GB)
     a.run_flavor_test()        # e001: the stock model (mood words, a mood dial at two conditioning sites, the norms)
+    a.run_attribute_screen()   # e012: attribute words, attribute sliders after the adapter, their cross-talk
     a.run_sequence()           # e002..: the LoRA arms (anima_experiments.SEQUENCE)
 
 Rendering. Every image (the training sets, the no-LoRA baseline, the evaluations, e001) is made in this process by
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field, fields
@@ -445,7 +447,8 @@ class AnimaRunner(_sr.SanaRunner):
 
     # ---- single runs: the sequence is the supported path on this bed --------------------------------
     def evaluate(self, *a, **k):
-        raise NotImplementedError("the Anima bed runs through run_flavor_test() and run_sequence()")
+        raise NotImplementedError("the Anima bed runs through run_flavor_test(), run_attribute_screen() and "
+                                  "run_sequence()")
 
     # ---- the renderer against the trainer's own previews (once per session) ---------------------------
     PARITY_LEVELS = 2.0                          # mean |difference| in 8-bit levels counted as the same image
@@ -622,3 +625,186 @@ class AnimaRunner(_sr.SanaRunner):
         conds = pipe.encode(prompts)
         ctx = pipe.adapt(conds)
         return {"source": (conds[0].float(), conds[1]), "context": (ctx.float(), conds[3])}
+
+    # ---- e012: the attribute screen ----------------------------------------------------------------------
+    def _tagger(self):
+        if getattr(self, "_tagger_fns", None) is None:
+            print(f"[{self.TAG}] loading the tagger judge ({ax.TAGGER}; a 1.3 GB download the first time)...", flush=True)
+            self._tagger_fns = _wd_tagger(ax.TAGGER, [t for p, m, _ in ax.ATTRIBUTES.values() for t in (p, m) if t])
+        return self._tagger_fns
+
+    def _tag_scores(self, imgs: list) -> dict:
+        """{attribute: [score per image]}: the tagger's log-odds of the + tag minus those of the - tag (the + tag
+        alone where there is none), probabilities clipped to [1e-4, 1 - 1e-4]."""
+        import numpy as np
+        probs, index = self._tagger()
+        p = probs(imgs)
+
+        def logodds(tag):
+            q = np.clip(p[:, index[tag]], 1e-4, 1 - 1e-4)
+            return np.log(q / (1 - q))
+
+        return {a: [float(x) for x in logodds(plus) - (logodds(minus) if minus else 0.0)]
+                for a, (plus, minus, _) in ax.ATTRIBUTES.items()}
+
+    def _attr_recipe(self) -> dict:
+        return {"model": "Anima-Base v1.0, no LoRA",
+                "images": f"{self._need('resolution')} x {self._need('resolution')}, Euler, {self.GEN_STEPS} steps, "
+                          f"guidance {self.GEN_CFG}, shift {self.GEN_SHIFT:g}",
+                "prompts": "the model card's quality prefix + 1girl, solo, <tag>, upper body, <outfit>, <setting>; the "
+                           "card's negative prompt",
+                "cells": f"{len(ax.CHARACTERS)} characters x seeds {', '.join(map(str, ax.ATTR_SEEDS))}",
+                "slider site": "the adapter's output (what the image model reads)",
+                "judge": "WD EVA02-Large tagger v3 (log-odds); content kept by CLIP ViT-L/14"}
+
+    def run_attribute_screen(self, *, force: bool = False) -> dict:
+        """e012 into its own folder of cfg.repo_id: attribute words, attribute sliders after the adapter, their
+        cross-talk and the overlap of their directions. Skipped when the repo lists it as done (force=True reruns)."""
+        self._need_model()
+        _drop_torchao()
+        repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
+        metas = repo.metas()
+        try:
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        eid = ax.ATTR_TEST_ID
+        if metas.get(eid, {}).get("status") == "done" and not force:
+            print(f"[anima] {eid} is done already (force=True reruns it)", flush=True)
+            return metas[eid]
+        base = f"experiments/{eid}"
+        recipe = self._attr_recipe()
+        meta = {"id": eid, "title": ax.ATTR_TEST_TITLE, "date": ax.DATE, "kind": "attribute_screen",
+                "status": "running", "recipe": recipe}
+        repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                     f"{base}/README.md": ax.render_attribute_screen_readme(meta, recipe)}, f"{eid}: started (README)")
+        out_dir = Path(self._need("data_root")) / "experiments" / eid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        try:
+            result = self._attribute_screen(out_dir)
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                                            f"{base}/README.md": ax.render_attribute_screen_readme(meta, recipe)},
+                                           f"{eid}: failed"))
+            raise
+        summary = "; ".join(f"{a} {v['OUTCOME']}" for a, v in result["attributes"].items())
+        meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
+                    seconds=round(time.time() - t0),
+                    finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
+        files = {f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_attribute_screen_readme(meta, recipe),
+                 f"{base}/result.json": out_dir / "result.json"}
+        for f in sorted(out_dir.glob("sheet_*.jpg")):
+            files[f"{base}/{f.name}"] = f
+        repo.commit(files, f"{eid}: result")
+        metas[eid] = meta
+        self._safe(lambda: self._publish_index(repo, metas))
+        print(f"[anima] {eid} done in {_sr._hms(meta['seconds'])}: {summary}", flush=True)
+        return meta
+
+    def _attribute_screen(self, out_dir: Path) -> dict:
+        import numpy as np
+        import torch
+        self._eval_pipe()
+        self._assert_stock()
+        self._tagger()                            # both judges before any image: a judge fault fails in minute one
+        self._judge()
+        cells = ax.attr_cells()
+        S = [sd for _, sd in cells]
+        chars = range(len(ax.CHARACTERS))
+
+        def token_means(tag):                    # per character: the prompt's mean token vector at both sites
+            st = self._site_states([ax.attr_prompt(tag, ci) for ci in chars])
+            return {site: (x * m[..., None]).sum(1) / m.sum(1, keepdim=True) for site, (x, m) in st.items()}
+
+        plain = token_means(None)
+        dirs: dict = {site: {} for site in plain}
+        for a, (plus, minus, _) in ax.ATTRIBUTES.items():
+            hi, lo = token_means(plus), (token_means(minus) if minus else plain)
+            for site in dirs:
+                dirs[site][a] = ((hi[site] - lo[site]) / 2).mean(0)
+        sets = ax.attr_sets()
+        print(f"[anima] e012: {len(sets)} sets of {len(cells)} images = {len(sets) * len(cells)} (the plain prompt, "
+              f"{len(ax.ATTRIBUTES)} attributes' words and sliders), one line per set", flush=True)
+        eta = _sr._Eta(self.TAG, "e012", len(sets) * len(cells))
+        imgs, judge, feats = {}, {}, {}
+        for k, (tag, slider) in sets.items():
+            kw = {"context_add": dirs[ax.ATTR_SITE][slider[0]] * slider[1]} if slider else {}
+            imgs[k] = self._render_tracked([ax.attr_prompt(tag, ci) for ci, _ in cells], S, eta, **kw)
+            judge[k] = self._tag_scores(imgs[k])
+            feats[k], _ = self._score(imgs[k])
+            own = k.split("@")[0].rstrip("+-")
+            line = (f"{own} score {np.mean(judge[k][own]):+.2f} (plain prompt {np.mean(judge['neutral'][own]):+.2f})"
+                    if own in ax.ATTRIBUTES else "plain prompt")
+            print(f"[anima] e012 {k}: {line}", flush=True)
+        reads = ax.attribute_reads(judge)
+        for a, (_, _, alphas) in ax.ATTRIBUTES.items():
+            kept = {f"{al:+g}": float(np.mean((feats[f"{a}@{al:+g}"] * feats["neutral"]).sum(-1))) for al in alphas}
+            kept["word"] = float(np.mean((feats[f"{a}+"] * feats["neutral"]).sum(-1)))
+            reads[a]["content_kept"] = kept
+        overlap, norms = {}, {}
+        for site, d in dirs.items():
+            names = list(d)
+            v = torch.stack([d[a] for a in names]).float()
+            c = (torch.nn.functional.normalize(v, dim=-1) @ torch.nn.functional.normalize(v, dim=-1).T).cpu().numpy()
+            overlap[site] = {a: {b: float(c[i, j]) for j, b in enumerate(names)} for i, a in enumerate(names)}
+            norms[site] = {a: float(v[i].norm()) for i, a in enumerate(names)}
+        rows_first = [i for i, (_, sd) in enumerate(cells) if sd == ax.ATTR_SEEDS[0]]
+        for a, (_, minus, alphas) in ax.ATTRIBUTES.items():
+            cols = (([f"{a}-"] if minus else []) + [f"{a}@{al:+g}" for al in alphas if al < 0] + ["neutral"]
+                    + [f"{a}@{al:+g}" for al in alphas if al > 0] + [f"{a}+"])
+            _grid([[imgs[k][i] for k in cols] for i in rows_first], out_dir / f"sheet_{a}.jpg")
+        return {"attributes": reads, "overlap": overlap, "direction_norms": norms,
+                "judge_means": {k: {a: float(np.mean(v)) for a, v in j.items()} for k, j in judge.items()},
+                "cells": [{"character": ax.CHARACTERS[ci][0], "seed": sd,
+                           **{k: {a: judge[k][a][n] for a in judge[k]} for k in judge}}
+                          for n, (ci, sd) in enumerate(cells)]}
+
+
+def _wd_tagger(repo_id: str, tags: list[str]):
+    """A WD v3 tagger (SmilingWolf; timm) as (fn(images) -> probabilities [n images, n tags], {tag: column}), with the
+    reference preprocessing (github.com/neggles/wdv3-timm): white square padding, the model's own transform (448,
+    bicubic, mean / std .5), RGB -> BGR, sigmoid; fp32. Every one of `tags` (spaces or underscores) must be in the
+    tagger's list."""
+    import csv
+
+    import numpy as np
+    import torch
+    from huggingface_hub import hf_hub_download
+    from PIL import Image
+    try:
+        import timm
+    except ImportError:
+        print("[setup] installing timm (the tagger judge)", flush=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "timm"], check=True)
+        import timm
+    from timm.data import create_transform, resolve_data_config
+    with open(hf_hub_download(repo_id, "selected_tags.csv"), encoding="utf-8") as f:
+        col = {row["name"]: i for i, row in enumerate(csv.DictReader(f))}
+    missing = [t for t in tags if t.replace(" ", "_") not in col]
+    if missing:
+        raise RuntimeError(f"{repo_id} has no tag(s) {missing}")
+    index = {t: col[t.replace(" ", "_")] for t in tags}
+    model = timm.create_model("hf-hub:" + repo_id).eval()
+    model.load_state_dict(timm.models.load_state_dict_from_hf(repo_id))
+    model = model.to("cuda")
+    transform = create_transform(**resolve_data_config(model.pretrained_cfg, model=model))
+
+    def square(im):
+        im = im.convert("RGB")
+        w, h = im.size
+        canvas = Image.new("RGB", (max(w, h), max(w, h)), (255, 255, 255))
+        canvas.paste(im, ((max(w, h) - w) // 2, (max(w, h) - h) // 2))
+        return canvas
+
+    @torch.no_grad()
+    def probs(imgs):
+        out = []
+        for i in range(0, len(imgs), 16):
+            x = torch.stack([transform(square(im)) for im in imgs[i:i + 16]])[:, [2, 1, 0]].to("cuda")
+            out.append(torch.sigmoid(model(x)).float().cpu().numpy())
+        return np.concatenate(out)
+
+    return probs, index

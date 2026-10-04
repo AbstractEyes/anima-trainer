@@ -364,6 +364,92 @@ def test_flavor_test_end_to_end(runner):
     assert again["status"] == "done" and sum(c.startswith(ax.FLAVOR_TEST_ID) for c in repo.commits) == 2
 
 
+def test_attribute_sets_are_the_registered_design():
+    sets = ax.attr_sets()
+    assert len(sets) == 22 and len(ax.attr_cells()) == 16
+    assert sets["age@+2"] == (None, ("age", 2.0)) and "age@-2" not in sets      # adults only: pushed older only
+    assert all(f"{a}-" in sets for a, (_, minus, _) in ax.ATTRIBUTES.items() if minus)
+    assert ax.attr_prompt("very long hair", 0) == (ax.PREFIX + "1girl, solo, very long hair, upper body, office suit, "
+                                                    "modern office.")
+    assert ax.attr_prompt(None, 1) == ax.PREFIX + "1girl, solo, upper body, apron over a sweater, cozy cafe."
+    assert not any("school" in o or "school" in st for o, st in ax.CHARACTERS)
+    readme = ax.render_attribute_screen_readme({"status": "running"}, {"model": "Anima"})
+    assert "fixed before the run" in readme and "2403.17064" in readme and "Running." in readme
+    for word in ("S-1", "Phil", "docket", "canon/"):
+        assert word not in readme
+
+
+def test_attribute_screen_end_to_end(runner, monkeypatch):
+    """Each tag owns one axis of a tiny conditioning space; a fake tagger reads the prompt and the push back. Built so
+    that hair length / hair colour / age are clean sliders, the eye-colour slider drags hair colour along, the
+    proportions push does nothing and the judge never sees style."""
+    from PIL import Image
+    s, repo, pipe, calls = runner
+    names = list(ax.ATTRIBUTES)
+
+    def vec(prompt):
+        v = torch.zeros(8)
+        for k, (plus, minus, _) in enumerate(ax.ATTRIBUTES.values()):
+            v[k] += float(plus in prompt) - float(bool(minus) and minus in prompt)
+        return v
+
+    def site_states(prompts):
+        m = torch.tensor([[1, 1, 1, 0]] * len(prompts))
+        x = torch.stack([vec(p).expand(4, 8) + 2.0 for p in prompts])
+        return {"source": (x, m), "context": (x, m)}
+
+    def render(prompts, seeds, source_add=None, context_add=None):
+        out = []
+        for p, sd in zip(prompts, seeds):
+            im = Image.new("RGB", (8, 8), (128, 128, 128))
+            im.info.update(prompt=p, seed=sd, push=context_add)
+            out.append(im)
+        return out
+
+    def tag_scores(imgs):
+        res = {a: [] for a in names}
+        for im in imgs:
+            p, push = im.info["prompt"], im.info["push"]
+            ci = next(i for i, (o, _) in enumerate(ax.CHARACTERS) if o in p)
+            noise, v = 0.05 * ((ci + im.info["seed"]) % 3), vec(p)
+            for k, a in enumerate(names):
+                sc = 3 * float(v[k]) + noise
+                if push is not None and a != "proportions":
+                    sc += 2 * float(push[k])
+                if push is not None and a == "hair_colour":
+                    sc += 1.5 * float(push[names.index("eye_colour")])
+                res[a].append(noise if a == "style" else sc)
+        return res
+
+    monkeypatch.setattr(s, "_site_states", site_states)
+    monkeypatch.setattr(s, "_render", render)
+    monkeypatch.setattr(s, "_tag_scores", tag_scores)
+    loaded = []
+    monkeypatch.setattr(s, "_tagger", lambda: loaded.append("tagger"))
+    monkeypatch.setattr(s, "_judge", lambda: loaded.append("clip"))
+    meta = s.run_attribute_screen()
+    assert loaded == ["tagger", "clip"]                          # both judges load before the first image
+    r = meta["result"]["attributes"]
+    assert meta["status"] == "done" and meta["kind"] == "attribute_screen"
+    assert {a: v["OUTCOME"] for a, v in r.items()} == {
+        "hair_length": "SLIDER", "hair_colour": "SLIDER", "eye_colour": "SLIDER WITH CROSS-TALK",
+        "proportions": "WORDS ONLY", "age": "SLIDER", "style": "NO HANDLE"}
+    assert r["hair_length"]["reach"] == pytest.approx(2 / 6) and r["age"]["reach"] == pytest.approx(1 / 3)
+    assert r["eye_colour"]["cross_talk"]["hair_colour"] == pytest.approx(1.5 / 6)
+    assert r["hair_colour"]["words_down"]["OUTCOME"] == "THE WORD MOVES IT" and r["age"]["words_down"] is None
+    ov = meta["result"]["overlap"]["context"]
+    assert ov["hair_length"]["hair_colour"] == pytest.approx(0.0) and ov["age"]["age"] == pytest.approx(1.0)
+    assert meta["result"]["direction_norms"]["context"]["age"] == pytest.approx(0.5)
+    base = f"experiments/{ax.ATTR_TEST_ID}"
+    for f in ["meta.json", "README.md", "result.json"] + [f"sheet_{a}.jpg" for a in names]:
+        assert f"{base}/{f}" in repo.files_
+    assert "SLIDER WITH CROSS-TALK" in repo.files_[f"{base}/README.md"].decode()
+    assert ax.ATTR_TEST_ID in repo.files_["README.md"].decode()
+    assert len(json.loads(repo.files_[f"{base}/result.json"])["cells"]) == 16
+    again = s.run_attribute_screen()                           # done already: skipped
+    assert again["status"] == "done" and sum(c.startswith(ax.ATTR_TEST_ID) for c in repo.commits) == 2
+
+
 def test_config_validation_refuses_master_weights_without_plain_adam():
     from geolip_anima_trainer import api
     cfg = api.TrainConfig(run=api.RunConfig(output_dir="o", bf16_master_weights=True), model=api.ModelConfig(),

@@ -498,7 +498,14 @@ LoRAs: `LoraHooks` (ComfyUI keys `diffusion_model.<path>.lora_A/B.weight`, alpha
 zero-B modules skipped — the frozen LLM adapter's LoRA) as forward hooks; stock weights never change. The
 first arm per session compares the kernel renders against the trainer's own step-0 and final-epoch previews
 (`_after_train`; `renderer_parity` in meta, MATCHES <= 2 levels mean). `tests/test_anima_runner.py`: the
-hooks against merged weights on a CPU model, the config, the registry/READMEs, the sequence and e001 with fakes.
+hooks against merged weights on a CPU model, the config, the registry/READMEs, the sequence, e001 and e012 with
+fakes. `run_attribute_screen()` = e012: `anima_experiments.ATTRIBUTES` (tag pairs; age pushed up only, adults),
+`CHARACTERS` x `ATTR_SEEDS`, `attr_sets()` (22 sets), sliders at the `context` site only (e001: a uniform push is
+dead before the adapter), judged by `_wd_tagger` (SmilingWolf WD EVA02-Large v3 via timm, the reference
+preprocessing of neggles/wdv3-timm: white square pad, the model transform, RGB->BGR, sigmoid; log-odds),
+`attribute_reads()` = the registered rule (words, dial, cross-talk in units of each attribute's word span, clean <
+reach / 3). PROGRESS: `sana_runner._Eta` / `_render_tracked` / `_train_eta` print job size, done / total, time
+spent and time left on every long step (renders, training from the trainer's own step lines, the sequence).
 
 ### Training previews — `SamplesConfig` → `[samples]`
 `TrainConfig.samples = SamplesConfig(prompts=[...])` renders a `[samples]` table into the lora toml

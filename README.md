@@ -199,8 +199,9 @@ cache → two-phase train):
   [Sana](#sana-diffusers-format) and `notebooks/README.md`.
 - **`anima_colab_experiments.ipynb`** — the same experiment system on **Anima**
   (`geolip_anima_trainer.anima_runner.AnimaRunner`): e001 measures the stock model (mood words, a mood
-  direction added to the conditioning before and after the LLM adapter, the conditioning norms), then the
-  LoRA arms, each into its own folder of
+  direction added to the conditioning before and after the LLM adapter, the conditioning norms), e012
+  screens character attributes as sliders (judged by an anime tagger), then the LoRA arms, each into its own
+  folder of
   [AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). See
   [Anima experiments](#anima-experiments-the-flavor-bed).
 
@@ -291,6 +292,7 @@ from geolip_anima_trainer.anima_runner import AnimaRunner
 a = AnimaRunner()          # Anima-Base v1.0, 768 px
 a.setup()                  # GPU + the fork + the three model files
 a.run_flavor_test()        # e001: the stock model
+a.run_attribute_screen()   # e012: attribute sliders on the stock model
 a.run_sequence()           # e002..e011: the LoRA arms
 ```
 
@@ -304,7 +306,14 @@ a.run_sequence()           # e002..e011: the LoRA arms
   stock weights never change. The first arm of a session compares this renderer with the trainer's own
   preview images (stock and with the LoRA) and records the pixel difference in the arm's `meta.json`.
 - **e001** adds a mood direction to the conditioning at two sites: the Qwen3 states the LLM adapter reads,
-  and the adapter's output the DiT cross-attends to (both 1,024 wide).
+  and the adapter's output the DiT cross-attends to (both 1,024 wide). Result: a push added equally to every
+  token moves the mood only after the adapter.
+- **e012** screens six character attributes (hair length, hair colour, eye colour, chibi proportions, age
+  for adults only, style) as tag pairs on eight characters: does the tag move the attribute, does its
+  direction added after the adapter act as a slider, and does each slider leave the other attributes alone
+  (cross-talk, and the overlap of the directions). The judge is the
+  [WD EVA02-Large tagger v3](https://huggingface.co/SmilingWolf/wd-eva02-large-tagger-v3).
+- **Progress:** every long step prints the size of the job, then done / total, time spent and time left.
 
 > **Licence.** Anima's weights are under the CircleStone Labs Non-Commercial License (a derivative of
 > NVIDIA Cosmos-Predict2-2B, NVIDIA Open Model License); LoRAs trained on it share those terms.

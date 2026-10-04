@@ -70,11 +70,15 @@ Sana's weights are Apache-2.0; its Gemma-2-2B-IT text encoder is under the Gemma
 The same experiment system on **Anima** (Anima-Base v1.0 at 768 px), uploaded one folder per experiment
 into [AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). Thin
 shell over `geolip_anima_trainer.anima_runner.AnimaRunner`: the same bootstrap, then `setup()` →
-`run_flavor_test()` → `run_sequence()`.
+`run_flavor_test()` → `run_attribute_screen()` → `run_sequence()`. Every long step prints the job's size,
+then done / total, time spent and time left.
 
 - **e001** (`run_flavor_test`): 32 scenes × {neutral, upbeat, downbeat} words × 2 seeds; the conditioning
   norms of the 32 neutral prompts at two sites (the Qwen3 states the LLM adapter reads, and the adapter's
   output the DiT cross-attends to); a mood direction added at each site at alpha −2..+2 (about 700 images).
+- **e012** (`run_attribute_screen`): six attributes as tag pairs (hair length, hair colour, eye colour, chibi,
+  age for adults only, style) on 8 characters × 2 seeds; the words, a slider after the adapter at ±2, the
+  cross-talk between sliders; judged by the WD EVA02-Large tagger v3 (352 images, ~20 min).
 - **The LoRA arms** (`anima_experiments.SEQUENCE`): e002 upbeat, e003 the control, e004 downbeat, e005 a
   fresh draw, e006 / e007 half / double the learning rate, then e008–e011 the second draw.
 - **Recipe** (from the model card): rank 32 at 2e-5, the LLM adapter frozen, plain Adam with weight decay 0
