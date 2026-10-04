@@ -11,6 +11,7 @@ handful of `a.<step>()` calls and all logic lives here.
     a.run_route_split()        # e020 / e021 (run_appended_split): which of the adapter's two readings carries the words
     a.run_query_dial()         # e022: a mood direction in the adapter's queries, alone and with a source token
     a.run_word_split()         # e026: single words, whole T5 tokens against shattered ones
+    a.run_slot_pair()          # e027: a word-sized push at one word's position: its query side, its source side, both
     a.run_attribute_screen()   # e012: attribute words, attribute sliders after the adapter, their cross-talk
     a.run_sequence()           # e002..: the LoRA arms (anima_experiments.SEQUENCE)
     a.run_beatrix_connectors() # e013-e025: a push from Beatrix's phrase features (+ an untrained trunk, a free vector)
@@ -302,6 +303,43 @@ class AnimaPipe:
             out.append(conds[0][b, idx].float().mean(0))
         return torch.stack(out)
 
+    def slot_masks(self, prompts: list[str], word: str, device: str = "cuda", length: int = 512) -> tuple:
+        """Per prompt, float masks [B, length] over the T5 positions and the Qwen3 positions of the tokens whose
+        characters overlap the last occurrence of `word` (the pipeline calls both tokenizers plainly with right
+        padding, so the offsets' indices are the tensors' positions)."""
+        import torch
+        out = []
+        for tok in (self.model.t5_tokenizer, self.model.tokenizer):
+            rows = torch.zeros(len(prompts), length)
+            for b, p in enumerate(prompts):
+                if word not in p:
+                    raise ValueError(f"{word!r} not in {p!r}")
+                ws = p.rindex(word)
+                we = ws + len(word)
+                offs = tok(p, return_offsets_mapping=True)["offset_mapping"]
+                idx = [k for k, (a, e) in enumerate(offs) if a < we and e > ws and k < length]
+                if not idx:
+                    raise ValueError(f"no token of {word!r} in {p!r}")
+                rows[b, idx] = 1.0
+            out.append(rows.to(device))
+        return tuple(out)
+
+    def word_queries(self, words: "tuple[str, ...]"):
+        """The adapter's query embedding of each word [len, D] float32: its word table's row through in_proj, for words
+        the T5 vocabulary holds as one token (after a space)."""
+        import torch
+        tok = self.model.t5_tokenizer
+        ids = []
+        for w in words:
+            pieces = tok.tokenize(" " + w)
+            if len(pieces) != 1:
+                raise ValueError(f"{w!r} is not one T5 token: {pieces}")
+            ids.append(tok.convert_tokens_to_ids(pieces[0]))
+        ad = self.model.transformer.llm_adapter
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            x = ad.in_proj(ad.embed(torch.tensor(ids, device="cuda")))
+        return x.float()
+
     def encode_images(self, imgs: list, res: int):
         """Latents [B, 16, 1, res/8, res/8] of PIL images by the trainer's own path: fitted to res x res
         (utils.image_resize.convert_crop_and_resize), scaled to [-1, 1] (ToTensor + Normalize(.5, .5)), then the VAE
@@ -342,10 +380,10 @@ class AnimaPipe:
         return self._loss_fn(self.train_forward(x, t, tuple(c), push), (target, torch.tensor([])))
 
     # ---- sampling ---------------------------------------------------------------------------------
-    def _forward(self, x, t, conds: tuple, context_add=None, query_add=None):
+    def _forward(self, x, t, conds: tuple, context_add=None, query_add=None, query_mask=None):
         handle = None
         if query_add is not None:                          # added to the adapter's queries at the caption's T5 tokens
-            mask = conds[3]
+            mask = conds[3] if query_mask is None else query_mask      # (or at the positions query_mask marks)
 
             def hook(mod, inp, out):
                 return out + mask.to(out.dtype)[..., None] * query_add.to(out.device, out.dtype)
@@ -364,20 +402,26 @@ class AnimaPipe:
 
     def generate(self, prompts: list[str], seeds: list[int], *, res: int, steps: int, cfg: float, shift: float,
                  negative: str = "", batch: int = 8, source_add=None, context_add=None, uncond_add=None,
-                 t5_prompts: "list[str] | None" = None, query_add=None, source_token=None) -> list:
+                 t5_prompts: "list[str] | None" = None, query_add=None, source_token=None, slot_word: "str | None" = None,
+                 slot_query=None, slot_source=None) -> list:
         """PIL images, one per (prompt, seed). source_add / context_add: a 1024-vector added to every prompt token
         before / after the LLM adapter, on the conditional branch; uncond_add: the same after the adapter on the
         negative prompt's branch (a trained push goes on both branches, as a LoRA acts; e001's dial on neither).
         t5_prompts: per image, the prompt whose T5 token ids the adapter reads in place of the prompt's own, while
         the Qwen3 states stay the prompt's (the adapter's two inputs from one caption, split). query_add: a vector
         added to the adapter's query embeddings (before its blocks) at the caption's T5 tokens; source_token: one
-        extra source position appended after the caption's Qwen3 tokens (both on the conditional branch only)."""
+        extra source position appended after the caption's Qwen3 tokens. slot_query / slot_source: a vector added to
+        the query embedding / the Qwen3 state at slot_word's own tokens only (slot_masks). All on the conditional
+        branch only."""
         import torch
         from utils.previews import to_pil
         if len(prompts) != len(seeds):
             raise ValueError("one seed per prompt")
         if t5_prompts is not None and len(t5_prompts) != len(prompts):
             raise ValueError("one T5 prompt per prompt")
+        if (slot_query is not None or slot_source is not None) and (slot_word is None or query_add is not None
+                                                                   or t5_prompts is not None):
+            raise ValueError("a slot push needs slot_word, and takes neither query_add nor t5_prompts")
         unc = self.encode([negative]) if cfg > 1 else None
         out: list = []
         with torch.no_grad():
@@ -392,6 +436,14 @@ class AnimaPipe:
                     conds = (self.add_at_tokens(conds[0], conds[1], source_add), *conds[1:])
                 if source_token is not None:
                     conds = self.append_source_token(conds, source_token)
+                q_add, q_mask = query_add, None
+                if slot_query is not None or slot_source is not None:
+                    m_t5, m_q = self.slot_masks(p, slot_word)
+                    if slot_source is not None:
+                        conds = (conds[0] + m_q.to(conds[0].dtype)[..., None]
+                                 * slot_source.to(conds[0].device, conds[0].dtype), *conds[1:])
+                    if slot_query is not None:
+                        q_add, q_mask = slot_query, m_t5
                 un = tuple(u.expand(n, *u.shape[1:]).contiguous() for u in unc) if unc is not None else None
                 x = torch.cat([torch.randn((1, 16, res // 8, res // 8), device="cuda",
                                            generator=torch.Generator(device="cuda").manual_seed(int(sd)))
@@ -400,7 +452,7 @@ class AnimaPipe:
                 sch = self.model.scheduler
                 for step in sch.timesteps:
                     t = (step / 1000).float().reshape(1).repeat(n)
-                    v = self._forward(x, t, conds, context_add, query_add).float()
+                    v = self._forward(x, t, conds, context_add, q_add, q_mask).float()
                     if un is not None:
                         vu = self._forward(x, t, un, uncond_add).float()
                         v = vu + cfg * (v - vu)
@@ -1023,6 +1075,104 @@ class AnimaRunner(_sr.SanaRunner):
         result = ax.word_split_reads(scores)
         result.update(content_kept=kept, mood_score={k: float(np.mean(v)) for k, v in scores.items()}, sheet_columns=cols)
         _grid([[sheet[k][r] for k in cols] for r in range(len(rows))], out_dir / "sheet_words.jpg")
+        result["cells"] = [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
+                           for j, (si, sd) in enumerate(cells)]
+        return result
+
+    # ---- e027: the slot pair ------------------------------------------------------------------------------------------
+    def run_slot_pair(self, *, force: bool = False) -> dict:
+        """e027 into its own folder of cfg.repo_id: a word-sized mood push at one word's position, on the adapter's query
+        side, its source side, or both (a matched pair). Skipped when the repo lists it as done (force=True reruns)."""
+        self._need_model()
+        _drop_torchao()
+        repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
+        metas = repo.metas()
+        try:
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        rid = ax.SLOT_TEST_ID
+        if metas.get(rid, {}).get("status") == "done" and not force:
+            print(f"[anima] {rid} is done already (force=True reruns it)", flush=True)
+            return metas[rid]
+        base = f"experiments/{rid}"
+        recipe = self._flavor_recipe()
+        meta = {"id": rid, "title": ax.SLOT_TEST_TITLE, "date": "2026-10-04", "kind": "slot_pair", "status": "running",
+                "recipe": recipe}
+        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_slot_pair_readme(meta, recipe)},
+                    f"{rid}: started (README)")
+        out_dir = Path(self._need("data_root")) / "experiments" / rid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        try:
+            result = self._slot_pair(out_dir)
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                                            f"{base}/README.md": ax.render_slot_pair_readme(meta, recipe)},
+                                           f"{rid}: failed"))
+            raise
+        summary = ax.slot_summary(result)
+        meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
+                    seconds=round(time.time() - t0), finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
+        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_slot_pair_readme(meta, recipe),
+                     f"{base}/result.json": out_dir / "result.json", f"{base}/sheet_slot.jpg": out_dir / "sheet_slot.jpg"},
+                    f"{rid}: result")
+        metas[rid] = meta
+        self._safe(lambda: self._publish_index(repo, metas))
+        print(f"[anima] {rid} done in {meta['seconds']} s: {summary}", flush=True)
+        return meta
+
+    def _slot_pair(self, out_dir: Path) -> dict:
+        import numpy as np
+        pipe = self._eval_pipe()
+        self._assert_stock()
+        cells = [(si, sd) for si in range(len(SUBJECTS)) for sd in ax.SLOT_SEEDS]
+        S = [sd for _, sd in cells]
+        up, down = ax.SLOT_REFERENCE
+        P = {w: [ax.slot_prompt(w, SUBJECTS[si]) for si, _ in cells] for w in (ax.SLOT_WORD, up, down)}
+        q = pipe.word_queries((up, down))                    # the word table's rows through in_proj
+        d_q = q[0] - q[1]
+        xq, mq = pipe.query_states(P[ax.SLOT_WORD])
+        q_size = float(xq.norm(dim=-1)[mq.bool()].mean())
+        d_s = pipe.word_states(P[up], (up,)).mean(0) - pipe.word_states(P[down], (down,)).mean(0)
+        conds = pipe.encode(P[ax.SLOT_WORD])
+        s_size = float(conds[0].float().norm(dim=-1)[conds[1].bool()].mean())
+        sizes = {"query token mean size": q_size, "query direction before scaling": float(d_q.norm()),
+                 "Qwen3 state mean size": s_size, "source direction before scaling": float(d_s.norm())}
+        d_q, d_s = d_q / d_q.norm() * q_size, d_s / d_s.norm() * s_size       # one unit of alpha = one word's size
+        sets = ax.slot_sets()
+        print(f"[anima] e027: {len(sets)} sets of {len(cells)} images (the slot prompt, the real words at the slot, the "
+              f"query / pair / answer at the slot per alpha), one line per set; sizes "
+              + ", ".join(f"{k} {v:.1f}" for k, v in sizes.items()), flush=True)
+        eta = _sr._Eta(self.TAG, "e027", len(sets) * len(cells))
+        rows = list(range(len(cells)))[::4]                                    # 8 scenes for the sheet
+        cols = ["slot", f"word_{up}", f"word_{down}"] + [f"{f}@{a:+g}" for f in ax.SLOT_FORMS
+                                                         for a in (min(ax.SLOT_ALPHAS), max(ax.SLOT_ALPHAS))]
+        sheet, feat0, scores, kept = {}, None, {}, {}
+        for key in sets:                                   # the slot prompt first: content kept is read against it
+            if key == "slot" or key.startswith("word_"):
+                ims = self._render_tracked(P[ax.SLOT_WORD if key == "slot" else key[len("word_"):]], S, eta)
+            else:
+                form, a = key.split("@")
+                kw: dict = {"slot_word": ax.SLOT_WORD}
+                if form in ("Q", "P"):
+                    kw["slot_query"] = d_q * float(a)
+                if form in ("P", "S"):
+                    kw["slot_source"] = d_s * float(a)
+                ims = self._render_tracked(P[ax.SLOT_WORD], S, eta, **kw)
+            fa, sc = self._score(ims)
+            feat0 = fa if feat0 is None else feat0
+            scores[key] = [float(x) for x in sc]
+            kept[key] = float(np.mean((fa * feat0).sum(-1)))
+            if key in cols:
+                sheet[key] = [ims[i] for i in rows]
+            print(f"[anima] e027 {key}: mood score {np.mean(scores[key]):+.3f}, content kept {kept[key]:.3f}", flush=True)
+        result = ax.slot_pair_reads(scores)
+        result.update(sizes=sizes, content_kept=kept, mood_score={k: float(np.mean(v)) for k, v in scores.items()},
+                      sheet_columns=cols)
+        _grid([[sheet[k][r] for k in cols] for r in range(len(rows))], out_dir / "sheet_slot.jpg")
         result["cells"] = [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
                            for j, (si, sd) in enumerate(cells)]
         return result

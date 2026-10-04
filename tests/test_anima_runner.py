@@ -955,6 +955,84 @@ def test_word_split_test_needs_both_decisive_groups_readable():
     assert "n/a" in ax.word_summary(r)
 
 
+def test_slot_masks_mark_the_word_in_both_tokenizers():
+    from types import SimpleNamespace
+
+    class Tok:
+        """Splits on spaces and reports character offsets; the T5 stand-in ends with a special token at (0, 0)."""
+        def __init__(self, special):
+            self.special = special
+
+        def __call__(self, text, return_offsets_mapping=False):
+            offs, i = [], 0
+            for w in text.split(" "):
+                offs.append((i, i + len(w)))
+                i += len(w) + 1
+            return {"offset_mapping": offs + ([(0, 0)] if self.special else [])}
+
+    pipe = ar.AnimaPipe.__new__(ar.AnimaPipe)
+    pipe.model = SimpleNamespace(t5_tokenizer=Tok(True), tokenizer=Tok(False))
+    m_t5, m_q = pipe.slot_masks(["a cat, neutral mood.", "a dog by the sea, neutral mood."], "neutral", device="cpu",
+                                length=12)
+    assert m_t5.shape == m_q.shape == (2, 12)
+    assert m_t5[0].nonzero().flatten().tolist() == [2] and m_t5[1].nonzero().flatten().tolist() == [5]
+    assert torch.equal(m_t5, m_q)                                      # the special token at (0, 0) is never marked
+    with pytest.raises(ValueError, match="not in"):
+        pipe.slot_masks(["a cat, sad mood."], "neutral", device="cpu", length=12)
+
+
+def test_slot_pair_reads_the_matched_source_beside_the_query(runner, monkeypatch):
+    """e027: a fake model where the query at the slot is a dial and the matched source adds only on the downbeat side
+    when the query is there (the answer alone does nothing): the query and the pair are dials, the gate passes, the
+    answer alone reads no effect, and the pair's share of each real word comes out of the known levels."""
+    from PIL import Image
+    s, repo, pipe, _ = runner
+    pipe.word_queries = lambda words: torch.tensor([[1.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    pipe.query_states = lambda prompts: (torch.tensor([[[2.0, 0.0, 0.0]] * 4] * len(prompts)),
+                                         torch.tensor([[1, 1, 1, 0]] * len(prompts)))
+    pipe.word_states = lambda prompts, words: torch.tensor([[0.0, 1.0 if words == ("happy",) else -1.0, 0.0]] * len(prompts))
+    pipe.encode = lambda prompts: (torch.tensor([[[0.0, 0.0, 3.0]] * 4] * len(prompts)), torch.ones(len(prompts), 4),
+                                   None, None)
+    calls = []
+
+    def render(prompts, seeds, slot_word=None, slot_query=None, slot_source=None):
+        calls.append((slot_word, slot_query is not None, slot_source is not None))
+        out = []
+        for p in prompts:
+            assert ", neutral mood." in p or ", happy mood." in p or ", sad mood." in p
+            if "happy mood" in p or "sad mood" in p:
+                assert slot_word is None
+                level = 2.0 if "happy" in p else -2.0
+            else:
+                aq = float(slot_query[0]) / 2 if slot_query is not None else 0.0       # back to alpha (query size 2)
+                a_s = float(slot_source[1]) / 3 if slot_source is not None else 0.0    # (state size 3)
+                level = 0.5 * aq + (0.8 * a_s if a_s < 0 and aq != 0 else 0.0)
+            out.append(Image.new("RGB", (8, 8), (int(round(128 + 20 * level)),) * 3))
+        return out
+
+    monkeypatch.setattr(s, "_render", render)
+    meta = s.run_slot_pair()
+    r = meta["result"]
+    assert meta["status"] == "done" and meta["kind"] == "slot_pair"
+    assert r["dials"]["Q"]["OUTCOME"] == "A DIAL" and r["dials"]["Q"]["mean"] == pytest.approx(0.5, abs=0.01)
+    assert r["dials"]["P"]["OUTCOME"] == "A DIAL" and r["dials"]["S"]["OUTCOME"] == "NO EFFECT"
+    assert r["gate"]["OUTCOME"] == ax.SLOT_GATE and r["gate"]["mean"] == pytest.approx(-0.6, abs=0.01)
+    assert r["upbeat_side"]["OUTCOME"] == "NO EFFECT"
+    assert r["words"]["happy"]["OUTCOME"] == r["words"]["sad"]["OUTCOME"] == "THE WORD MOVES IT"
+    assert r["pair_share"]["happy"] == pytest.approx(0.25, abs=0.01) and r["pair_share"]["sad"] == pytest.approx(0.65, abs=0.01)
+    assert r["sizes"]["query token mean size"] == pytest.approx(2.0) and r["sizes"]["Qwen3 state mean size"] == pytest.approx(3.0)
+    assert ("neutral", True, True) in calls and ("neutral", False, True) in calls and (None, False, False) in calls
+    assert len(r["content_kept"]) == len(ax.slot_sets()) == 15 and len(r["sheet_columns"]) == 9
+    base = f"experiments/{ax.SLOT_TEST_ID}"
+    for f in ("meta.json", "README.md", "result.json", "sheet_slot.jpg"):
+        assert f"{base}/{f}" in repo.files_, f
+    readme = repo.files_[f"{base}/README.md"].decode()
+    assert f"**{ax.SLOT_GATE}**" in readme and "share the pair recovers" in readme
+    import re
+    for word in (r"S-1", r"\bPhil\b", r"docket", r"canon/", r"Fable"):
+        assert not re.search(word, readme), word
+
+
 def test_append_source_token_opens_one_position_after_the_caption():
     pe = torch.zeros(2, 6, 3)
     am = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 0]])

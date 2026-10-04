@@ -82,7 +82,8 @@ step prints the job's size, then done / total, time spent and time left.
   to the query half on the downbeat words (448 images). **e022** (`run_query_dial`): a mood direction in the
   adapter's queries, alone and with one appended source token (1,088 images). **e026** (`run_word_split`):
   single mood words after the scene, cheerful / gloomy × one T5 token / cut into pieces, through both readings or
-  the T5 ids only (672 images on 32 cells).
+  the T5 ids only (672 images on 32 cells). **e027** (`run_slot_pair`): a word-sized mood push at one word's
+  position, on the adapter's query side, its source side, or both, against the real words (480 images).
 - **e012** (`run_attribute_screen`): six attributes as tag pairs (hair length, hair colour, eye colour, chibi,
   age for adults only, style) on 8 characters × 2 seeds; the words, a slider after the adapter at ±2, the
   cross-talk between sliders; judged by the WD EVA02-Large tagger v3 (352 images, ~20 min).
