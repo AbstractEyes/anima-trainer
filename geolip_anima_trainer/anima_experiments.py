@@ -330,8 +330,8 @@ ATTR_REFERENCES = (
      "Models\" (2023)", "https://arxiv.org/abs/2311.12092"),
     ("Baumann, Krause, Neumayr, Stracke, Sevi, Hu et al., \"Continuous, Subject-Specific Attribute Control in T2I Models "
      "by Identifying Semantic Directions\" (2024)", "https://arxiv.org/abs/2403.17064"),
-    ("Brack, Friedrich, Hintersdorf, Struppek, Schramowski, Kersting, \"SEGA: Instructing Diffusion using Semantic "
-     "Dimensions\" (2023)", "https://arxiv.org/abs/2301.12247"),
+    ("Brack, Friedrich, Hintersdorf, Struppek, Schramowski, Kersting, \"SEGA: Instructing Text-to-Image Models using "
+     "Semantic Guidance\" (NeurIPS 2023)", "https://arxiv.org/abs/2301.12247"),
     ("Gandikota, Wu, Zhang, Bau, Shechtman, Kolkin, \"SliderSpace: Decomposing the Visual Capabilities of Diffusion "
      "Models\" (2025)", "https://arxiv.org/abs/2502.01639"),
     ("SmilingWolf, \"WD EVA02-Large Tagger v3\" (model card, 2024)", f"https://huggingface.co/{TAGGER}"),
