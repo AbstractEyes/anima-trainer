@@ -512,7 +512,7 @@ drawn set at `sets/<flavor>_<seed_base>-<key>` (key = sha256 of the render setti
 every item); `run_sequence` pulls a matching set before drawing (`_pull_set`, verified image by image and caption by
 caption) and pushes each set once drawn (`_push_set`); the arm's recipe links its training images;
 `a.save_training_sets()` / `ts.upload_local_sets(a)` upload by hand. Changing any render setting changes the key.
-CONNECTORS (`run_beatrix_connectors()` = e013-e015, `anima_experiments.CONNECTOR_ARMS`): push = f @ W.T + b at the
+CONNECTORS (`run_beatrix_connectors()` = e013-e019, `anima_experiments.CONNECTOR_ARMS`): push = f @ W.T + b at the
 `context` site (every caption token after the adapter), W/b zero-init fp32, the only trained tensors; f = Beatrix's
 phrase features (`CONNECTOR_FEATURES` in the data repo: `trained` / `random` [74, 4096] + the phrase table in the
 metadata) or a one-hot class (e015). Training in the kernel: `AnimaPipe.train_loss` = the fork's `prepare_inputs`
@@ -528,8 +528,13 @@ while the phrase-dependent part barely moved (|W (up - down)| .06): only the cla
 Adam's per-weight normalization in a 4,096-wide correlated basis wastes most of W's movement outside it. e016 / e017
 (`ConnectorArm.whiten_k = 16`): `connector_whitening()` (top-k PCs of the TRAINING phrases, unit variance, float64
 SVD, k capped at rank; mu / V / scale ship with the weights) and `connector_lrs(contrast_l1=)` = lr x 2 / the L1 size
-of the training inputs' up-minus-down class-mean difference (the free vector's pace). `_connector_inputs()` builds
-every arm's input rows.
+of the training inputs' up-minus-down class-mean difference (the free vector's pace). LESSON (e016, NOT LEARNED by
+the rule, every group the right way): the class contrast moved (|W (z_up - z_down)| .42) but each phrase's own part
+(|W z| ~.72) was larger, so single phrases scattered and the neutral phrases moved. e018 / e019
+(`ConnectorArm.axis`): `connector_axis()` reduces f to [a, n] = (f - mid) @ V.T with mid = the midpoint of the up
+and down training centres, V = [ax / (|ax|^2 / 2), nax / |nax|^2], ax = up - down, nax = neutral - mid (the
+training centres land at a = +-1 and n = 1; scale = ones; mu / V / scale ship like the whitening's).
+`_connector_inputs()` builds every arm's input rows.
 
 ### Training previews — `SamplesConfig` → `[samples]`
 `TrainConfig.samples = SamplesConfig(prompts=[...])` renders a `[samples]` table into the lora toml

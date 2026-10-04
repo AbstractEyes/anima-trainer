@@ -429,6 +429,7 @@ class ConnectorArm:
     question: str
     changed: str = "none (the reference connector)"
     whiten_k: "int | None" = None    # the features projected on the top k whitened components of the training phrases
+    axis: bool = False               # the features reduced to a slider value on the training phrases' mood axis (+ neutral)
 
 
 CONNECTOR_ARMS = (
@@ -464,9 +465,26 @@ CONNECTOR_ARMS = (
                          "initialised trunk of the same shape (seed 0), whitened on its own training phrases",
                  question="Does e016's held-out effect come from what Beatrix learned, or would any fixed random features of "
                           "the phrase text carry it? (A control that must fail on the held-out phrases.)", whiten_k=16),
+    # e016 learned every group the right way, but each phrase's own part of the push outweighed the mood contrast. The slider
+    # arms reduce her features to two numbers: the phrase's position on the training phrases' mood axis and on their neutral
+    # axis, so the image model receives her reading of the phrase's mood and nothing phrase-specific.
+    ConnectorArm("e018_beatrix_mood_slider", "Beatrix's reading of a phrase's mood as a slider value", "trained", 18,
+                 changed="the features are reduced to a slider value: the phrase's position on the axis from the gloomy to "
+                         "the cheerful training phrases (their centres at -1 and +1), plus its position on the axis toward "
+                         "the neutral training phrases; the map's rate by the free vector's pace",
+                 question="Does Beatrix's reading of a phrase's mood, reduced to one slider value, steer the image that way, "
+                          "for the phrases it trained on and for mood phrases it never saw?", axis=True),
+    ConnectorArm("e019_beatrix_random_trunk_slider", "Control: the same slider on an untrained Beatrix of the same shape",
+                 "random", 19,
+                 changed="e018's slider (the axes fit on its own training phrases) on the features of a randomly initialised "
+                         "trunk of the same shape (seed 0)",
+                 question="Does e018's held-out effect come from what Beatrix learned, or would any fixed random features of "
+                          "the phrase text place unseen phrases on the right side? (A control that must fail on the held-out "
+                          "phrases.)", axis=True),
 )
 CONNECTOR_IDS = [a.id for a in CONNECTOR_ARMS]
-CONNECTOR_PAIRS = ((CONNECTOR_IDS[0], CONNECTOR_IDS[1]), (CONNECTOR_IDS[3], CONNECTOR_IDS[4]))   # (Beatrix, untrained)
+CONNECTOR_PAIRS = ((CONNECTOR_IDS[0], CONNECTOR_IDS[1]), (CONNECTOR_IDS[3], CONNECTOR_IDS[4]),
+                   (CONNECTOR_IDS[5], CONNECTOR_IDS[6]))                                            # (Beatrix, untrained)
 CONNECTOR_FREE = CONNECTOR_IDS[2]
 CONNECTOR_FEATURES = "beatrix/mood_phrases_mini-beatrix-3_step212000.safetensors"   # in the data repo
 CONNECTOR_CHECKPOINT = "AbstractPhil/alephllm-mini-beatrix-training, mini-beatrix-3 at step 212,000"
@@ -625,6 +643,14 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
               "space; the free vector's one-hot difference has L1 2). The first connectors (e013, e014) fed the 4,096 "
               "features in directly at 1e-3 / 4,096, and their phrase-dependent part barely moved in 720 steps."]
              if arm.whiten_k else []),
+           *(["- **This experiment's input** (a slider value): two numbers per phrase, computed from the training phrases' "
+              "features alone. a = the phrase's position on the axis from the centre of the gloomy training phrases to the "
+              "centre of the cheerful ones (those centres at -1 and +1); n = its position on the axis from their midpoint "
+              "toward the centre of the neutral training phrases (that centre at 1). The axes ship with the weights. The "
+              "image model receives her reading of the phrase's mood and nothing phrase-specific: in e016 each phrase's own "
+              "part of the push outweighed the mood contrast. The map's learning rate follows the free vector's pace (1e-3 "
+              "x 2 / the L1 size of the cheerful-minus-gloomy class-mean difference of the inputs, about 2 here)."]
+             if arm.axis else []),
            "- **Training**: Anima's own flow-matching objective, computed by the trainer's code (logit-normal "
            "timesteps, the noisy latent (1 - t) x0 + t noise, mean squared error to noise - x0), on the LoRA "
            "experiments' first-draw training images: 192 upbeat, 192 downbeat and 192 neutral renders of the stock "
@@ -706,7 +732,7 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
     out += ["## Files",
             ("- `connector/stepNNNN.safetensors`: W and b after every pass over the training images, with the input "
              "projection mu, V, scale (float32; the push for features f is ((f - mu) @ V.T / scale) @ W.T + b)."
-             if arm.whiten_k else
+             if arm.whiten_k or arm.axis else
              "- `connector/stepNNNN.safetensors`: W and b after every pass over the training images (float32; the push "
              "for features f is f @ W.T + b)."),
             "- `trace.json`: the training loss and the push's size per class during training.",

@@ -81,12 +81,13 @@ step prints the job's size, then done / total, time spent and time left.
   cross-talk between sliders; judged by the WD EVA02-Large tagger v3 (352 images, ~20 min).
 - **The LoRA arms** (`anima_experiments.SEQUENCE`): e002 upbeat, e003 the control, e004 downbeat, e005 a
   fresh draw, e006 / e007 half / double the learning rate, then e008–e011 the second draw.
-- **e013–e017** (`run_beatrix_connectors`): a push after the adapter computed from Beatrix's features for a
+- **e013–e019** (`run_beatrix_connectors`): a push after the adapter computed from Beatrix's features for a
   mood phrase (e013), the same on an untrained Beatrix (e014, must fail on unseen phrases), a free vector
   per mood (e015); each trained 720 steps in the notebook by Anima's own objective on the first-draw training
   images, then scored on the held-out scenes (16 cells per phrase; about 20 minutes each). e016 / e017
-  re-run e013 / e014 on whitened features (e013's map learned too slowly to read). The features come from
-  `beatrix/` in the data repo.
+  re-run e013 / e014 on whitened features (e013's map learned too slowly to read); e018 / e019 on a slider
+  value (the phrase's position between the gloomy and cheerful training phrases, and toward the neutral ones).
+  The features come from `beatrix/` in the data repo.
 - **Recipe** (from the model card): rank 32 at 2e-5, the LLM adapter frozen, plain Adam with weight decay 0
   and fp32 master weights, 10 epochs at micro-batch 4, the card's quality prefix and negative prompt;
   evaluation at 30 steps, guidance 4.5, shift 3.

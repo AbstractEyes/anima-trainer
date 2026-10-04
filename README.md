@@ -294,7 +294,7 @@ a.setup()                  # GPU + the fork + the three model files
 a.run_flavor_test()        # e001: the stock model
 a.run_attribute_screen()   # e012: attribute sliders on the stock model
 a.run_sequence()           # e002..e011: the LoRA arms
-a.run_beatrix_connectors() # e013-e017: a push from Beatrix's phrase features, and its controls
+a.run_beatrix_connectors() # e013-e019: a push from Beatrix's phrase features, and its controls
 ```
 
 - **Recipe** (from the model card): Anima-Base v1.0; LoRA rank 32 at 2e-5 (half and double as arms), the
@@ -324,7 +324,11 @@ a.run_beatrix_connectors() # e013-e017: a push from Beatrix's phrase features, a
   e013 read NOT LEARNED (the map's phrase-dependent part barely moved in 720 steps on the raw 4,096 features),
   so e016 / e017 re-run e013 / e014 on the features whitened onto the training phrases' top 16 principal
   components (fit on the training phrases only), with the map's rate set so its mood contrast moves at the
-  free vector's pace.
+  free vector's pace. e016 moved every group the right way, unseen phrases included, but each phrase's own
+  position in those 16 components pushed the image more than its mood did (and the neutral phrases moved too),
+  so e018 / e019 reduce the features to a slider value: the phrase's position on the axis from the gloomy to
+  the cheerful training phrases' centres (at -1 and +1) and on the axis toward the neutral training phrases'
+  centre (2 numbers, both axes fit on the training phrases only).
 - **Progress:** every long step prints the size of the job, then done / total, time spent and time left.
 
 > **Licence.** Anima's weights are under the CircleStone Labs Non-Commercial License (a derivative of

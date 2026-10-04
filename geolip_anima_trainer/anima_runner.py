@@ -924,9 +924,10 @@ class AnimaRunner(_sr.SanaRunner):
 
     def _connector_inputs(self, arm: "ax.ConnectorArm", feats: dict, phrases: list) -> dict:
         """The arm's input rows (CPU float32) and, per class, the rows of its training inputs: the one-hot class (e015),
-        the phrase features as they are (e013, e014) or projected on the top whiten_k whitened components of the
-        training phrases (e016, e017; fit on the training phrases only), with that projection and the L1 size of the
-        up-minus-down class-mean difference of the training inputs (it sets W's learning rate)."""
+        the phrase features as they are (e013, e014), projected on the top whiten_k whitened components of the training
+        phrases (e016, e017) or reduced to a slider value on their mood and neutral axes (e018, e019); projections are fit
+        on the training phrases only and returned with the L1 size of the up-minus-down class-mean difference of the
+        training inputs (it sets W's learning rate)."""
         import torch
         classes = ax.CONNECTOR_CLASSES
         if arm.source == "onehot":
@@ -938,8 +939,9 @@ class AnimaRunner(_sr.SanaRunner):
             raise ValueError(f"a class without training phrases: {({c: len(v) for c, v in pool.items()})}")
         out = {"inputs": F, "pool": pool, "row_of": {p["text"]: i for i, p in enumerate(phrases)}, "projection": None,
                "contrast_l1": None}
-        if arm.whiten_k:
-            proj = connector_whitening(F, [i for c in classes for i in pool[c]], arm.whiten_k)
+        if arm.whiten_k or arm.axis:
+            proj = (connector_axis(F, pool) if arm.axis else
+                    connector_whitening(F, [i for c in classes for i in pool[c]], arm.whiten_k))
             Z = (F - proj["mu"]) @ proj["V"].T / proj["scale"]
             out.update(inputs=Z, projection=proj,
                        contrast_l1=float((Z[pool["up"]].mean(0) - Z[pool["down"]].mean(0)).abs().sum()))
@@ -957,7 +959,11 @@ class AnimaRunner(_sr.SanaRunner):
                          "random": f"an untrained Beatrix of the same shape (random initialisation, seed 0): its features "
                                    f"for the phrase ({n_feat} numbers), standardized the same way",
                          "onehot": "the mood class as a one-hot vector (3 numbers); no encoder"}[arm.source]}
-        if ci["projection"] is not None:
+        if ci["projection"] is not None and arm.axis:
+            rec["input"] += (", reduced to a slider value: its position on the axis from the gloomy to the cheerful training "
+                             "phrases' centres (at -1 and +1) and on the axis toward the neutral training phrases' centre (2 "
+                             "numbers; the axes fit on the training phrases only)")
+        elif ci["projection"] is not None:
             rec["input"] += (f", projected on the top {fan_in} principal components of the training phrases' features and "
                              "scaled to unit variance per component (fit on the training phrases only)")
         if arm.source != "onehot":
@@ -1188,6 +1194,20 @@ def connector_whitening(F, train_rows: list, k: int) -> dict:
     _, S, Vh = torch.linalg.svd(X - mu, full_matrices=False)
     k = min(int(k), int((S > S[0] * 1e-6).sum()))
     return {"mu": mu.float(), "V": Vh[:k].float().contiguous(), "scale": (S[:k] / (len(train_rows) - 1) ** 0.5).float()}
+
+
+def connector_axis(F, pool: dict) -> dict:
+    """The slider projection from the training rows of each class (pool: {class: rows}), in the whitening's format
+    {'mu', 'V' [2, D], 'scale' [2]}: (F - mu) @ V.T / scale = [a, n] with a = the position on the axis from the down
+    centre to the up centre (the centres at -1 / +1) and n = the position on the axis from their midpoint toward the
+    neutral centre (that centre at 1). Fit on the training rows only."""
+    import torch
+    X = F.double()
+    c = {k: X[rows].mean(0) for k, rows in pool.items()}
+    mid = (c["up"] + c["down"]) / 2
+    ax, nax = c["up"] - c["down"], c["neutral"] - mid
+    V = torch.stack([ax / (ax @ ax / 2), nax / (nax @ nax)])
+    return {"mu": mid.float(), "V": V.float().contiguous(), "scale": torch.ones(2)}
 
 
 def _wd_tagger(repo_id: str, tags: list[str]):
