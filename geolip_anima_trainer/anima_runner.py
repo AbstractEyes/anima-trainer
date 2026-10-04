@@ -557,11 +557,17 @@ class AnimaRunner(_sr.SanaRunner):
 
     # ---- e001: the stock model -------------------------------------------------------------------------
     def _flavor_recipe(self) -> dict:
-        return {"model": "Anima-Base v1.0, no LoRA",
-                "images": f"{self._need('resolution')} x {self._need('resolution')}, Euler, {self.GEN_STEPS} steps, "
-                          f"guidance {self.GEN_CFG}, shift {self.GEN_SHIFT:g}",
-                "prompts": "the model card's quality prefix + an illustration of <scene>; the card's negative prompt",
-                "scenes x seeds": f"32 x {len(ax.FLAVOR_TEST_SEEDS)} ({', '.join(map(str, ax.FLAVOR_TEST_SEEDS))})"}
+        rec = {"model": "Anima-Base v1.0, no LoRA",
+               "images": f"{self._need('resolution')} x {self._need('resolution')}, Euler, {self.GEN_STEPS} steps, "
+                         f"guidance {self.GEN_CFG}, shift {self.GEN_SHIFT:g}",
+               "prompts": "the model card's quality prefix + an illustration of <scene>; the card's negative prompt",
+               "scenes x seeds": f"32 x {len(ax.FLAVOR_TEST_SEEDS)} ({', '.join(map(str, ax.FLAVOR_TEST_SEEDS))})"}
+        return {**rec, **self._card()}
+
+    def _card(self) -> dict:
+        """The GPU that ran the experiment ({} when setup() did not record one)."""
+        name = (self.state.get("gpu") or {}).get("name")
+        return {"GPU": name} if name else {}
 
     def run_flavor_test(self, *, force: bool = False) -> dict:
         """e001 into its own folder of cfg.repo_id: the words, the conditioning norms and the dial at both sites.
@@ -1081,7 +1087,8 @@ class AnimaRunner(_sr.SanaRunner):
             "training seed": str(arm.seed),
             "evaluation": f"8 held-out scenes x seeds {', '.join(map(str, ax.CONNECTOR_SEEDS))} = 16 cells; Euler, "
                           f"{self.GEN_STEPS} steps, guidance {self.GEN_CFG}, shift {self.GEN_SHIFT:g}, "
-                          f"{self._need('resolution')} px, the card's quality prefix and negative prompt"})
+                          f"{self._need('resolution')} px, the card's quality prefix and negative prompt",
+            **self._card()})
         try:                                             # the exact training images, when the data repo holds them
             links = []
             for c in ax.CONNECTOR_CLASSES if self.cfg.data_repo_id else ():
