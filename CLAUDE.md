@@ -518,7 +518,14 @@ token ids through the adapter's own embedding table (the queries). `AnimaPipe.ge
 (and mask) from another prompt per image while the Qwen3 states stay the prompt's (both pad to 512);
 `_render_routes()` chunks the two lists together. Seven sets on e001's 64 cells (neutral; the words; the words through
 Qwen3's states only; through the T5 ids only); e001's rule per set; per reading CARRIES THE WORDS / ONE WAY / CARRIES
-NOTHING; shares of the words' effect and the two readings' sum beside them.
+NOTHING; shares of the words' effect and the two readings' sum beside them. `ax.ROUTE_TESTS` / `RouteTest` hold e020
+(first templates) and e021 (`run_appended_split`: the second templates, the mood words after the scene; gate = words
+minus T5-only on the downbeat words, `route_reads()["pair_minus_query"]`). QUERY DIAL (`run_query_dial()` = e022):
+`AnimaPipe.generate(query_add=)` adds a vector to the adapter's queries (a forward hook on `llm_adapter.in_proj`, at
+the caption's T5 tokens, the conditional branch only); `generate(source_token=)` appends one source position after the
+caption's Qwen3 tokens (`append_source_token`, mask opened; Qwen3 pads on the right); `query_states()` /
+`word_states()` give the query embeddings and the mean Qwen3 state at given words (tokenizer offsets). Forms q,
+pair_dir, pair_state, pair_uniform (the control) at alpha -2..+2; `query_dial_reads()` = slopes + the downbeat gates.
 CONNECTORS (`run_beatrix_connectors()` = e013-e019, `anima_experiments.CONNECTOR_ARMS`): push = f @ W.T + b at the
 `context` site (every caption token after the adapter), W/b zero-init fp32, the only trained tensors; f = Beatrix's
 phrase features (`CONNECTOR_FEATURES` in the data repo: `trained` / `random` [74, 4096] + the phrase table in the

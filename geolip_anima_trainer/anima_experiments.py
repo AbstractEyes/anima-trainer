@@ -434,12 +434,56 @@ ROUTE_SETS = {
 ROUTES = {"words": ("THE WORDS MOVE IT", "both readings (the plain mood prompt)"),
           "qwen": ("THE QWEN STATES MOVE IT", "Qwen3's states of the mood prompt, the neutral prompt's T5 ids"),
           "t5": ("THE T5 IDS MOVE IT", "the neutral prompt's Qwen3 states, the mood prompt's T5 ids")}
+GATE_LABEL = "THE SOURCE HALF ADDS TO THE QUERY HALF"
+
+
+@dataclass(frozen=True)
+class RouteTest:
+    """One route-split experiment: which mood templates it uses and whether the pair-minus-query gate is registered."""
+    id: str
+    title: str
+    template: int                    # the mood templates' index in TEMPLATES (the neutral prompt is always the first)
+    gate: bool                       # the pair minus the query half on the downbeat words is a registered read
+    question: str
+    limit: str
+
+
+APPENDED_TEST_ID = "e021_anima_route_split_appended"
+ROUTE_TESTS = {
+    ROUTE_TEST_ID: RouteTest(
+        ROUTE_TEST_ID, ROUTE_TEST_TITLE, 0, False,
+        question="Anima's LLM adapter reads a caption twice: as Qwen3 0.6B's last hidden states (the source its "
+                 "cross-attention reads) and as the caption's T5 token ids, through the adapter's own embedding table (the "
+                 "queries its blocks start from). When mood words are added to the caption, which of the two readings "
+                 "carries their effect on the image? (Experiment e001 found that a direction added to every Qwen3 state does "
+                 "not move the mood, while the words do; this splits the words themselves.)",
+        limit="the mood words shift the later tokens' positions in the reading that carries them while the other reading "
+              "stays neutral. The adapter always pairs two tokenizations of unequal length, but the split is not "
+              "position-exact."),
+    APPENDED_TEST_ID: RouteTest(
+        APPENDED_TEST_ID, "The stock model: the mood words appended after the scene, through the adapter's query half, "
+                          "its source half, or both", 1, True,
+        question="The adapter's cross-attention works as a lookup: the caption's T5 ids become the queries, Qwen3's states "
+                 "the keys and values, and experiment e020 found that mood words in Qwen3's states alone do nothing while "
+                 "the same words in both readings add to what the T5 ids carry. With the mood words appended after the "
+                 "scene, so that both readings share the caption's positions up to them: what does the source half (the "
+                 "words' Qwen3 states) add when the query half (the words' T5 ids) is there to look it up, above all for "
+                 "the downbeat words?",
+        limit="the appended words still differ in length between the two tokenizations; the caption before them is "
+              "position-identical in both readings."),
+}
+
+
+def route_prompts(test: RouteTest, flavor: str, scene: str) -> str:
+    return TEMPLATES[flavor][0 if flavor == "neutral" else test.template].format(s=scene)
 
 
 def route_reads(scores: dict) -> dict:
     """The registered reads from mood scores {set key: [score per cell]} (keys as ROUTE_SETS): per set, the cells'
     difference to the neutral image under e001's rule; per split route CARRIES THE WORDS (both of its sets move it),
-    ONE WAY (one) or CARRIES NOTHING; descriptive: each route's share of the words' effect and the two routes' sum."""
+    ONE WAY (one) or CARRIES NOTHING; the pair minus the query half per cell (words minus T5-only; registered as the
+    gate on the downbeat words where the test says so); descriptive: each route's share of the words' effect and the
+    two routes' sum."""
     import numpy as np
     base = scores["neutral"]
     sets = {}
@@ -457,33 +501,39 @@ def route_reads(scores: dict) -> dict:
                                 else "CARRIES NOTHING", "share_of_words": share}
     out["sum_of_routes"] = {m: ((sets[f"qwen_{m}"]["mean"] + sets[f"t5_{m}"]["mean"]) / sets[f"words_{m}"]["mean"]
                                 if sets[f"words_{m}"]["mean"] else None) for m in ("up", "down")}
+    out["pair_minus_query"] = {m: flavor_outcome(list(np.subtract(scores[f"words_{m}"], scores[f"t5_{m}"])),
+                                                 1 if m == "up" else -1, label=GATE_LABEL) for m in ("up", "down")}
     return out
 
 
-def route_summary(reads: dict) -> str:
+def route_summary(reads: dict, test: "RouteTest | None" = None) -> str:
     s, r = reads["sets"], reads["routes"]
-    return "; ".join(f"{name} {s[f'{k}_up']['mean']:+.2f} / {s[f'{k}_down']['mean']:+.2f}"
-                     + (f" ({r[k]['OUTCOME']})" if k in r else "")
-                     for k, name in (("words", "the words"), ("qwen", "Qwen3's states only"), ("t5", "the T5 ids only")))
+    out = "; ".join(f"{name} {s[f'{k}_up']['mean']:+.2f} / {s[f'{k}_down']['mean']:+.2f}"
+                    + (f" ({r[k]['OUTCOME']})" if k in r else "")
+                    for k, name in (("words", "the words"), ("qwen", "Qwen3's states only"), ("t5", "the T5 ids only")))
+    if test is not None and test.gate and reads.get("pair_minus_query"):
+        g = reads["pair_minus_query"]
+        out += (f"; the source half beside the query half {g['up']['mean']:+.2f} / {g['down']['mean']:+.2f} "
+                f"(downbeat: {g['down']['OUTCOME']})")
+    return out
 
 
 def render_route_split_readme(meta: dict, recipe: dict) -> str:
-    """e020's README: the question, the design and the rule fixed before the run, and the result when done."""
+    """A route split's README (e020, e021): the question, the design and the rule fixed before the run, and the result."""
+    t = ROUTE_TESTS[meta.get("id", ROUTE_TEST_ID)]
     rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
-    out = [f"# {ROUTE_TEST_ID}: {ROUTE_TEST_TITLE}", "",
+    tpl = {f: TEMPLATES[f][0 if f == "neutral" else t.template].replace(PREFIX, "") for f in ("neutral", "up", "down")}
+    out = [f"# {t.id}: {t.title}", "",
            f"Date: 2026-10-04. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
-           "## Question",
-           "Anima's LLM adapter reads a caption twice: as Qwen3 0.6B's last hidden states (the source its "
-           "cross-attention reads) and as the caption's T5 token ids, through the adapter's own embedding table (the "
-           "queries its blocks start from). When mood words are added to the caption, which of the two readings carries "
-           "their effect on the image? (Experiment e001 found that a direction added to every Qwen3 state does not move "
-           "the mood, while the words do; this splits the words themselves.)", "",
+           "## Question", t.question, "",
            "## Design",
-           f"- e001's 32 scenes x seeds {', '.join(map(str, ROUTE_SEEDS))} (64 cells) and its first templates; the "
+           f"- e001's 32 scenes x seeds {', '.join(map(str, ROUTE_SEEDS))} (64 cells); the prompts (after the model card's "
+           f"quality prefix): neutral \"{tpl['neutral']}\", upbeat \"{tpl['up']}\", downbeat \"{tpl['down']}\"; the "
            "negative prompt unchanged. Seven sets, 448 images:", "",
            "| set | Qwen3 states from | T5 ids from |", "|---|---|---|",
-           *[f"| {k} | the {q} prompt | the {t} prompt |" for k, (q, t) in ROUTE_SETS.items()], "",
-           "- The words sets are e001's words, re-rendered in this run as its reference.", "",
+           *[f"| {k} | the {q} prompt | the {f} prompt |" for k, (q, f) in ROUTE_SETS.items()], "",
+           "- In the words sets both readings carry the mood words (the pair); in the t5 sets only the queries do (the "
+           "query half); in the qwen sets only the source does (the source half).", "",
            "## Recipe", "| setting | value |", "|---|---|", rec, "",
            "## The rule (fixed before the run)",
            "Per cell, a set's mood score minus the neutral image's, read in the mood's direction (e001's rule): a set "
@@ -492,10 +542,12 @@ def render_route_split_readme(meta: dict, recipe: dict) -> str:
            "Per reading (Qwen3's states, the T5 ids): **CARRIES THE WORDS** when both of its sets move it, **ONE WAY** "
            "when one does, **CARRIES NOTHING** when neither does. Reported beside them: each reading's share of the "
            "words' effect, the two readings' sum against the words, content kept (the CLIP image cosine to the neutral "
-           "image of the same cell).", "",
-           "**Limit fixed in advance**: the mood words shift the later tokens' positions in the reading that carries them "
-           "while the other reading stays neutral. The adapter always pairs two tokenizations of unequal length, but the "
-           "split is not position-exact.", "", ANIMA.judge_text, ""]
+           "image of the same cell)."]
+    if t.gate:
+        out += ["", f"**The gate**: per cell, the words set minus the t5 set (the source half added to the query half) on "
+                    f"the downbeat words, read downward under the same rule: **{GATE_LABEL}**, **NO EFFECT** or **MIXED**. "
+                    "The same difference on the upbeat words is reported beside it."]
+    out += ["", f"**Limit fixed in advance**: {t.limit}", "", ANIMA.judge_text, ""]
     if meta.get("status") == "done":
         r = meta["result"]
         out += ["## Result", meta.get("summary", ""), "",
@@ -514,8 +566,16 @@ def render_route_split_readme(meta: dict, recipe: dict) -> str:
         out += ["", "The two readings' effects summed, against the words: up "
                 + ("" if sm["up"] is None else f"{sm['up']:.2f}") + ", down " + ("" if sm["down"] is None else f"{sm['down']:.2f}")
                 + " (1 = the words' effect is the sum of the two)."]
+        if t.gate and r.get("pair_minus_query"):
+            g = r["pair_minus_query"]
+            out += ["", "| the source half added to the query half (words minus t5) | effect | cells that way | verdict |",
+                    "|---|---|---|---|"]
+            for m in ("down", "up"):
+                frac = g[m].get("frac_pos", g[m].get("frac_neg"))
+                out.append(f"| {m}beat words{' (the gate)' if m == 'down' else ''} | {g[m]['mean']:+.3f} +- "
+                           f"{g[m]['se']:.3f} | {frac:.0%} | **{g[m]['OUTCOME']}** |")
         if r.get("e001_words"):
-            out += ["", f"e001's words for the same cells: up {r['e001_words']['up']:+.3f}, down "
+            out += ["", f"e001's words (its first templates) for the same cells: up {r['e001_words']['up']:+.3f}, down "
                         f"{r['e001_words']['down']:+.3f}."]
         out += ["", "![the seven sets](sheet_routes.jpg)", "",
                 "Rows: eight scenes at the first seed. Columns: " + ", ".join(ROUTE_SETS) + ".", ""]
@@ -524,6 +584,126 @@ def render_route_split_readme(meta: dict, recipe: dict) -> str:
     else:
         out += ["## Result", "Running.", ""]
     out += ["## Files", "- `result.json`: every cell's scores and the reads.", "- `sheet_routes.jpg`: the contact sheet.", ""]
+    return "\n".join(out)
+
+
+# ---- e022: the query-site dial (the stock model: a mood direction in the adapter's queries, alone and paired) ---------
+QUERY_TEST_ID = "e022_anima_query_dial"
+QUERY_TEST_TITLE = ("The stock model: a mood direction added to the adapter's queries, alone and paired with a source token "
+                    "a query can look up")
+QUERY_WORDS = {"up": ("cheerful", "upbeat"), "down": ("gloomy", "downbeat")}     # in e001's first mood templates
+QUERY_FORMS = {
+    "q": "the query dial alone",
+    "pair_dir": "the query dial + one source token appended after the caption: the source direction scaled to the mean "
+                "size of Qwen3's states (upbeat for alpha > 0, downbeat for alpha < 0)",
+    "pair_state": "the query dial + one source token appended after the caption: the mean Qwen3 state at the real mood "
+                  "words (\"cheerful\", \"upbeat\" for alpha > 0; \"gloomy\", \"downbeat\" for alpha < 0)",
+    "pair_uniform": "the query dial + the source direction added to every Qwen3 token at the same alpha (the control)",
+}
+QUERY_GATE = {"pair_dir": "THE SOURCE TOKEN ADDS", "pair_state": "THE SOURCE TOKEN ADDS",
+              "pair_uniform": "THE UNIFORM SOURCE ADDS"}
+
+
+def query_sets() -> list[str]:
+    """Every image set of e022 in render order: the neutral images, then each form at each alpha."""
+    return ["neutral"] + [f"{f}@{a:+g}" for f in QUERY_FORMS for a in DIAL_ALPHAS]
+
+
+def query_dial_reads(scores: dict) -> dict:
+    """The registered reads from mood scores {set: [score per cell]} (keys as query_sets()): per form, the per-cell slope
+    of the mood score on alpha (A DIAL rule); the gates: per cell, the mean over alpha -2 and -1 of a pair form minus the
+    query dial alone, read downward; descriptive: the same over +1 and +2 read upward, and the state token minus the
+    direction token on the downbeat side."""
+    import numpy as np
+    neg = [a for a in DIAL_ALPHAS if a < 0]
+    pos = [a for a in DIAL_ALPHAS if a > 0]
+
+    def side(form, alphas, minus="q"):
+        return list(np.mean([np.subtract(scores[f"{form}@{a:+g}"], scores[f"{minus}@{a:+g}"]) for a in alphas], axis=0))
+
+    out: dict = {"dials": {}, "gates": {}, "upbeat_side": {}}
+    for f in QUERY_FORMS:
+        out["dials"][f] = flavor_outcome(cell_slopes({0.0: scores["neutral"],
+                                                      **{a: scores[f"{f}@{a:+g}"] for a in DIAL_ALPHAS}}), 1, label="A DIAL")
+    for f, label in QUERY_GATE.items():
+        out["gates"][f] = flavor_outcome(side(f, neg), -1, label=label)
+        out["upbeat_side"][f] = flavor_outcome(side(f, pos), 1, label=label)
+    out["state_minus_direction_downbeat"] = flavor_outcome(side("pair_state", neg, minus="pair_dir"), -1,
+                                                           label="THE STATE TOKEN ADDS MORE")
+    return out
+
+
+def query_summary(reads: dict) -> str:
+    d, g = reads["dials"], reads["gates"]
+    return (f"query dial {d['q']['mean']:+.3f}/unit ({d['q']['OUTCOME']}); downbeat side, a source token beside it: direction "
+            f"{g['pair_dir']['mean']:+.2f} ({g['pair_dir']['OUTCOME']}), state {g['pair_state']['mean']:+.2f} "
+            f"({g['pair_state']['OUTCOME']}); uniform control {g['pair_uniform']['mean']:+.2f} ({g['pair_uniform']['OUTCOME']})")
+
+
+def render_query_dial_readme(meta: dict, recipe: dict) -> str:
+    """e022's README: the question, the design and the rule fixed before the run, and the result when done."""
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    forms = "\n".join(f"| {k} | {v} |" for k, v in QUERY_FORMS.items())
+    alphas = ", ".join(f"{a:+g}" for a in DIAL_ALPHAS)
+    out = [f"# {QUERY_TEST_ID}: {QUERY_TEST_TITLE}", "",
+           f"Date: 2026-10-04. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Question",
+           "The adapter's cross-attention works as a lookup: its queries start from the caption's T5 ids (its own word "
+           "table), and Qwen3's states are the keys and values. Experiment e001 found a mood direction added to every "
+           "Qwen3 state does nothing, and e020 that Qwen3's states carry the mood words only when the words' queries "
+           "are there. (1) Does a mood direction added to the queries act as a dial? (2) On the downbeat side, does one "
+           "source token that a query can look up add to it, and does it matter whether that token is a bare direction "
+           "or shaped like Qwen3's real state for a mood word? A direction spread over every Qwen3 token is the control.",
+           "",
+           "## Design",
+           f"- The neutral prompt of e001 on its 64 cells (32 scenes x seeds {', '.join(map(str, FLAVOR_TEST_SEEDS))}); "
+           f"alpha {alphas} (alpha 0 = the neutral images); the negative prompt unchanged; every push on the "
+           "conditional branch only (e001's dial).",
+           "- The query direction: half the mean, over the 32 scenes, of the upbeat prompt's mean query vector minus the "
+           "downbeat prompt's (e001's first templates), added to the query embeddings (the output of the adapter's word "
+           "table and input projection, before its blocks) at every caption token, times alpha. The source direction: the "
+           "same at Qwen3's states (e001's source direction).", "",
+           "| form | what is added |", "|---|---|", forms, "",
+           f"- {1 + len(QUERY_FORMS) * len(DIAL_ALPHAS)} sets x 64 = {64 * (1 + len(QUERY_FORMS) * len(DIAL_ALPHAS))} "
+           "images.", "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           "Per cell, e001's rule. **Dial**: the least-squares slope of the mood score on alpha; **A DIAL** when the mean "
+           "is upward, at least 75% of the 64 cells upward and beyond 3 standard errors; **NO EFFECT** within 2 standard "
+           "errors of zero or under 60% upward; **MIXED** otherwise. **The gates** (the downbeat side): per cell, the mean "
+           "over alpha -2 and -1 of a paired form's mood score minus the query dial's alone, read downward under the same "
+           "rule: **THE SOURCE TOKEN ADDS** for the two token forms; for the uniform control **THE UNIFORM SOURCE ADDS** "
+           "(expected: no effect, if placement is what a query needs). Reported beside them: the same differences over "
+           "alpha +1 and +2 read upward, the state token minus the direction token on the downbeat side, content kept "
+           "(the CLIP image cosine to the neutral image), and the sizes of the directions and tokens.", "",
+           ANIMA.judge_text, ""]
+    if meta.get("status") == "done":
+        r = meta["result"]
+        out += ["## Result", meta.get("summary", ""), "",
+                "| form | slope per unit alpha | cells upward | verdict |", "|---|---|---|---|"]
+        for f, v in r["dials"].items():
+            out.append(f"| {f} | {v['mean']:+.3f} +- {v['se']:.3f} | {v['frac_pos']:.0%} | **{v['OUTCOME']}** |")
+        out += ["", "| beside the query dial | downbeat side (the gate) | cells | verdict | upbeat side | cells | verdict |",
+                "|---|---|---|---|---|---|---|"]
+        for f in QUERY_GATE:
+            g, u = r["gates"][f], r["upbeat_side"][f]
+            out.append(f"| {f} | {g['mean']:+.3f} +- {g['se']:.3f} | {g['frac_neg']:.0%} | **{g['OUTCOME']}** | "
+                       f"{u['mean']:+.3f} +- {u['se']:.3f} | {u['frac_pos']:.0%} | {u['OUTCOME']} |")
+        s = r["state_minus_direction_downbeat"]
+        out += ["", f"The state token minus the direction token, downbeat side: {s['mean']:+.3f} +- {s['se']:.3f} "
+                    f"({s['frac_neg']:.0%} downward; {s['OUTCOME']})."]
+        if r.get("sizes"):
+            out += ["", "Sizes: " + ", ".join(f"{k} {v:.3f}" for k, v in r["sizes"].items()) + "."]
+        out += ["", "| set | mood score | content kept |", "|---|---|---|"]
+        for k in query_sets():
+            out.append(f"| {k} | {r['mood_score'][k]:+.3f} | {r['content_kept'][k]:.3f} |")
+        out += ["", "![the forms at alpha -2 and +2](sheet_query.jpg)", "",
+                "Rows: eight scenes at the first seed. Columns: neutral, then each form at alpha -2 and +2.", ""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    else:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files", "- `result.json`: every cell's scores and the reads.", "- `sheet_query.jpg`: the contact sheet.", ""]
     return "\n".join(out)
 
 

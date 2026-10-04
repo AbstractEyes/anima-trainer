@@ -769,6 +769,91 @@ def test_route_reads_split_the_words_between_the_two_readings():
     assert ax.route_summary(r).startswith("the words +2.01 / -0.99")
 
 
+def test_appended_split_reads_the_gate_on_the_appended_words(runner, monkeypatch):
+    """e021: e001's second templates (the mood words after the scene); a fake model whose downbeat words need both
+    readings (the source half adds only beside the query half) passes the registered gate."""
+    from PIL import Image
+    s, repo, _, _ = runner
+    seen = []
+
+    def mood(p):
+        return 1.0 if "joyful" in p else -1.0 if "somber" in p else 0.0
+
+    def render(prompts, seeds, t5_prompts=None):
+        t5 = t5_prompts or prompts
+        seen.extend(prompts)
+        out = []
+        for q, t in zip(prompts, t5):
+            level = mood(t) * (0.5 if mood(t) < 0 else 1.0) + (0.5 * mood(q) if mood(q) < 0 and mood(t) < 0 else 0.0)
+            out.append(Image.new("RGB", (8, 8), (int(round(128 + 20 * level)),) * 3))
+        return out
+
+    monkeypatch.setattr(s, "_render", render)
+    meta = s.run_appended_split()
+    r = meta["result"]
+    assert meta["id"] == ax.APPENDED_TEST_ID and any("joyful and uplifting mood" in p for p in seen)
+    assert not any("cheerful" in p for p in seen)
+    assert r["routes"]["qwen"]["OUTCOME"] == "CARRIES NOTHING" and r["routes"]["t5"]["OUTCOME"] == "CARRIES THE WORDS"
+    assert r["pair_minus_query"]["down"]["OUTCOME"] == ax.GATE_LABEL
+    assert r["pair_minus_query"]["down"]["mean"] == pytest.approx(-0.5, abs=0.01)
+    assert r["pair_minus_query"]["up"]["OUTCOME"] == "NO EFFECT"
+    readme = repo.files_[f"experiments/{ax.APPENDED_TEST_ID}/README.md"].decode()
+    assert "**The gate**" in readme and "(the gate)" in readme and "joyful and uplifting mood" in readme
+    assert "downbeat:" in meta["summary"]
+
+
+def test_query_dial_reads_the_source_token_beside_the_queries(runner, monkeypatch):
+    """e022: a fake model where the query direction is a dial and only an appended source token adds (the uniform source
+    push does nothing): the dial passes, both token gates pass, the uniform control reads no effect."""
+    from PIL import Image
+    s, repo, pipe, _ = runner
+
+    def mood(p):
+        return 1.0 if "cheerful" in p else -1.0 if "gloomy" in p else 0.0
+
+    def query_states(prompts):
+        return torch.stack([torch.full((4, 3), 2.0 + mood(p)) for p in prompts]), torch.tensor([[1, 1, 1, 0]] * len(prompts))
+
+    def word_states(prompts, words):
+        assert set(words) in ({"cheerful", "upbeat"}, {"gloomy", "downbeat"})
+        return torch.full((len(prompts), 3), 1.0 if "cheerful" in words else -1.0)
+
+    pipe.query_states, pipe.word_states = query_states, word_states
+    calls = []
+
+    def render(prompts, seeds, query_add=None, source_token=None, source_add=None):
+        calls.append((query_add is not None, source_token is not None, source_add is not None))
+        level = (float(query_add.mean()) if query_add is not None else 0.0)
+        level += 0.4 * float(torch.sign(source_token.mean())) if source_token is not None else 0.0
+        return [Image.new("RGB", (8, 8), (int(round(128 + 20 * level)),) * 3) for _ in prompts]
+
+    monkeypatch.setattr(s, "_render", render)
+    meta = s.run_query_dial()
+    r = meta["result"]
+    assert r["dials"]["q"]["OUTCOME"] == "A DIAL" and r["dials"]["q"]["mean"] == pytest.approx(1.0, abs=0.01)
+    assert r["gates"]["pair_dir"]["OUTCOME"] == "THE SOURCE TOKEN ADDS"
+    assert r["gates"]["pair_state"]["OUTCOME"] == "THE SOURCE TOKEN ADDS"
+    assert r["gates"]["pair_uniform"]["OUTCOME"] == "NO EFFECT"
+    assert r["state_minus_direction_downbeat"]["OUTCOME"] == "NO EFFECT"
+    assert len(r["content_kept"]) == len(ax.query_sets()) == 17
+    assert (True, False, True) in calls and (True, True, False) in calls and (False, False, False) in calls
+    readme = repo.files_[f"experiments/{ax.QUERY_TEST_ID}/README.md"].decode()
+    assert "THE SOURCE TOKEN ADDS" in readme and "sheet_query.jpg" in readme
+    assert f"experiments/{ax.QUERY_TEST_ID}/sheet_query.jpg" in repo.files_
+
+
+def test_append_source_token_opens_one_position_after_the_caption():
+    pe = torch.zeros(2, 6, 3)
+    am = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 0]])
+    tok = torch.tensor([5.0, 6.0, 7.0])
+    out = ar.AnimaPipe.append_source_token((pe, am, "ids", "tm"), tok)
+    assert torch.equal(out[1], torch.tensor([[1, 1, 1, 1, 0, 0], [1, 1, 1, 1, 1, 1]]))
+    assert torch.equal(out[0][0, 3], tok) and torch.equal(out[0][1, 5], tok) and float(out[0][0, 4].abs().sum()) == 0
+    assert out[2:] == ("ids", "tm") and float(pe.abs().sum()) == 0          # the inputs are not modified in place
+    with pytest.raises(ValueError, match="no room"):
+        ar.AnimaPipe.append_source_token((pe, torch.ones(2, 6, dtype=torch.long), "ids", "tm"), tok)
+
+
 def test_route_split_end_to_end(runner, monkeypatch):
     from PIL import Image
     s, repo, _, _ = runner

@@ -78,6 +78,9 @@ step prints the job's size, then done / total, time spent and time left.
   output the DiT cross-attends to); a mood direction added at each site at alpha −2..+2 (about 700 images).
 - **e020** (`run_route_split`): the adapter reads a caption as Qwen3's states and as T5 word ids; the mood prompt
   through one of the two at a time, on e001's 64 cells (448 images, ~25 min).
+- **e021** (`run_appended_split`): e020 with the mood words after the scene; the gate is what the source half adds
+  to the query half on the downbeat words (448 images). **e022** (`run_query_dial`): a mood direction in the
+  adapter's queries, alone and with one appended source token (1,088 images).
 - **e012** (`run_attribute_screen`): six attributes as tag pairs (hair length, hair colour, eye colour, chibi,
   age for adults only, style) on 8 characters × 2 seeds; the words, a slider after the adapter at ±2, the
   cross-talk between sliders; judged by the WD EVA02-Large tagger v3 (352 images, ~20 min).

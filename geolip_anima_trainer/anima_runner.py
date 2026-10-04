@@ -257,6 +257,48 @@ class AnimaPipe:
         """states + vec at every token the mask marks (padding untouched); vec is [D] or per image [B, 1, D]."""
         return states + mask.to(states.dtype)[..., None] * vec.to(states.device, states.dtype)
 
+    @staticmethod
+    def append_source_token(conds: tuple, token) -> tuple:
+        """conds with one extra source position right after each caption's last Qwen3 token, its mask opened: a vector
+        the adapter's queries can look up there (token [D] or per image [B, D]). Qwen3's tokenizer pads on the right."""
+        import torch
+        pe, am, ids, tm = conds
+        pe, am = pe.clone(), am.clone()
+        n = am.sum(1).long()
+        if int(n.max()) >= pe.shape[1]:
+            raise ValueError("no room after the caption for a source token")
+        tok = token.to(pe.device, pe.dtype)
+        tok = tok.expand(pe.shape[0], -1) if tok.ndim == 1 else tok
+        rows = torch.arange(pe.shape[0], device=pe.device)
+        pe[rows, n] = tok
+        am[rows, n] = 1
+        return (pe, am, ids, tm)
+
+    def query_states(self, prompts: list[str]) -> tuple:
+        """The adapter's query embeddings before its blocks (its word table's output through in_proj; float32) and the T5
+        mask."""
+        import torch
+        conds = self.encode(prompts)
+        ad = self.model.transformer.llm_adapter
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            x = ad.in_proj(ad.embed(conds[2]))
+        return x.float(), conds[3]
+
+    def word_states(self, prompts: list[str], words: "tuple[str, ...]"):
+        """Per prompt, the mean Qwen3 state over the tokens whose characters overlap any of `words` [B, D] (float32):
+        the source vectors a query for those words looks up."""
+        import torch
+        conds = self.encode(prompts)
+        out = []
+        for b, p in enumerate(prompts):
+            offs = self.model.tokenizer(p, return_offsets_mapping=True)["offset_mapping"]
+            spans = [(p.index(w), p.index(w) + len(w)) for w in words if w in p]
+            idx = [k for k, (a, e) in enumerate(offs) if any(a < we and e > ws for ws, we in spans)]
+            if not idx:
+                raise ValueError(f"none of {words} in {p!r}")
+            out.append(conds[0][b, idx].float().mean(0))
+        return torch.stack(out)
+
     def encode_images(self, imgs: list, res: int):
         """Latents [B, 16, 1, res/8, res/8] of PIL images by the trainer's own path: fitted to res x res
         (utils.image_resize.convert_crop_and_resize), scaled to [-1, 1] (ToTensor + Normalize(.5, .5)), then the VAE
@@ -297,23 +339,36 @@ class AnimaPipe:
         return self._loss_fn(self.train_forward(x, t, tuple(c), push), (target, torch.tensor([])))
 
     # ---- sampling ---------------------------------------------------------------------------------
-    def _forward(self, x, t, conds: tuple, context_add=None):
-        inputs = (x, t, *conds)
-        for i, layer in enumerate(self.layers):
-            inputs = layer(inputs)
-            if i == self.adapter_at and context_add is not None:
-                x_, temb, ctx, *rest = inputs
-                inputs = (x_, temb, self.add_at_tokens(ctx, conds[3], context_add), *rest)
+    def _forward(self, x, t, conds: tuple, context_add=None, query_add=None):
+        handle = None
+        if query_add is not None:                          # added to the adapter's queries at the caption's T5 tokens
+            mask = conds[3]
+
+            def hook(mod, inp, out):
+                return out + mask.to(out.dtype)[..., None] * query_add.to(out.device, out.dtype)
+            handle = self.model.transformer.llm_adapter.in_proj.register_forward_hook(hook)
+        try:
+            inputs = (x, t, *conds)
+            for i, layer in enumerate(self.layers):
+                inputs = layer(inputs)
+                if i == self.adapter_at and context_add is not None:
+                    x_, temb, ctx, *rest = inputs
+                    inputs = (x_, temb, self.add_at_tokens(ctx, conds[3], context_add), *rest)
+        finally:
+            if handle is not None:
+                handle.remove()
         return inputs
 
     def generate(self, prompts: list[str], seeds: list[int], *, res: int, steps: int, cfg: float, shift: float,
                  negative: str = "", batch: int = 8, source_add=None, context_add=None, uncond_add=None,
-                 t5_prompts: "list[str] | None" = None) -> list:
+                 t5_prompts: "list[str] | None" = None, query_add=None, source_token=None) -> list:
         """PIL images, one per (prompt, seed). source_add / context_add: a 1024-vector added to every prompt token
         before / after the LLM adapter, on the conditional branch; uncond_add: the same after the adapter on the
         negative prompt's branch (a trained push goes on both branches, as a LoRA acts; e001's dial on neither).
         t5_prompts: per image, the prompt whose T5 token ids the adapter reads in place of the prompt's own, while
-        the Qwen3 states stay the prompt's (the adapter's two inputs from one caption, split)."""
+        the Qwen3 states stay the prompt's (the adapter's two inputs from one caption, split). query_add: a vector
+        added to the adapter's query embeddings (before its blocks) at the caption's T5 tokens; source_token: one
+        extra source position appended after the caption's Qwen3 tokens (both on the conditional branch only)."""
         import torch
         from utils.previews import to_pil
         if len(prompts) != len(seeds):
@@ -332,6 +387,8 @@ class AnimaPipe:
                     conds = (conds[0], conds[1], t5[2], t5[3])
                 if source_add is not None:
                     conds = (self.add_at_tokens(conds[0], conds[1], source_add), *conds[1:])
+                if source_token is not None:
+                    conds = self.append_source_token(conds, source_token)
                 un = tuple(u.expand(n, *u.shape[1:]).contiguous() for u in unc) if unc is not None else None
                 x = torch.cat([torch.randn((1, 16, res // 8, res // 8), device="cuda",
                                            generator=torch.Generator(device="cuda").manual_seed(int(sd)))
@@ -340,7 +397,7 @@ class AnimaPipe:
                 sch = self.model.scheduler
                 for step in sch.timesteps:
                     t = (step / 1000).float().reshape(1).repeat(n)
-                    v = self._forward(x, t, conds, context_add).float()
+                    v = self._forward(x, t, conds, context_add, query_add).float()
                     if un is not None:
                         vu = self._forward(x, t, un, uncond_add).float()
                         v = vu + cfg * (v - vu)
@@ -692,24 +749,31 @@ class AnimaRunner(_sr.SanaRunner):
         return {"source": (conds[0].float(), conds[1]), "context": (ctx.float(), conds[3])}
 
     # ---- e020: the route split ---------------------------------------------------------------------------------------
-    def run_route_split(self, *, force: bool = False) -> dict:
-        """e020 into its own folder of cfg.repo_id: the mood words through one of the adapter's two readings of the
-        caption at a time (Qwen3's states, the T5 ids). Skipped when the repo lists it as done (force=True reruns)."""
+    def run_appended_split(self, *, force: bool = False) -> dict:
+        """e021: the route split with the mood words appended after the scene (the query half, the source half, the
+        pair; the gate is the source half added to the query half on the downbeat words)."""
+        return self.run_route_split(test_id=ax.APPENDED_TEST_ID, force=force)
+
+    def run_route_split(self, test_id: str = ax.ROUTE_TEST_ID, *, force: bool = False) -> dict:
+        """A route split (e020, e021) into its own folder of cfg.repo_id: the mood words through one of the adapter's two
+        readings of the caption at a time (Qwen3's states, the T5 ids). Skipped when the repo lists it as done
+        (force=True reruns)."""
         self._need_model()
         _drop_torchao()
+        test = ax.ROUTE_TESTS[test_id]
         repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
         metas = repo.metas()
         try:
             self._publish_index(repo, metas)
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
-        rid = ax.ROUTE_TEST_ID
+        rid = test.id
         if metas.get(rid, {}).get("status") == "done" and not force:
             print(f"[anima] {rid} is done already (force=True reruns it)", flush=True)
             return metas[rid]
         base = f"experiments/{rid}"
         recipe = self._flavor_recipe()
-        meta = {"id": rid, "title": ax.ROUTE_TEST_TITLE, "date": "2026-10-04", "kind": "route_split", "status": "running",
+        meta = {"id": rid, "title": test.title, "date": "2026-10-04", "kind": "route_split", "status": "running",
                 "recipe": recipe}
         repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_route_split_readme(meta, recipe)},
                     f"{rid}: started (README)")
@@ -717,7 +781,7 @@ class AnimaRunner(_sr.SanaRunner):
         out_dir.mkdir(parents=True, exist_ok=True)
         t0 = time.time()
         try:
-            result = self._route_split(out_dir)
+            result = self._route_split(out_dir, test)
         except Exception as e:  # noqa: BLE001
             meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
             self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
@@ -727,7 +791,7 @@ class AnimaRunner(_sr.SanaRunner):
         e001 = metas.get(ax.FLAVOR_TEST_ID, {}).get("result", {})
         if e001.get("up_words") and e001.get("down_words"):
             result["e001_words"] = {"up": e001["up_words"]["mean"], "down": e001["down_words"]["mean"]}
-        summary = ax.route_summary(result)
+        summary = ax.route_summary(result, test)
         meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
                     seconds=round(time.time() - t0), finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
         (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
@@ -739,24 +803,26 @@ class AnimaRunner(_sr.SanaRunner):
         print(f"[anima] {rid} done in {meta['seconds']} s: {summary}", flush=True)
         return meta
 
-    def _route_split(self, out_dir: Path) -> dict:
+    def _route_split(self, out_dir: Path, test: "ax.RouteTest | None" = None) -> dict:
         import numpy as np
+        test = test or ax.ROUTE_TESTS[ax.ROUTE_TEST_ID]
+        tag = test.id.split("_")[0]
         self._eval_pipe()
         self._assert_stock()
         seeds = list(ax.ROUTE_SEEDS)
         cells = [(si, sd) for si in range(len(SUBJECTS)) for sd in seeds]
-        print(f"[anima] e020: {len(ax.ROUTE_SETS)} sets of {len(cells)} images (neutral; the words; the words through "
+        print(f"[anima] {tag}: {len(ax.ROUTE_SETS)} sets of {len(cells)} images (neutral; the words; the words through "
               "Qwen3's states only; through the T5 ids only), one line per set", flush=True)
-        eta = _sr._Eta(self.TAG, "e020", len(ax.ROUTE_SETS) * len(cells))
+        eta = _sr._Eta(self.TAG, tag, len(ax.ROUTE_SETS) * len(cells))
         S = [sd for _, sd in cells]
-        P = {f: [ax.TEMPLATES[f][0].format(s=SUBJECTS[si]) for si, _ in cells] for f in ("neutral", "up", "down")}
+        P = {f: [ax.route_prompts(test, f, SUBJECTS[si]) for si, _ in cells] for f in ("neutral", "up", "down")}
         imgs, feats, scores, kept = {}, {}, {}, {}
         for key, (fq, ft) in ax.ROUTE_SETS.items():                # neutral first: content kept is read against it
             imgs[key] = self._render_routes(P[fq], P[ft], S, eta)
             feats[key], sc = self._score(imgs[key])
             scores[key] = [float(x) for x in sc]
             kept[key] = float(np.mean((feats[key] * feats["neutral"]).sum(-1)))
-            print(f"[anima] e020 {key}: mood score {np.mean(scores[key]):+.3f}, content kept {kept[key]:.3f}", flush=True)
+            print(f"[anima] {tag} {key}: mood score {np.mean(scores[key]):+.3f}, content kept {kept[key]:.3f}", flush=True)
         result = ax.route_reads(scores)
         result.update(content_kept=kept, mood_score={k: float(np.mean(v)) for k, v in scores.items()})
         rows_first = [i for i, (_, sd) in enumerate(cells) if sd == seeds[0]][::4]      # 8 scenes, first seed
@@ -775,6 +841,110 @@ class AnimaRunner(_sr.SanaRunner):
             if eta is not None:
                 eta.add(len(qwen_prompts[i:i + b]))
         return out
+
+    # ---- e022: the query-site dial ------------------------------------------------------------------------------------
+    def run_query_dial(self, *, force: bool = False) -> dict:
+        """e022 into its own folder of cfg.repo_id: a mood direction added to the adapter's queries, alone and paired with
+        a source token (a bare direction, a state-shaped token, and the uniform source direction as the control).
+        Skipped when the repo lists it as done (force=True reruns)."""
+        self._need_model()
+        _drop_torchao()
+        repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
+        metas = repo.metas()
+        try:
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        qid = ax.QUERY_TEST_ID
+        if metas.get(qid, {}).get("status") == "done" and not force:
+            print(f"[anima] {qid} is done already (force=True reruns it)", flush=True)
+            return metas[qid]
+        base = f"experiments/{qid}"
+        recipe = self._flavor_recipe()
+        meta = {"id": qid, "title": ax.QUERY_TEST_TITLE, "date": "2026-10-04", "kind": "query_dial", "status": "running",
+                "recipe": recipe}
+        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_query_dial_readme(meta, recipe)},
+                    f"{qid}: started (README)")
+        out_dir = Path(self._need("data_root")) / "experiments" / qid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        try:
+            result = self._query_dial(out_dir)
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                                            f"{base}/README.md": ax.render_query_dial_readme(meta, recipe)},
+                                           f"{qid}: failed"))
+            raise
+        summary = ax.query_summary(result)
+        meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
+                    seconds=round(time.time() - t0), finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
+        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_query_dial_readme(meta, recipe),
+                     f"{base}/result.json": out_dir / "result.json", f"{base}/sheet_query.jpg": out_dir / "sheet_query.jpg"},
+                    f"{qid}: result")
+        metas[qid] = meta
+        self._safe(lambda: self._publish_index(repo, metas))
+        print(f"[anima] {qid} done in {meta['seconds']} s: {summary}", flush=True)
+        return meta
+
+    def _query_dial(self, out_dir: Path) -> dict:
+        import numpy as np
+        pipe = self._eval_pipe()
+        self._assert_stock()
+        seeds = list(ax.FLAVOR_TEST_SEEDS)
+        cells = [(si, sd) for si in range(len(SUBJECTS)) for sd in seeds]
+        S = [sd for _, sd in cells]
+        P = [ax.TEMPLATES["neutral"][0].format(s=SUBJECTS[si]) for si, _ in cells]
+        per_scene = {f: [ax.TEMPLATES[f][0].format(s=s) for s in SUBJECTS] for f in ("neutral", "up", "down")}
+
+        def mean_token(x, m):
+            m = m.to(x.dtype)
+            return (x * m[..., None]).sum(1) / m.sum(1, keepdim=True)
+
+        q = {f: pipe.query_states(per_scene[f]) for f in per_scene}
+        src = {f: self._site_states(per_scene[f])["source"] for f in per_scene}
+        d_q = ((mean_token(*q["up"]) - mean_token(*q["down"])) / 2).mean(0)
+        d_s = ((mean_token(*src["up"]) - mean_token(*src["down"])) / 2).mean(0)
+        xs, ms = src["neutral"]
+        xq, mq = q["neutral"]
+        src_norm = float(xs.norm(dim=-1)[ms.bool()].mean())
+        tokens = {"pair_dir": {1: d_s / d_s.norm() * src_norm, -1: -d_s / d_s.norm() * src_norm},
+                  "pair_state": {1: pipe.word_states(per_scene["up"], ax.QUERY_WORDS["up"]).mean(0),
+                                 -1: pipe.word_states(per_scene["down"], ax.QUERY_WORDS["down"]).mean(0)}}
+        sizes = {"query token mean size": float(xq.norm(dim=-1)[mq.bool()].mean()), "query direction": float(d_q.norm()),
+                 "Qwen3 state mean size": src_norm, "source direction": float(d_s.norm()),
+                 "state token, upbeat": float(tokens["pair_state"][1].norm()),
+                 "state token, downbeat": float(tokens["pair_state"][-1].norm())}
+        sets = ax.query_sets()
+        print(f"[anima] e022: {len(sets)} sets of {len(cells)} images (the neutral images, then the query dial alone and "
+              f"paired with a source token, at alpha {', '.join(f'{a:+g}' for a in ax.DIAL_ALPHAS)}), one line per set; "
+              + ", ".join(f"{k} {v:.2f}" for k, v in sizes.items()), flush=True)
+        eta = _sr._Eta(self.TAG, "e022", len(sets) * len(cells))
+        imgs, feats, scores, kept = {}, {}, {}, {}
+        for key in sets:                                         # neutral first: content kept is read against it
+            kw: dict = {}
+            if key != "neutral":
+                form, a = key.split("@")
+                a = float(a)
+                kw["query_add"] = d_q * a
+                if form in tokens:
+                    kw["source_token"] = tokens[form][1 if a > 0 else -1]
+                elif form == "pair_uniform":
+                    kw["source_add"] = d_s * a
+            imgs[key] = self._render_tracked(P, S, eta, **kw)
+            feats[key], sc = self._score(imgs[key])
+            scores[key] = [float(x) for x in sc]
+            kept[key] = float(np.mean((feats[key] * feats["neutral"]).sum(-1)))
+            print(f"[anima] e022 {key}: mood score {np.mean(scores[key]):+.3f}, content kept {kept[key]:.3f}", flush=True)
+        result = ax.query_dial_reads(scores)
+        result.update(sizes=sizes, content_kept=kept, mood_score={k: float(np.mean(v)) for k, v in scores.items()})
+        rows_first = [i for i, (_, sd) in enumerate(cells) if sd == seeds[0]][::4]      # 8 scenes, first seed
+        cols = ["neutral"] + [f"{f}@{a:+g}" for f in ax.QUERY_FORMS for a in (min(ax.DIAL_ALPHAS), max(ax.DIAL_ALPHAS))]
+        _grid([[imgs[k][i] for k in cols] for i in rows_first], out_dir / "sheet_query.jpg")
+        result["cells"] = [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
+                           for j, (si, sd) in enumerate(cells)]
+        return result
 
     # ---- e012: the attribute screen ----------------------------------------------------------------------
     def _tagger(self):
