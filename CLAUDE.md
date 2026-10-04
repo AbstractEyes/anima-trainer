@@ -526,6 +526,14 @@ the caption's T5 tokens, the conditional branch only); `generate(source_token=)`
 caption's Qwen3 tokens (`append_source_token`, mask opened; Qwen3 pads on the right); `query_states()` /
 `word_states()` give the query embeddings and the mean Qwen3 state at given words (tokenizer offsets). Forms q,
 pair_dir, pair_state, pair_uniform (the control) at alpha -2..+2; `query_dial_reads()` = slopes + the downbeat gates.
+LESSON (e021): the upbeat words ride the query half alone (T5-only +2.53 of +2.62), the downbeat words need Qwen3's
+states looked up by their own queries (words minus T5-only -2.13 of -2.65); every upbeat word there is one T5 piece and
+every downbeat word is cut into pieces (`t5_tokenizer.tokenize(" somber")` = so m ber). WORD SPLIT (`run_word_split()`
+= e026): `ax.WORD_GROUPS` (cheerful / gloomy x whole / shattered, two words each) + `WORD_EXTRA` (upbeat, downbeat,
+descriptive); per word words_w and t5_w on 32 cells (`WORD_SEEDS`); `word_split_reads()` = per word the word, its query
+half, its source half and its query share; per group the share pooled over readable words; TEST = BY TOKENIZATION /
+BY MOOD / NEITHER / NOT READABLE on the gloomy-whole and cheerful-shattered groups (line 0.5). The run records each
+word's pieces from `model.t5_tokenizer` / `model.tokenizer` in meta['pieces'].
 CONNECTORS (`run_beatrix_connectors()` = e013-e025, `anima_experiments.CONNECTOR_ARMS`): push = f @ W.T + b at the
 `context` site (every caption token after the adapter), W/b zero-init fp32, the only trained tensors; f = Beatrix's
 phrase features (`CONNECTOR_FEATURES` in the data repo: `trained` / `random` [74, 4096] + the phrase table in the

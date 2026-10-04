@@ -8,6 +8,9 @@ handful of `a.<step>()` calls and all logic lives here.
     a = AnimaRunner()          # Anima-Base v1.0, 768 px; uploads to AbstractPhil/geolip-beatrix-anima
     a.setup()                  # env + HF login + GPU + the diffusion-pipe fork + the three model files (~5.6 GB)
     a.run_flavor_test()        # e001: the stock model (mood words, a mood dial at two conditioning sites, the norms)
+    a.run_route_split()        # e020 / e021 (run_appended_split): which of the adapter's two readings carries the words
+    a.run_query_dial()         # e022: a mood direction in the adapter's queries, alone and with a source token
+    a.run_word_split()         # e026: single words, whole T5 tokens against shattered ones
     a.run_attribute_screen()   # e012: attribute words, attribute sliders after the adapter, their cross-talk
     a.run_sequence()           # e002..: the LoRA arms (anima_experiments.SEQUENCE)
     a.run_beatrix_connectors() # e013-e025: a push from Beatrix's phrase features (+ an untrained trunk, a free vector)
@@ -942,6 +945,84 @@ class AnimaRunner(_sr.SanaRunner):
         rows_first = [i for i, (_, sd) in enumerate(cells) if sd == seeds[0]][::4]      # 8 scenes, first seed
         cols = ["neutral"] + [f"{f}@{a:+g}" for f in ax.QUERY_FORMS for a in (min(ax.DIAL_ALPHAS), max(ax.DIAL_ALPHAS))]
         _grid([[imgs[k][i] for k in cols] for i in rows_first], out_dir / "sheet_query.jpg")
+        result["cells"] = [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
+                           for j, (si, sd) in enumerate(cells)]
+        return result
+
+    # ---- e026: the word split -----------------------------------------------------------------------------------------
+    def run_word_split(self, *, force: bool = False) -> dict:
+        """e026 into its own folder of cfg.repo_id: single mood words through the adapter's query half alone or through
+        both halves, whole T5 tokens against shattered ones. Skipped when the repo lists it as done (force=True reruns)."""
+        self._need_model()
+        _drop_torchao()
+        repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
+        metas = repo.metas()
+        try:
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        rid = ax.WORD_TEST_ID
+        if metas.get(rid, {}).get("status") == "done" and not force:
+            print(f"[anima] {rid} is done already (force=True reruns it)", flush=True)
+            return metas[rid]
+        base = f"experiments/{rid}"
+        recipe = self._flavor_recipe()
+        model = self._eval_pipe().model                 # each word as Anima's two tokenizers cut it, after a space
+        pieces = {w: {"t5": list(model.t5_tokenizer.tokenize(" " + w)), "qwen": list(model.tokenizer.tokenize(" " + w))}
+                  for w in ax.word_list()}
+        meta = {"id": rid, "title": ax.WORD_TEST_TITLE, "date": "2026-10-04", "kind": "word_split", "status": "running",
+                "recipe": recipe, "pieces": pieces}
+        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_word_split_readme(meta, recipe)},
+                    f"{rid}: started (README)")
+        out_dir = Path(self._need("data_root")) / "experiments" / rid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        try:
+            result = self._word_split(out_dir)
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                                            f"{base}/README.md": ax.render_word_split_readme(meta, recipe)},
+                                           f"{rid}: failed"))
+            raise
+        summary = ax.word_summary(result)
+        meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
+                    seconds=round(time.time() - t0), finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
+        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_word_split_readme(meta, recipe),
+                     f"{base}/result.json": out_dir / "result.json", f"{base}/sheet_words.jpg": out_dir / "sheet_words.jpg"},
+                    f"{rid}: result")
+        metas[rid] = meta
+        self._safe(lambda: self._publish_index(repo, metas))
+        print(f"[anima] {rid} done in {meta['seconds']} s: {summary}", flush=True)
+        return meta
+
+    def _word_split(self, out_dir: Path) -> dict:
+        import numpy as np
+        self._eval_pipe()
+        self._assert_stock()
+        cells = [(si, sd) for si in range(len(SUBJECTS)) for sd in ax.WORD_SEEDS]
+        sets = ax.word_sets()
+        print(f"[anima] e026: {len(sets)} sets of {len(cells)} images (neutral; per word, the word through both readings "
+              "and through the T5 ids only), one line per set", flush=True)
+        eta = _sr._Eta(self.TAG, "e026", len(sets) * len(cells))
+        S = [sd for _, sd in cells]
+        P = {w: [ax.word_prompt(w, SUBJECTS[si]) for si, _ in cells] for w in [None, *ax.word_list()]}
+        rows = list(range(len(cells)))[::4]                                # 8 scenes for the sheet
+        cols = ["neutral"] + [k for ws in ax.WORD_GROUPS.values() for k in (f"words_{ws[0]}", f"t5_{ws[0]}")]
+        sheet, feat0, scores, kept = {}, None, {}, {}
+        for key, (wq, wt) in sets.items():                 # neutral first: content kept is read against it
+            ims = self._render_routes(P[wq], P[wt], S, eta)
+            fa, sc = self._score(ims)
+            feat0 = fa if feat0 is None else feat0
+            scores[key] = [float(x) for x in sc]
+            kept[key] = float(np.mean((fa * feat0).sum(-1)))
+            if key in cols:
+                sheet[key] = [ims[i] for i in rows]
+            print(f"[anima] e026 {key}: mood score {np.mean(scores[key]):+.3f}, content kept {kept[key]:.3f}", flush=True)
+        result = ax.word_split_reads(scores)
+        result.update(content_kept=kept, mood_score={k: float(np.mean(v)) for k, v in scores.items()}, sheet_columns=cols)
+        _grid([[sheet[k][r] for k in cols] for r in range(len(rows))], out_dir / "sheet_words.jpg")
         result["cells"] = [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
                            for j, (si, sd) in enumerate(cells)]
         return result

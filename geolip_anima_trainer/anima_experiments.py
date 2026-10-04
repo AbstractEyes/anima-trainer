@@ -707,6 +707,156 @@ def render_query_dial_readme(meta: dict, recipe: dict) -> str:
     return "\n".join(out)
 
 
+# ---- e026: the word split (the route split one word at a time: whole T5 tokens against shattered ones) ---------------
+WORD_TEST_ID = "e026_anima_word_split"
+WORD_TEST_TITLE = ("The stock model: single mood words through the adapter's query half alone or through both halves, "
+                   "whole T5 tokens against shattered ones")
+WORD_TEMPLATE = PREFIX + "an illustration of {s}, {w} mood."
+WORD_GROUPS = {                          # (mood, how the T5 vocabulary holds the word) -> words: the 2 x 2 of the test
+    ("up", "whole"): ("happy", "joyful"),
+    ("up", "shattered"): ("jubilant", "gleeful"),
+    ("down", "whole"): ("sad", "miserable"),
+    ("down", "shattered"): ("gloomy", "melancholy"),
+}
+WORD_EXTRA = {"upbeat": "up", "downbeat": "down"}   # descriptive rows outside the 2 x 2 (two pieces each, ending in 'beat')
+WORD_SEEDS = FLAVOR_TEST_SEEDS[:1]       # e001's 32 scenes at its first seed: 32 cells
+WORD_SHARE_LINE = 0.5
+
+
+def word_list() -> list[str]:
+    return [w for ws in WORD_GROUPS.values() for w in ws] + list(WORD_EXTRA)
+
+
+def word_mood(w: str) -> str:
+    return WORD_EXTRA.get(w) or next(m for (m, _), ws in WORD_GROUPS.items() if w in ws)
+
+
+def word_sets() -> dict:
+    """Every image set of e026 in render order: {key: (the word whose prompt gives Qwen3's states, the word whose prompt
+    gives the T5 ids)}; None = the neutral prompt."""
+    out: dict = {"neutral": (None, None)}
+    for w in word_list():
+        out[f"words_{w}"] = (w, w)
+        out[f"t5_{w}"] = (None, w)
+    return out
+
+
+def word_prompt(w: "str | None", scene: str) -> str:
+    return NEUTRAL_CAPTION.format(s=scene) if w is None else WORD_TEMPLATE.format(s=scene, w=w)
+
+
+def word_split_reads(scores: dict) -> dict:
+    """The registered reads from mood scores {set key: [score per cell]} (keys as word_sets()): per word, in its mood's
+    direction under e001's rule, the word itself (words_w - neutral; a word that does not move it is not readable), its
+    query half (t5_w - neutral), its source half (words_w - t5_w) and its query share; per group of the 2 x 2 the query
+    share pooled over its readable words; THE TEST on the two groups the readings disagree on (gloomy whole, cheerful
+    shattered)."""
+    import numpy as np
+    base = scores["neutral"]
+    words = {}
+    for w in word_list():
+        d = 1 if word_mood(w) == "up" else -1
+        word = flavor_outcome(list(np.subtract(scores[f"words_{w}"], base)), d, label="THE WORD MOVES IT")
+        query = flavor_outcome(list(np.subtract(scores[f"t5_{w}"], base)), d, label="THE QUERY HALF MOVES IT")
+        source = flavor_outcome(list(np.subtract(scores[f"words_{w}"], scores[f"t5_{w}"])), d, label="THE SOURCE HALF ADDS")
+        words[w] = {"mood": word_mood(w), "word": word, "query": query, "source": source,
+                    "query_share": query["mean"] / word["mean"] if word["mean"] else None,
+                    "readable": word["OUTCOME"] == "THE WORD MOVES IT"}
+    groups = {}
+    for (m, kind), ws in WORD_GROUPS.items():
+        ok = [w for w in ws if words[w]["readable"]]
+        den = sum(words[w]["word"]["mean"] for w in ok)
+        groups[f"{m}_{kind}"] = {"words": list(ws), "readable": ok,
+                                 "query_share": sum(words[w]["query"]["mean"] for w in ok) / den if ok and den else None}
+    gw, cs = groups["down_whole"]["query_share"], groups["up_shattered"]["query_share"]
+    test = ("NOT READABLE" if gw is None or cs is None else
+            "BY TOKENIZATION" if gw >= WORD_SHARE_LINE > cs else
+            "BY MOOD" if cs >= WORD_SHARE_LINE > gw else "NEITHER")
+    return {"words": words, "groups": groups, "TEST": test}
+
+
+def word_summary(reads: dict) -> str:
+    def q(k):
+        v = reads["groups"][k]["query_share"]
+        return "n/a" if v is None else f"{v:.2f}"
+    return (f"{reads['TEST']}; the query half's share: cheerful whole {q('up_whole')}, cheerful shattered "
+            f"{q('up_shattered')}, gloomy whole {q('down_whole')}, gloomy shattered {q('down_shattered')}")
+
+
+def render_word_split_readme(meta: dict, recipe: dict) -> str:
+    """e026's README: the question, the design and the rule fixed before the run, and the result when done."""
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    pieces = meta.get("pieces") or {}
+
+    def cut(w, side="t5"):
+        return " ".join(pieces.get(w, {}).get(side, [])) or "?"
+
+    mood = {"up": "cheerful", "down": "gloomy"}
+    rows = [f"| {w} | {mood[m]} | {kind} | {cut(w)} | {cut(w, 'qwen')} |" for (m, kind), ws in WORD_GROUPS.items() for w in ws]
+    rows += [f"| {w} | {mood[m]} | (descriptive) | {cut(w)} | {cut(w, 'qwen')} |" for w, m in WORD_EXTRA.items()]
+    n_sets = len(word_sets())
+    out = [f"# {WORD_TEST_ID}: {WORD_TEST_TITLE}", "",
+           f"Date: 2026-10-04. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Question",
+           "The adapter reads a caption twice: its queries start from the caption's T5 token ids (through its own word "
+           "table), and they look up Qwen3's states. Experiment e021 found that, with the mood words after the scene, the "
+           "upbeat words reach the image almost entirely through the queries, while the downbeat words are carried by "
+           "Qwen3's states, looked up by the same words' queries. Every upbeat word there is a whole token in the T5 "
+           "vocabulary (\"joyful\", \"uplifting\"), while every downbeat word is cut into pieces (\"somber\" = so + m + "
+           "ber, \"melancholy\" = me + lan + cho + ly). Does the split follow the mood, or whether the T5 vocabulary holds "
+           "the word whole?", "",
+           "## Design",
+           f"- One mood word after the scene, \"{WORD_TEMPLATE.replace(PREFIX, '').format(s='{scene}', w='{word}')}\", "
+           f"against the neutral prompt \"{NEUTRAL_CAPTION.replace(PREFIX, '').format(s='{scene}')}\" (after the model "
+           f"card's quality prefix; the negative prompt unchanged); e001's 32 scenes at seed {WORD_SEEDS[0]} (32 cells).",
+           "- Eight words in a 2 x 2, plus two descriptive words outside the test; the pieces are Anima's own tokenizers' "
+           "(recorded by the run):", "",
+           "| word | mood | T5 vocabulary | T5 pieces | Qwen3 pieces |", "|---|---|---|---|---|", *rows, "",
+           f"- Per word two sets: the word through both readings (words) and through the T5 ids only, Qwen3 reading the "
+           f"neutral prompt (t5); with the neutral set, {n_sets} sets x 32 = {32 * n_sets} images.", "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           "Per cell, a set's mood score minus the neutral image's (minus the t5 set's for the source half), read in the "
+           "word's mood direction under e001's rule: it **moves it** when the mean moves that way, at least 75% of the 32 "
+           "cells move that way and the mean is beyond 3 standard errors; **NO EFFECT** within 2 standard errors of zero "
+           "or under 60% that way; **MIXED** otherwise. Per word: the word (words - neutral; a word that does not move it "
+           "is not readable), the query half (t5 - neutral), the source half (words - t5), and the query share (the query "
+           "half's mean over the word's). Per group of the 2 x 2: the query share pooled over its readable words (their "
+           "query halves' sum over their effects' sum). **The test**: **BY TOKENIZATION** when the gloomy whole-token "
+           "group's share is at least 0.5 and the cheerful shattered group's is under 0.5; **BY MOOD** for the reverse; "
+           "**NEITHER** otherwise; **NOT READABLE** when either of those two groups has no readable word. The other two "
+           "groups are anchors: both readings predict the same for them (a high share for the cheerful whole words, a "
+           "low one for the gloomy shattered words; e021's word pairs read 0.97 and 0.20).", "",
+           "**Limit fixed in advance**: the number of T5 pieces stands in for whether the adapter's word table knows the "
+           "word; how often each word appeared in the adapter's training captions is unknown, and the words differ in "
+           "strength; 32 cells.", "", ANIMA.judge_text, ""]
+    if meta.get("status") == "done":
+        r = meta["result"]
+        out += ["## Result", meta.get("summary", ""), "",
+                "| word | T5 pieces | the word (mean +- SE) | verdict | the query half | the source half | query share |",
+                "|---|---|---|---|---|---|---|"]
+        for w, v in r["words"].items():
+            qs = "" if v["query_share"] is None else f"{v['query_share']:.2f}"
+            out.append(f"| {w} | {len(pieces.get(w, {}).get('t5', [])) or '?'} | {v['word']['mean']:+.3f} +- "
+                       f"{v['word']['se']:.3f} | **{v['word']['OUTCOME']}** | {v['query']['mean']:+.3f} +- "
+                       f"{v['query']['se']:.3f} ({v['query']['OUTCOME']}) | {v['source']['mean']:+.3f} +- "
+                       f"{v['source']['se']:.3f} ({v['source']['OUTCOME']}) | {qs} |")
+        out += ["", "| group | words read | pooled query share |", "|---|---|---|"]
+        for k, g in r["groups"].items():
+            qs = "not readable" if g["query_share"] is None else f"{g['query_share']:.2f}"
+            m, kind = k.split("_")
+            out.append(f"| {mood[m]}, {kind} | {', '.join(g['readable']) or 'none'} | {qs} |")
+        out += ["", f"**The test: {r['TEST']}.**", "",
+                "![the words](sheet_words.jpg)", "",
+                "Rows: eight scenes. Columns: " + ", ".join(r.get("sheet_columns", [])) + ".", ""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    else:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files", "- `result.json`: every cell's scores and the reads.", "- `sheet_words.jpg`: the contact sheet.", ""]
+    return "\n".join(out)
+
+
 # ---- e013-e015: Beatrix as a second conditioning source (a learned push after the adapter) ------------------------
 @dataclass(frozen=True)
 class ConnectorArm:

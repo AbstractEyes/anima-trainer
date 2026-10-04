@@ -881,6 +881,80 @@ def test_query_dial_reads_the_source_token_beside_the_queries(runner, monkeypatc
     assert f"experiments/{ax.QUERY_TEST_ID}/sheet_query.jpg" in repo.files_
 
 
+def test_word_split_reads_the_tokenization_test_both_ways(runner, monkeypatch):
+    """e026: a fake model where a word the fake T5 vocabulary holds whole rides the query half and a shattered word needs
+    the source half reads BY TOKENIZATION; one where the mood decides reads BY MOOD; the pieces come from the tokenizers."""
+    from types import SimpleNamespace
+    from PIL import Image
+    s, repo, pipe, _ = runner
+    whole = {"happy", "joyful", "sad", "miserable"}
+
+    class Tok:
+        def __init__(self, split):
+            self.split = split
+
+        def tokenize(self, text):
+            w = text.strip()
+            return ["_" + w] if not self.split or w in whole else ["_", w[:2], w[2:4], w[4:]]
+
+    pipe.model = SimpleNamespace(t5_tokenizer=Tok(True), tokenizer=Tok(False))
+
+    def word_in(p):
+        return next((w for w in ax.word_list() if f", {w} mood" in p), None)
+
+    def make_render(query_carries):
+        def render(prompts, seeds, t5_prompts=None):
+            t5 = t5_prompts or prompts
+            out = []
+            for q, t in zip(prompts, t5):
+                wq, wt = word_in(q), word_in(t)
+                level = 0.0
+                if wt:
+                    sign = 1.0 if ax.word_mood(wt) == "up" else -1.0
+                    level = sign * (2.0 if query_carries(wt) else 0.3) + (sign * 1.7 if wq == wt and not query_carries(wt)
+                                                                         else 0.0)
+                out.append(Image.new("RGB", (8, 8), (int(round(128 + 20 * level)),) * 3))
+            return out
+        return render
+
+    monkeypatch.setattr(s, "_render", make_render(lambda w: w in whole or w == "upbeat"))
+    meta = s.run_word_split()
+    r = meta["result"]
+    assert meta["status"] == "done" and meta["kind"] == "word_split" and r["TEST"] == "BY TOKENIZATION"
+    assert r["groups"]["down_whole"]["query_share"] == pytest.approx(1.0, abs=0.01)
+    assert r["groups"]["up_shattered"]["query_share"] == pytest.approx(0.3 / 2.0, abs=0.01)
+    assert r["words"]["gloomy"]["source"]["OUTCOME"] == "THE SOURCE HALF ADDS" and r["words"]["sad"]["readable"]
+    assert r["words"]["happy"]["source"]["OUTCOME"] == "NO EFFECT"
+    assert meta["pieces"]["gloomy"]["t5"] == ["_", "gl", "oo", "my"] and meta["pieces"]["sad"]["t5"] == ["_sad"]
+    assert len(r["content_kept"]) == len(ax.word_sets()) == 21 and len(r["sheet_columns"]) == 9
+    base = f"experiments/{ax.WORD_TEST_ID}"
+    for f in ("meta.json", "README.md", "result.json", "sheet_words.jpg"):
+        assert f"{base}/{f}" in repo.files_, f
+    readme = repo.files_[f"{base}/README.md"].decode()
+    assert "**The test: BY TOKENIZATION.**" in readme and "| gloomy | gloomy | shattered | _ gl oo my |" in readme
+    assert "upbeat" in readme and "(descriptive)" in readme
+    import re
+    for word in (r"S-1", r"\bPhil\b", r"docket", r"canon/", r"Fable"):
+        assert not re.search(word, readme), word
+    assert len(json.loads(repo.files_[f"{base}/result.json"])["cells"]) == 32
+    monkeypatch.setattr(s, "_render", make_render(lambda w: ax.word_mood(w) == "up"))
+    assert s.run_word_split(force=True)["result"]["TEST"] == "BY MOOD"
+
+
+def test_word_split_test_needs_both_decisive_groups_readable():
+    base = [0.05 * (i % 3) for i in range(32)]
+    scores = {"neutral": base}
+    for w in ax.word_list():
+        sign = 1.0 if ax.word_mood(w) == "up" else -1.0
+        moves = 0.0 if w in ("sad", "miserable") else 2.0                 # the gloomy whole words do not move it
+        scores[f"words_{w}"] = [b + sign * moves + 0.01 * (i % 4) for i, b in enumerate(base)]
+        scores[f"t5_{w}"] = [b + sign * moves / 2 for b in base]
+    r = ax.word_split_reads(scores)
+    assert r["TEST"] == "NOT READABLE" and r["groups"]["down_whole"]["readable"] == []
+    assert r["groups"]["up_whole"]["query_share"] == pytest.approx(0.5, abs=0.02)
+    assert "n/a" in ax.word_summary(r)
+
+
 def test_append_source_token_opens_one_position_after_the_caption():
     pe = torch.zeros(2, 6, 3)
     am = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 0]])

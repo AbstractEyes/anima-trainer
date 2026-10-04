@@ -295,6 +295,7 @@ a.run_flavor_test()        # e001: the stock model
 a.run_route_split()        # e020: which of the adapter's two readings carries the words
 a.run_appended_split()     # e021: the same with the mood words after the scene (the query half, the source half, both)
 a.run_query_dial()         # e022: a mood direction in the adapter's queries, alone and with a source token beside it
+a.run_word_split()         # e026: single mood words, whole T5 tokens against shattered ones
 a.run_attribute_screen()   # e012: attribute sliders on the stock model
 a.run_sequence()           # e002..e011: the LoRA arms
 a.run_beatrix_connectors() # e013-e025: a push from Beatrix's phrase features, and its controls
@@ -321,7 +322,12 @@ a.run_beatrix_connectors() # e013-e025: a push from Beatrix's phrase features, a
   the caption's positions agree in both readings, and reads what the source half adds to the query half on
   the downbeat words. **e022** adds a mood direction to the adapter's queries (before its blocks), alone and
   with one source token appended after the caption (a bare direction, or Qwen3's own state for the mood
-  words); the same direction spread over every Qwen3 token is the control.
+  words); the same direction spread over every Qwen3 token is the control. e021 found the upbeat words ride the
+  queries alone and the downbeat words need Qwen3's states looked up by their queries; every upbeat word there is
+  one T5 token and every downbeat word is cut into pieces ("somber" = so + m + ber). **e026** splits single words
+  in a 2 x 2 (cheerful / gloomy x whole / cut into pieces: happy, joyful | jubilant, gleeful | sad, miserable |
+  gloomy, melancholy; upbeat and downbeat beside them) to read whether the split follows the mood or the T5
+  vocabulary.
 - **e012** screens six character attributes (hair length, hair colour, eye colour, chibi proportions, age
   for adults only, style) as tag pairs on eight characters: does the tag move the attribute, does its
   direction added after the adapter act as a slider, and does each slider leave the other attributes alone
