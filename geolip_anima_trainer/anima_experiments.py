@@ -1251,6 +1251,61 @@ def render_word_swap_readme(meta: dict, recipe: dict) -> str:
     return "\n".join(out)
 
 
+# ---- e029 (planned; the set list and the read only, no runner yet): a relayed phrase reading in pictures ----------------
+# Beatrix's states for a phrase, mapped into Qwen3's space by a ridge regression, written over Qwen3's states at every token of the
+# phrase at one depth; the adapter's T5 queries unchanged. The adapter-level grid picks the map and the depth; pictures confirm.
+RELAY_TEST_ID = "e029_anima_relay_in_pictures"
+RELAY_TEMPLATE = PREFIX + "an illustration of {s}, {p}."   # the relay grid's caption form (no ' mood': not e026's template)
+RELAY_SCENE_STEP = 4                                      # e001's scenes [::4]: the eight contact-sheet rows
+RELAY_ANSWER = "THE RELAY CARRIES THE MOOD"
+
+
+def relay_prompt(p: str, scene: str) -> str:
+    return RELAY_TEMPLATE.format(s=scene, p=p)
+
+
+def relay_sets(phrases: list) -> dict:
+    """e029's image sets per phrase (dicts: text, mood 'up' / 'down', filler = the neutral phrase of the same Qwen3 token count):
+    {key: (the phrase whose caption gives Qwen3's states, the phrase whose caption gives the T5 ids, relayed)}. ceiling = the
+    phrase's caption on both sides; relay = the same, with the relayed states written over Qwen3's at the phrase's tokens at the
+    chosen depth; filler = the phrase's T5 ids with the filler caption's Qwen3 states (the answer absent)."""
+    out: dict = {}
+    for p in phrases:
+        t = p["text"]
+        out[f"ceiling|{t}"] = (t, t, False)
+        out[f"relay|{t}"] = (t, t, True)
+        out[f"filler|{t}"] = (p["filler"], t, False)
+    return out
+
+
+def relay_reads(scores: dict, phrases: list) -> dict:
+    """The read fixed before any image, from mood scores {set key: [score per scene]}: per (phrase, scene) the relay minus the
+    filler in the phrase's mood direction under e001's rule (THE RELAY CARRIES THE MOOD), pooled over all phrases and per mood;
+    beside it the ceiling minus the filler under the same rule (the caption's own answer); the size = the mean signed relay effect
+    over the mean signed ceiling effect, pooled, per mood and per phrase."""
+    import numpy as np
+
+    def block(ps):
+        rel, cei, num, den = [], [], [], []
+        for p in ps:
+            s = 1 if p["mood"] == "up" else -1
+            f = np.array(scores[f"filler|{p['text']}"])
+            r, c = np.subtract(scores[f"relay|{p['text']}"], f), np.subtract(scores[f"ceiling|{p['text']}"], f)
+            rel += [s * x for x in r]
+            cei += [s * x for x in c]
+            num.append(s * float(np.mean(r)))
+            den.append(s * float(np.mean(c)))
+        sd = float(np.mean(den))
+        return {"relay": flavor_outcome(rel, 1, label=RELAY_ANSWER),
+                "ceiling": flavor_outcome(cei, 1, label="THE CAPTION CARRIES THE MOOD"),
+                "size": float(np.mean(num)) / sd if sd else None}
+
+    out = {"all": block(phrases), "by_mood": {m: block([p for p in phrases if p["mood"] == m]) for m in ("up", "down")},
+           "phrases": {p["text"]: block([p]) for p in phrases}}
+    out["TEST"] = out["all"]["relay"]["OUTCOME"]
+    return out
+
+
 # ---- e013-e015: Beatrix as a second conditioning source (a learned push after the adapter) ------------------------
 @dataclass(frozen=True)
 class ConnectorArm:

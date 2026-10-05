@@ -1122,6 +1122,36 @@ def test_word_swap_reads_the_answer_and_the_carrier(runner, monkeypatch):
     assert len(json.loads(repo.files_[f"{base}/result.json"])["cells"]) == 8
 
 
+def test_relay_reads_score_the_relay_against_the_ceiling():
+    """e029's planned read on fake scores: every caption carries 2 per unit of mood over its filler, the relay half of that with a
+    small spread for 'elated' and 'dismal' and nothing for 'giddy': pooled the relay carries the mood at its known size, per mood
+    the up side is diluted by the flat phrase, and the flat phrase alone reads NO EFFECT."""
+    phrases = [{"text": "elated", "mood": "up", "filler": "workaday"}, {"text": "dismal", "mood": "down", "filler": "neutral"},
+               {"text": "giddy", "mood": "up", "filler": "workaday"}]
+    sets = ax.relay_sets(phrases)
+    assert len(sets) == 9 and sets["filler|dismal"] == ("neutral", "dismal", False)
+    assert sets["relay|elated"] == ("elated", "elated", True) and sets["ceiling|giddy"] == ("giddy", "giddy", False)
+    assert ax.relay_prompt("dismal", "a cat") == ax.PREFIX + "an illustration of a cat, dismal."
+    scores = {}
+    for p in phrases:
+        s = 1 if p["mood"] == "up" else -1
+        base = [0.1 * i for i in range(8)]
+        scores[f"filler|{p['text']}"] = base
+        scores[f"ceiling|{p['text']}"] = [b + s * (2.0 + 0.05 * (i % 3)) for i, b in enumerate(base)]
+        if p["text"] == "giddy":
+            scores[f"relay|{p['text']}"] = [b + (0.05 if i % 2 else -0.05) for i, b in enumerate(base)]
+        else:
+            scores[f"relay|{p['text']}"] = [b + s * (1.0 + 0.05 * (i % 2)) for i, b in enumerate(base)]
+    r = ax.relay_reads(scores, phrases)
+    ceil = 2.0 + 0.05 * 7 / 8                             # the ceiling's mean signed effect per phrase (i % 3 sums to 7 over 0..7)
+    assert r["TEST"] == ax.RELAY_ANSWER and r["all"]["ceiling"]["OUTCOME"] == "THE CAPTION CARRIES THE MOOD"
+    assert r["all"]["size"] == pytest.approx((1.025 + 1.025 + 0.0) / 3 / ceil, abs=1e-6)
+    assert r["by_mood"]["down"]["size"] == pytest.approx(1.025 / ceil, abs=1e-6)
+    assert r["by_mood"]["up"]["size"] == pytest.approx(1.025 / 2 / ceil, abs=1e-6)
+    assert r["phrases"]["giddy"]["relay"]["OUTCOME"] == "NO EFFECT"
+    assert r["phrases"]["dismal"]["relay"]["OUTCOME"] == ax.RELAY_ANSWER
+
+
 def test_swap_aligned_needs_the_same_qwen_positions(runner):
     """e028's guard: every swapped caption keeps the first word's Qwen3 positions and length, or the run stops."""
     from types import SimpleNamespace
