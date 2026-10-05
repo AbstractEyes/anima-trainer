@@ -1052,6 +1052,100 @@ def test_slot_pair_reads_the_matched_source_beside_the_query(runner, monkeypatch
         assert not re.search(word, readme), word
 
 
+def test_word_swap_reads_the_answer_and_the_carrier(runner, monkeypatch):
+    """e028: a fake model where, under a mood word's pieces, the answer's mood moves the picture 2 per unit whatever the
+    question (the pieces themselves darken 0.2), the filler's pieces carry an answer at 0.6 of that, and any mood clause
+    tints -0.5: R1 reads the answer carrying the mood at the own axis's full size, every answer adds, a foreign question
+    delivers in full, the same-mood swaps equal the own captions, and the carrier reads at its known size."""
+    from types import SimpleNamespace
+    from PIL import Image
+    s, repo, pipe, _ = runner
+    words = ax.swap_words()
+
+    class Tok:
+        def tokenize(self, text):
+            w = text.strip()
+            return ["_", w[:3], w[3:]]
+
+    pipe.model = SimpleNamespace(t5_tokenizer=Tok(), tokenizer=Tok())
+
+    def word_in(p):
+        return next((w for w in [*words, ax.SWAP_FILLER] if f", {w} mood" in p), None)
+
+    def level(q, a):                       # q: the T5 caption's word, a: the Qwen3 caption's word (None: the scene caption)
+        if q is None and a is None:
+            return 0.0
+        m = (1.0 if ax.swap_mood(a) == "up" else -1.0) if a in words else 0.0
+        return -0.5 + (2.0 if q in words else 1.2) * m - (0.2 if q in words else 0.0)
+
+    def render(prompts, seeds, t5_prompts=None):
+        t5 = t5_prompts or prompts
+        return [Image.new("RGB", (8, 8), (int(round(128 + 20 * level(word_in(t), word_in(p)))),) * 3)
+                for p, t in zip(prompts, t5)]
+
+    monkeypatch.setattr(s, "_render", render)
+    monkeypatch.setattr(s, "_swap_aligned", lambda P: [[7, 8]] * len(P[None]))
+    meta = s.run_word_swap()
+    r = meta["result"]
+    assert meta["status"] == "done" and meta["kind"] == "word_swap" and r["TEST"] == ax.SWAP_ANSWER
+    assert r["R1"]["mean"] == pytest.approx(4.0, abs=0.01) and r["R2_size"] == pytest.approx(1.0, abs=0.01)
+    assert r["own_axis"] == pytest.approx(4.0, abs=0.01) and r["clause_tint"]["mean"] == pytest.approx(-0.5, abs=0.01)
+    assert r["R5"]["OUTCOME"] == "THE CARRIER DELIVERS THE ANSWER" and r["R5_size"] == pytest.approx(0.6, abs=0.01)
+    for w in words:
+        v = r["words"][w]
+        assert v["answer_adds"]["OUTCOME"] == "THE ANSWER ADDS" and v["own"]["OUTCOME"] == "THE WORD MOVES IT"
+        assert v["foreign_delivery"]["same"] == pytest.approx(1.0, abs=0.01)
+        assert v["foreign_delivery"]["opposite"] == pytest.approx(1.0, abs=0.01)
+        assert v["same_mood_swaps_minus_own"] == pytest.approx(0.0, abs=0.01)
+        assert v["question_under_filler"]["mean"] == pytest.approx(-0.2, abs=0.01)
+    assert r["words"]["gleeful"]["carrier_size"] == pytest.approx(1.2 / 1.8, abs=0.01)
+    assert r["words"]["gloomy"]["carrier_size"] == pytest.approx(1.2 / 2.2, abs=0.01)
+    assert len(r["content_kept"]) == len(ax.swap_sets()) == 26 and len(r["sheet_columns"]) == 10
+    assert meta["pieces"][ax.SWAP_FILLER]["t5"] == ["_", "wor", "kaday"]
+    base = f"experiments/{ax.SWAP_TEST_ID}"
+    for f in ("meta.json", "README.md", "result.json", "sheet_swap.jpg"):
+        assert f"{base}/{f}" in repo.files_, f
+    readme = repo.files_[f"{base}/README.md"].decode()
+    assert f"**{ax.SWAP_ANSWER}**" in readme and "THE CARRIER DELIVERS THE ANSWER" in readme and "| workaday |" in readme
+    import re
+    for word in (r"S-1", r"\bPhil\b", r"docket", r"canon/", r"Fable"):
+        assert not re.search(word, readme), word
+    assert len(json.loads(repo.files_[f"{base}/result.json"])["cells"]) == 8
+
+
+def test_swap_aligned_needs_the_same_qwen_positions(runner):
+    """e028's guard: every swapped caption keeps the first word's Qwen3 positions and length, or the run stops."""
+    from types import SimpleNamespace
+    s, _, _, _ = runner
+
+    class Tok:
+        """Splits on spaces with character offsets; the words in `two` come out as two tokens."""
+        def __init__(self, two):
+            self.two = two
+
+        def __call__(self, text, return_offsets_mapping=False):
+            offs, i = [], 0
+            for w in text.split(" "):
+                if w.rstrip(".,") in self.two:
+                    h = len(w) // 2
+                    offs += [(i, i + h), (i + h, i + len(w))]
+                else:
+                    offs.append((i, i + len(w)))
+                i += len(w) + 1
+            return {"offset_mapping": offs, "input_ids": list(range(len(offs)))}
+
+    pipe = ar.AnimaPipe.__new__(ar.AnimaPipe)
+    two = {*ax.swap_words(), ax.SWAP_FILLER}
+    pipe.model = SimpleNamespace(t5_tokenizer=Tok(set()), tokenizer=Tok(two))
+    s._pipe = pipe
+    P = {w: [ax.word_prompt(w, sc) for sc in ("a cat", "a dog by the sea")] for w in [None, *ax.swap_words(), ax.SWAP_FILLER]}
+    pos = s._swap_aligned(P)
+    assert len(pos) == 2 and len(pos[0]) == 2 and pos[1][0] == pos[0][0] + 3
+    pipe.model = SimpleNamespace(t5_tokenizer=Tok(set()), tokenizer=Tok(two - {"elated"}))
+    with pytest.raises(ValueError, match="does not keep"):
+        s._swap_aligned(P)
+
+
 def test_append_source_token_opens_one_position_after_the_caption():
     pe = torch.zeros(2, 6, 3)
     am = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 1, 1, 1, 0]])

@@ -1198,6 +1198,105 @@ class AnimaRunner(_sr.SanaRunner):
                            for j, (si, sd) in enumerate(cells)]
         return result
 
+    # ---- e028: the word swap ------------------------------------------------------------------------------------------
+    def run_word_swap(self, *, force: bool = False) -> dict:
+        """e028 into its own folder of cfg.repo_id: mood words cut into pieces by T5, each read with another word's (or a
+        neutral filler's) Qwen3 states in its place, and the filler's pieces with each word's states. Skipped when the repo
+        lists it as done (force=True reruns)."""
+        self._need_model()
+        _drop_torchao()
+        repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
+        metas = repo.metas()
+        try:
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        rid = ax.SWAP_TEST_ID
+        if metas.get(rid, {}).get("status") == "done" and not force:
+            print(f"[anima] {rid} is done already (force=True reruns it)", flush=True)
+            return metas[rid]
+        base = f"experiments/{rid}"
+        recipe = self._flavor_recipe()
+        model = self._eval_pipe().model                 # each word as Anima's two tokenizers cut it, after a space
+        pieces = {w: {"t5": list(model.t5_tokenizer.tokenize(" " + w)), "qwen": list(model.tokenizer.tokenize(" " + w))}
+                  for w in [*ax.swap_words(), ax.SWAP_FILLER]}
+        meta = {"id": rid, "title": ax.SWAP_TEST_TITLE, "date": "2026-10-04", "kind": "word_swap", "status": "running",
+                "recipe": recipe, "pieces": pieces}
+        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_word_swap_readme(meta, recipe)},
+                    f"{rid}: started (README)")
+        out_dir = Path(self._need("data_root")) / "experiments" / rid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        try:
+            result = self._word_swap(out_dir)
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                                            f"{base}/README.md": ax.render_word_swap_readme(meta, recipe)},
+                                           f"{rid}: failed"))
+            raise
+        summary = ax.word_swap_summary(result)
+        meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
+                    seconds=round(time.time() - t0), finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
+        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_word_swap_readme(meta, recipe),
+                     f"{base}/result.json": out_dir / "result.json", f"{base}/sheet_swap.jpg": out_dir / "sheet_swap.jpg"},
+                    f"{rid}: result")
+        metas[rid] = meta
+        self._safe(lambda: self._publish_index(repo, metas))
+        print(f"[anima] {rid} done in {meta['seconds']} s: {summary}", flush=True)
+        return meta
+
+    def _swap_aligned(self, P: dict) -> list:
+        """Every caption of a scene that a swap pairs holds the same number of Qwen3 tokens with the swapped word at the
+        same positions (else a swap shifts every later position); returns the words' shared Qwen3 positions per scene."""
+        import torch
+        pipe = self._eval_pipe()
+        words = [*ax.swap_words(), ax.SWAP_FILLER]
+        ref = None
+        for w in words:
+            _, m_q = pipe.slot_masks(P[w], w, device="cpu")
+            n = [len(pipe.model.tokenizer(p)["input_ids"]) for p in P[w]]
+            if ref is None:
+                ref = (m_q, n)
+            elif not torch.equal(m_q, ref[0]) or n != ref[1]:
+                raise ValueError(f"{w!r} does not keep {words[0]!r}'s Qwen3 positions ({n} vs {ref[1]} tokens)")
+        return [ref[0][i].nonzero().flatten().tolist() for i in range(ref[0].shape[0])]
+
+    def _word_swap(self, out_dir: Path) -> dict:
+        import numpy as np
+        self._eval_pipe()
+        self._assert_stock()
+        cells = [(si, sd) for si in range(0, len(SUBJECTS), ax.SWAP_SCENE_STEP) for sd in ax.SWAP_SEEDS]
+        assert len(cells) == ax.SWAP_N_SCENES * len(ax.SWAP_SEEDS), (len(cells), ax.SWAP_N_SCENES)
+        S = [sd for _, sd in cells]
+        P = {w: [ax.word_prompt(w, SUBJECTS[si]) for si, _ in cells] for w in [None, *ax.swap_words(), ax.SWAP_FILLER]}
+        positions = self._swap_aligned(P)
+        sets = ax.swap_sets()
+        print(f"[anima] e028: {len(sets)} sets of {len(cells)} images (T5 ids of one caption with the Qwen3 states of "
+              f"another), one line per set; the swapped words' Qwen3 positions per scene {positions}", flush=True)
+        eta = _sr._Eta(self.TAG, "e028", len(sets) * len(cells))
+        g, d = ax.SWAP_WORDS["up"][0], ax.SWAP_WORDS["down"][0]
+        cols = ["neutral", "filler_own", f"own_{g}", f"swap_{g}_{d}", f"filler_{g}", f"carrier_{g}",
+                f"own_{d}", f"swap_{d}_{g}", f"filler_{d}", f"carrier_{d}"]
+        sheet, feat0, scores, kept = {}, None, {}, {}
+        for key, (wq, wt) in sets.items():                 # the scene caption first: content kept is read against it
+            ims = self._render_routes(P[wq], P[wt], S, eta)
+            fa, sc = self._score(ims)
+            feat0 = fa if feat0 is None else feat0
+            scores[key] = [float(x) for x in sc]
+            kept[key] = float(np.mean((fa * feat0).sum(-1)))
+            if key in cols:
+                sheet[key] = ims
+            print(f"[anima] e028 {key}: mood score {np.mean(scores[key]):+.3f}, content kept {kept[key]:.3f}", flush=True)
+        result = ax.word_swap_reads(scores)
+        result.update(content_kept=kept, mood_score={k: float(np.mean(v)) for k, v in scores.items()}, sheet_columns=cols,
+                      positions=positions)
+        _grid([[sheet[k][r] for k in cols] for r in range(len(cells))], out_dir / "sheet_swap.jpg")
+        result["cells"] = [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
+                           for j, (si, sd) in enumerate(cells)]
+        return result
+
     # ---- e012: the attribute screen ----------------------------------------------------------------------
     def _tagger(self):
         if getattr(self, "_tagger_fns", None) is None:

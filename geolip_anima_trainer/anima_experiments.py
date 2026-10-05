@@ -1031,6 +1031,195 @@ def render_slot_pair_readme(meta: dict, recipe: dict) -> str:
     return "\n".join(out)
 
 
+# ---- e028: the word swap (a shattered word's own T5 pieces with another word's Qwen3 reading in its place) --------------
+SWAP_TEST_ID = "e028_anima_word_swap"
+SWAP_TEST_TITLE = ("The stock model: a mood word cut into pieces, read with another word's Qwen3 states in its place; does the "
+                   "picture follow the answer's mood?")
+SWAP_WORDS = {"up": ("gleeful", "elated"), "down": ("gloomy", "melancholy")}   # cut into pieces by T5, two Qwen3 tokens each
+SWAP_FILLER = "workaday"                 # a neutral word of the same two Qwen3 tokens: the answer absent, or a neutral carrier
+SWAP_SCENE_STEP = 4                      # e001's scenes [::4]: the eight contact-sheet rows
+SWAP_N_SCENES = 8                        # len(e001's 32 scenes [::4]); the runner asserts it
+SWAP_SEEDS = WORD_SEEDS                  # e026's seed
+SWAP_ANSWER = "THE ANSWER CARRIES THE MOOD"
+
+
+def swap_words() -> list[str]:
+    return [w for ws in SWAP_WORDS.values() for w in ws]
+
+
+def swap_mood(w: str) -> str:
+    return next(m for m, ws in SWAP_WORDS.items() if w in ws)
+
+
+def swap_sets() -> dict:
+    """Every image set of e028 in render order: {key: (the word whose caption gives Qwen3's states, the word whose caption
+    gives the T5 ids)}; None = the scene caption, SWAP_FILLER = the neutral word's caption."""
+    W, F = swap_words(), SWAP_FILLER
+    out: dict = {"neutral": (None, None), "filler_own": (F, F)}
+    out.update({f"own_{a}": (a, a) for a in W})
+    out.update({f"swap_{a}_{x}": (x, a) for a in W for x in W if x != a})
+    out.update({f"filler_{a}": (F, a) for a in W})
+    out.update({f"carrier_{x}": (x, F) for x in W})
+    return out
+
+
+def word_swap_reads(scores: dict) -> dict:
+    """The registered reads from mood scores {set key: [score per scene]} (keys as swap_sets()).
+    R1 (deciding), per cell (question A, scene): the mean over A's foreign cheerful answers minus the mean over its foreign
+    gloomy answers, read upward under e001's rule. R2: R1's mean over the own axis (the cheerful words' own captions minus
+    the gloomy words', per scene). R3 per word A, in its mood's direction: its answer's share (A|A - A|filler, 'THE ANSWER
+    ADDS') and its question pieces under the filler's answer (A|filler - filler|filler); beside them the mood clause's own
+    tint (filler|filler - the scene caption). R4 per answer word X: a foreign question's delivery, the mean over the foreign
+    questions of (A|X - scene) over (X|X - scene), in X's direction, split by the question's mood. R5 per answer word X and
+    pooled: the neutral carrier, (filler|X - filler|filler) in X's direction under the rule, and its size over (X|X -
+    filler|filler)."""
+    import numpy as np
+    W, base, ff = swap_words(), np.array(scores["neutral"]), np.array(scores["filler_own"])
+
+    def sgn(w):
+        return 1 if swap_mood(w) == "up" else -1
+
+    r1_cells, r1_per = [], {}
+    for a in W:
+        u = np.mean([scores[f"swap_{a}_{x}"] for x in W if x != a and swap_mood(x) == "up"], axis=0)
+        d = np.mean([scores[f"swap_{a}_{x}"] for x in W if x != a and swap_mood(x) == "down"], axis=0)
+        r1_cells += list(u - d)
+        r1_per[a] = float(np.mean(u - d))
+    r1 = flavor_outcome(r1_cells, 1, label=SWAP_ANSWER)
+    own_axis = (np.mean([scores[f"own_{w}"] for w in W if swap_mood(w) == "up"], axis=0)
+                - np.mean([scores[f"own_{w}"] for w in W if swap_mood(w) == "down"], axis=0))
+    oa = float(np.mean(own_axis))
+    words, r5_cells, r5_num, r5_den = {}, [], [], []
+    for w in W:
+        s = sgn(w)
+        own = flavor_outcome(list(np.subtract(scores[f"own_{w}"], base)), s, label="THE WORD MOVES IT")
+        delivery = {}
+        for kind in ("same", "opposite"):
+            qs = [a for a in W if a != w and (swap_mood(a) == swap_mood(w)) == (kind == "same")]
+            num = float(np.mean([np.subtract(scores[f"swap_{a}_{w}"], base) for a in qs]))
+            delivery[kind] = num / own["mean"] if own["mean"] else None
+        carrier = list(np.subtract(scores[f"carrier_{w}"], ff))
+        r5_cells += [s * c for c in carrier]
+        r5_num.append(float(np.mean(carrier)))
+        r5_den.append(float(np.mean(np.subtract(scores[f"own_{w}"], ff))))
+        words[w] = {"mood": swap_mood(w), "own": own,
+                    "answer_adds": flavor_outcome(list(np.subtract(scores[f"own_{w}"], scores[f"filler_{w}"])), s,
+                                                  label="THE ANSWER ADDS"),
+                    "question_under_filler": flavor_outcome(list(np.subtract(scores[f"filler_{w}"], ff)), s,
+                                                            label="THE QUESTION ALONE MOVES IT"),
+                    "foreign_delivery": delivery,
+                    "carrier": flavor_outcome(carrier, s, label="THE CARRIER DELIVERS THE ANSWER"),
+                    "carrier_size": r5_num[-1] / r5_den[-1] if r5_den[-1] else None,
+                    "same_mood_swaps_minus_own": float(np.mean([np.subtract(scores[f"swap_{a}_{w}"], scores[f"own_{w}"])
+                                                                for a in W if a != w and swap_mood(a) == swap_mood(w)]))}
+    r5 = flavor_outcome(r5_cells, 1, label="THE CARRIER DELIVERS THE ANSWER")
+    signed_num = float(np.mean([sgn(w) * n for w, n in zip(W, r5_num)]))
+    signed_den = float(np.mean([sgn(w) * d for w, d in zip(W, r5_den)]))
+    return {"R1": r1, "R1_per_question": r1_per, "R2_size": r1["mean"] / oa if oa else None, "own_axis": oa,
+            "clause_tint": {**flavor_outcome(list(np.subtract(ff, base)), 0, label=""), "OUTCOME": "DESCRIPTIVE"},
+            "words": words, "R5": r5,
+            "R5_size": signed_num / signed_den if signed_den else None, "TEST": r1["OUTCOME"]}
+
+
+def word_swap_summary(reads: dict) -> str:
+    def f(v, spec):
+        return "n/a" if v is None else format(v, spec)
+    r1, r5 = reads["R1"], reads["R5"]
+    return (f"{reads['TEST']}: a word's own pieces with another word's reading, cheerful answers minus gloomy ones "
+            f"{r1['mean']:+.3f} +- {r1['se']:.3f} ({r1['frac_pos']:.0%} of cells), {f(reads['R2_size'], '.2f')} of the words' "
+            f"own axis; the neutral carrier: {r5['OUTCOME']} ({f(reads['R5_size'], '.2f')} of the answer's own effect)")
+
+
+def render_word_swap_readme(meta: dict, recipe: dict) -> str:
+    """e028's README: the question, the design and the rule fixed before the run, and the result when done."""
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    pieces = meta.get("pieces") or {}
+
+    def cut(w, side="t5"):
+        return " ".join(pieces.get(w, {}).get(side, [])) or "?"
+
+    mood = {"up": "cheerful", "down": "gloomy"}
+    rows = [f"| {w} | {mood[swap_mood(w)]} | {cut(w)} | {cut(w, 'qwen')} |" for w in swap_words()]
+    rows.append(f"| {SWAP_FILLER} | neutral (the filler) | {cut(SWAP_FILLER)} | {cut(SWAP_FILLER, 'qwen')} |")
+    n_sets = len(swap_sets())
+    n_scenes = SWAP_N_SCENES
+    out = [f"# {SWAP_TEST_ID}: {SWAP_TEST_TITLE}", "",
+           f"Date: 2026-10-04. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Question",
+           "The adapter's queries start from the caption's T5 token ids and look up Qwen3's states. Experiment e026 found that "
+           "a mood word the T5 vocabulary cuts into meaningless pieces gets its meaning only from Qwen3's states, looked up by "
+           "those pieces at the word's position. A read on the adapter's own output then put another word's Qwen3 states in "
+           "that position, under the first word's pieces: the pieces read the foreign states almost as fully as their own "
+           "(0.93 of the attention) and the foreign word's mood passed through to the adapter's output at full size. Does the "
+           "picture follow too: under the pieces of 'gleeful', does the reading of 'gloomy' make a gloomy picture? And does "
+           "a neutral word's pieces carry a mood word's reading into the picture (an added word's slot)?", "",
+           "## Design",
+           f"- One mood word after the scene, \"{WORD_TEMPLATE.replace(PREFIX, '').format(s='{scene}', w='{word}')}\" "
+           f"(after the model card's quality prefix; the negative prompt unchanged); e001's scenes [::{SWAP_SCENE_STEP}] at "
+           f"seed {SWAP_SEEDS[0]} ({n_scenes} scenes). Four words cut into pieces by T5, each two Qwen3 tokens, and a neutral "
+           "filler of the same two tokens, so every swap keeps every position (asserted per scene before any image):", "",
+           "| word | mood | T5 pieces | Qwen3 pieces |", "|---|---|---|---|", *rows, "",
+           "- A set = the T5 ids of one caption (the question) with the Qwen3 states of another (the answer): the scene "
+           "caption; the filler caption on both sides; each word's own caption; each word's pieces with every other word's "
+           "answer (cheerful and gloomy); each word's pieces with the filler's answer; the filler's pieces with each word's "
+           f"answer. {n_sets} sets x {n_scenes} scenes = {n_sets * n_scenes} images.", "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           "e001's rule on per-cell differences of the mood score: a set **moves it** when the mean goes the stated way, at "
+           "least 75% of the cells go that way and the mean is beyond 3 standard errors; **NO EFFECT** within 2 standard "
+           "errors of zero or under 60% that way; **MIXED** otherwise. "
+           f"**R1, the deciding read**: per cell (a word's pieces, a scene), the mean over its foreign cheerful answers minus "
+           f"the mean over its foreign gloomy answers (its own answer left out), read upward: **{SWAP_ANSWER}**, **NO "
+           "EFFECT** or **MIXED**; a MIXED result is extended to all 32 scenes before it is read. **R2**: R1's mean over the "
+           "words' own axis (the cheerful words' own captions minus the gloomy words', per scene). **R3**, per word in its "
+           "mood's direction: its own caption minus its pieces with the filler's answer (**THE ANSWER ADDS**), and its "
+           "pieces with the filler's answer minus the filler caption (the question alone); beside them the mood clause's "
+           "own tint (the filler caption minus the scene caption). **R4**, per answer word: a foreign question's delivery, "
+           "the mean over the foreign questions of (swap minus scene) over (own minus scene), split by the question's mood. "
+           "**R5**, the neutral carrier: per (answer word, scene), the filler's pieces with the word's answer minus the "
+           "filler caption, in the word's direction under the rule (**THE CARRIER DELIVERS THE ANSWER**), pooled over the "
+           "four words and per word, with its size over the word's own caption minus the filler caption.", "",
+           f"**Limits fixed in advance**: one seed; {n_scenes} scenes; two words per mood; 'elated' was not read in pictures "
+           "before; the filler is one word, and whether its lead T5 piece is a real word decides what kind of carrier it "
+           "is (see the pieces above).", "", ANIMA.judge_text, ""]
+    if meta.get("status") == "done":
+        r = meta["result"]
+        r1, r5, ct = r["R1"], r["R5"], r["clause_tint"]
+        size = "n/a" if r["R2_size"] is None else f"{r['R2_size']:.2f}"
+        out += ["## Result", meta.get("summary", ""), "",
+                "| read | effect (mean +- SE) | cells that way | verdict |", "|---|---|---|---|",
+                f"| R1: cheerful answers minus gloomy answers under foreign pieces | {r1['mean']:+.3f} +- {r1['se']:.3f} | "
+                f"{r1['frac_pos']:.0%} | **{r1['OUTCOME']}** |",
+                f"| R5: the filler's pieces with a mood word's answer | {r5['mean']:+.3f} +- {r5['se']:.3f} | "
+                f"{r5['frac_pos']:.0%} | **{r5['OUTCOME']}** |",
+                f"| the mood clause's own tint (filler caption minus scene caption) | {ct['mean']:+.3f} +- {ct['se']:.3f} | "
+                f"{ct['frac_pos']:.0%} upward | descriptive |", "",
+                f"R2: R1 is {size} of the words' own axis ({r['own_axis']:+.3f}). R5's size: "
+                f"{'n/a' if r['R5_size'] is None else format(r['R5_size'], '.2f')} of the answer's own effect.", "",
+                "| word | own caption (mean +- SE, verdict) | the answer adds | its pieces under the filler's answer | a "
+                "same-mood question delivers | an opposite-mood question delivers | the neutral carrier (size) |",
+                "|---|---|---|---|---|---|---|"]
+        for w, v in r["words"].items():
+            fd = v["foreign_delivery"]
+            out.append(f"| {w} | {v['own']['mean']:+.3f} +- {v['own']['se']:.3f} ({v['own']['OUTCOME']}) | "
+                       f"{v['answer_adds']['mean']:+.3f} ({v['answer_adds']['OUTCOME']}) | "
+                       f"{v['question_under_filler']['mean']:+.3f} ({v['question_under_filler']['OUTCOME']}) | "
+                       f"{'n/a' if fd['same'] is None else format(fd['same'], '.2f')} | "
+                       f"{'n/a' if fd['opposite'] is None else format(fd['opposite'], '.2f')} | "
+                       f"{v['carrier']['OUTCOME']} ({'n/a' if v['carrier_size'] is None else format(v['carrier_size'], '.2f')}) |")
+        out += ["", "| set | mood score | content kept |", "|---|---|---|"]
+        for k in swap_sets():
+            out.append(f"| {k} | {r['mood_score'][k]:+.3f} | {r['content_kept'][k]:.3f} |")
+        out += ["", "![the swaps](sheet_swap.jpg)", "",
+                "Rows: the scenes. Columns: " + ", ".join(r.get("sheet_columns", [])) + ".", ""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    else:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files", "- `result.json`: every cell's scores and the reads.", "- `sheet_swap.jpg`: the contact sheet.", ""]
+    return "\n".join(out)
+
+
 # ---- e013-e015: Beatrix as a second conditioning source (a learned push after the adapter) ------------------------
 @dataclass(frozen=True)
 class ConnectorArm:
