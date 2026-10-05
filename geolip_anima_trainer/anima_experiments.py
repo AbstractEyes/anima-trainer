@@ -1255,53 +1255,89 @@ def render_word_swap_readme(meta: dict, recipe: dict) -> str:
 # Beatrix's states for a phrase, mapped into Qwen3's space by a ridge regression, written over Qwen3's states at every token of the
 # phrase at one depth; the adapter's T5 queries unchanged. The adapter-level grid picks the map and the depth; pictures confirm.
 RELAY_TEST_ID = "e029_anima_relay_in_pictures"
-RELAY_TEMPLATE = PREFIX + "an illustration of {s}, {p}."   # the relay grid's caption form (no ' mood': not e026's template)
+RELAY_FORMS = {"bare": PREFIX + "an illustration of {s}, {p}.",       # the relay grid's caption form (never read in pictures)
+               "mood": PREFIX + "an illustration of {s}, {p} mood."}  # e026-e028's form: the fallback when the bare form's ceiling fails
+RELAY_TEMPLATE = RELAY_FORMS["bare"]
 RELAY_SCENE_STEP = 4                                      # e001's scenes [::4]: the eight contact-sheet rows
 RELAY_ANSWER = "THE RELAY CARRIES THE MOOD"
+RELAY_CAPTION = "THE CAPTION CARRIES THE MOOD"
+RELAY_CONTROL = "HER RELAY BEATS THE UNTRAINED ONE"
+RELAY_PILOT_PER_MOOD = 2                                  # stage A: the first two single words of each mood, in the record order
 
 
-def relay_prompt(p: str, scene: str) -> str:
-    return RELAY_TEMPLATE.format(s=scene, p=p)
+def relay_prompt(p: str, scene: str, form: str = "bare") -> str:
+    return RELAY_FORMS[form].format(s=scene, p=p)
 
 
-def relay_sets(phrases: list) -> dict:
+def relay_sets(phrases: list, control: bool = True) -> dict:
     """e029's image sets per phrase (dicts: text, mood 'up' / 'down', filler = the neutral phrase of the same Qwen3 token count):
-    {key: (the phrase whose caption gives Qwen3's states, the phrase whose caption gives the T5 ids, relayed)}. ceiling = the
-    phrase's caption on both sides; relay = the same, with the relayed states written over Qwen3's at the phrase's tokens at the
-    chosen depth; filler = the phrase's T5 ids with the filler caption's Qwen3 states (the answer absent)."""
+    {key: (the phrase whose caption gives Qwen3's states, the phrase whose caption gives the T5 ids, the relay written over
+    Qwen3's states at the phrase's tokens: None, 'her' or 'untrained')}. ceiling = the phrase's caption on both sides; relay = the
+    same with her relayed states at the chosen depth; control = the same with an untrained trunk's states through the same cell;
+    filler = the phrase's T5 ids with the filler caption's Qwen3 states (the answer absent)."""
     out: dict = {}
     for p in phrases:
         t = p["text"]
-        out[f"ceiling|{t}"] = (t, t, False)
-        out[f"relay|{t}"] = (t, t, True)
-        out[f"filler|{t}"] = (p["filler"], t, False)
+        out[f"ceiling|{t}"] = (t, t, None)
+        out[f"relay|{t}"] = (t, t, "her")
+        if control:
+            out[f"control|{t}"] = (t, t, "untrained")
+        out[f"filler|{t}"] = (p["filler"], t, None)
     return out
+
+
+def relay_pilot_words(phrases: list) -> list:
+    """Stage A's words: the first RELAY_PILOT_PER_MOOD single words (no space) of each mood, in the order given (the record list)."""
+    return [p for m in ("up", "down") for p in [q for q in phrases if q["mood"] == m and " " not in q["text"]][:RELAY_PILOT_PER_MOOD]]
+
+
+def relay_pilot_sets(words: list) -> dict:
+    """Stage A (the bare form's ceiling pilot): ceiling and filler for each pilot word, in relay_sets' key form (stage B reuses them)."""
+    return {k: v for k, v in relay_sets(words, control=False).items() if not k.startswith("relay|")}
+
+
+def relay_pilot_read(scores: dict, words: list) -> dict:
+    """Stage A's read: per (word, scene) the ceiling minus the filler in the word's mood direction under e001's rule, pooled over the
+    cells: THE CAPTION CARRIES THE MOOD -> stage B in the same form; anything else -> the confirmation moves to the 'mood' form."""
+    import numpy as np
+    cells = []
+    for p in words:
+        s = 1 if p["mood"] == "up" else -1
+        cells += [s * x for x in np.subtract(scores[f"ceiling|{p['text']}"], scores[f"filler|{p['text']}"])]
+    r = flavor_outcome(cells, 1, label=RELAY_CAPTION)
+    return {"ceiling": r, "form_next": "bare" if r["OUTCOME"] == RELAY_CAPTION else "mood"}
 
 
 def relay_reads(scores: dict, phrases: list) -> dict:
     """The read fixed before any image, from mood scores {set key: [score per scene]}: per (phrase, scene) the relay minus the
     filler in the phrase's mood direction under e001's rule (THE RELAY CARRIES THE MOOD), pooled over all phrases and per mood;
     beside it the ceiling minus the filler under the same rule (the caption's own answer); the size = the mean signed relay effect
-    over the mean signed ceiling effect, pooled, per mood and per phrase."""
+    over the mean signed ceiling effect, pooled, per mood and per phrase; with the control set, her relay minus the untrained relay
+    in the phrase's mood direction under the same rule (HER RELAY BEATS THE UNTRAINED ONE)."""
     import numpy as np
+    has_control = all(f"control|{p['text']}" in scores for p in phrases)
 
     def block(ps):
-        rel, cei, num, den = [], [], [], []
+        rel, cei, ctl, num, den = [], [], [], [], []
         for p in ps:
             s = 1 if p["mood"] == "up" else -1
             f = np.array(scores[f"filler|{p['text']}"])
             r, c = np.subtract(scores[f"relay|{p['text']}"], f), np.subtract(scores[f"ceiling|{p['text']}"], f)
             rel += [s * x for x in r]
             cei += [s * x for x in c]
+            if has_control:
+                ctl += [s * x for x in np.subtract(scores[f"relay|{p['text']}"], scores[f"control|{p['text']}"])]
             num.append(s * float(np.mean(r)))
             den.append(s * float(np.mean(c)))
         sd = float(np.mean(den))
-        return {"relay": flavor_outcome(rel, 1, label=RELAY_ANSWER),
-                "ceiling": flavor_outcome(cei, 1, label="THE CAPTION CARRIES THE MOOD"),
-                "size": float(np.mean(num)) / sd if sd else None}
+        out_b = {"relay": flavor_outcome(rel, 1, label=RELAY_ANSWER), "ceiling": flavor_outcome(cei, 1, label=RELAY_CAPTION),
+                 "size": float(np.mean(num)) / sd if sd else None}
+        if has_control:
+            out_b["over_control"] = flavor_outcome(ctl, 1, label=RELAY_CONTROL)
+        return out_b
 
     out = {"all": block(phrases), "by_mood": {m: block([p for p in phrases if p["mood"] == m]) for m in ("up", "down")},
-           "phrases": {p["text"]: block([p]) for p in phrases}}
+           "phrases": {p["text"]: block([p]) for p in phrases}, "control": has_control}
     out["TEST"] = out["all"]["relay"]["OUTCOME"]
     return out
 

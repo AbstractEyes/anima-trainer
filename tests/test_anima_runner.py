@@ -1129,27 +1129,57 @@ def test_relay_reads_score_the_relay_against_the_ceiling():
     phrases = [{"text": "elated", "mood": "up", "filler": "workaday"}, {"text": "dismal", "mood": "down", "filler": "neutral"},
                {"text": "giddy", "mood": "up", "filler": "workaday"}]
     sets = ax.relay_sets(phrases)
-    assert len(sets) == 9 and sets["filler|dismal"] == ("neutral", "dismal", False)
-    assert sets["relay|elated"] == ("elated", "elated", True) and sets["ceiling|giddy"] == ("giddy", "giddy", False)
+    assert len(sets) == 12 and sets["filler|dismal"] == ("neutral", "dismal", None)
+    assert sets["relay|elated"] == ("elated", "elated", "her") and sets["control|giddy"] == ("giddy", "giddy", "untrained")
+    assert sets["ceiling|giddy"] == ("giddy", "giddy", None) and len(ax.relay_sets(phrases, control=False)) == 9
     assert ax.relay_prompt("dismal", "a cat") == ax.PREFIX + "an illustration of a cat, dismal."
+    assert ax.relay_prompt("dismal", "a cat", "mood") == ax.PREFIX + "an illustration of a cat, dismal mood."
     scores = {}
     for p in phrases:
         s = 1 if p["mood"] == "up" else -1
         base = [0.1 * i for i in range(8)]
         scores[f"filler|{p['text']}"] = base
         scores[f"ceiling|{p['text']}"] = [b + s * (2.0 + 0.05 * (i % 3)) for i, b in enumerate(base)]
+        scores[f"control|{p['text']}"] = [b + s * 0.2 for b in base]            # the untrained relay: a little of the mood
         if p["text"] == "giddy":
             scores[f"relay|{p['text']}"] = [b + (0.05 if i % 2 else -0.05) for i, b in enumerate(base)]
         else:
             scores[f"relay|{p['text']}"] = [b + s * (1.0 + 0.05 * (i % 2)) for i, b in enumerate(base)]
     r = ax.relay_reads(scores, phrases)
     ceil = 2.0 + 0.05 * 7 / 8                             # the ceiling's mean signed effect per phrase (i % 3 sums to 7 over 0..7)
-    assert r["TEST"] == ax.RELAY_ANSWER and r["all"]["ceiling"]["OUTCOME"] == "THE CAPTION CARRIES THE MOOD"
+    assert r["TEST"] == ax.RELAY_ANSWER and r["all"]["ceiling"]["OUTCOME"] == ax.RELAY_CAPTION and r["control"]
     assert r["all"]["size"] == pytest.approx((1.025 + 1.025 + 0.0) / 3 / ceil, abs=1e-6)
     assert r["by_mood"]["down"]["size"] == pytest.approx(1.025 / ceil, abs=1e-6)
     assert r["by_mood"]["up"]["size"] == pytest.approx(1.025 / 2 / ceil, abs=1e-6)
     assert r["phrases"]["giddy"]["relay"]["OUTCOME"] == "NO EFFECT"
     assert r["phrases"]["dismal"]["relay"]["OUTCOME"] == ax.RELAY_ANSWER
+    assert r["phrases"]["dismal"]["over_control"]["OUTCOME"] == ax.RELAY_CONTROL                      # 1.025 vs 0.2
+    assert r["phrases"]["giddy"]["over_control"]["mean"] == pytest.approx(-0.2, abs=1e-6)          # the flat relay under it
+    no_ctl = {k: v for k, v in scores.items() if not k.startswith("control|")}
+    assert not ax.relay_reads(no_ctl, phrases)["control"] and "over_control" not in ax.relay_reads(no_ctl, phrases)["all"]
+
+
+def test_relay_pilot_picks_the_first_single_words_and_reads_the_ceiling():
+    """e029's stage A: the first two single words of each mood in the record order (phrases with a space skipped); ceiling and
+    filler only; a ceiling 1.5 over its filler reads THE CAPTION CARRIES THE MOOD (stage B stays in the bare form), a flat one
+    sends the confirmation to the 'mood' form."""
+    rec = [{"text": "elated", "mood": "up", "filler": "workaday"}, {"text": "jubilant and gleeful", "mood": "up", "filler": "x"},
+           {"text": "forlorn and desolate", "mood": "down", "filler": "x"}, {"text": "dismal", "mood": "down", "filler": "neutral"},
+           {"text": "blithe", "mood": "up", "filler": "workaday"}, {"text": "jaunty", "mood": "up", "filler": "nondescript"},
+           {"text": "despondent", "mood": "down", "filler": "nondescript"}, {"text": "dejected", "mood": "down", "filler": "workaday"}]
+    words = ax.relay_pilot_words(rec)
+    assert [w["text"] for w in words] == ["elated", "blithe", "dismal", "despondent"]
+    sets = ax.relay_pilot_sets(words)
+    assert sorted(sets) == sorted(f"{k}|{w['text']}" for w in words for k in ("ceiling", "filler"))
+    good, flat = {}, {}
+    for w in words:
+        s = 1 if w["mood"] == "up" else -1
+        good[f"filler|{w['text']}"] = flat[f"filler|{w['text']}"] = [0.1 * i for i in range(8)]
+        good[f"ceiling|{w['text']}"] = [0.1 * i + s * (1.5 + 0.1 * (i % 2)) for i in range(8)]
+        flat[f"ceiling|{w['text']}"] = [0.1 * i + (0.05 if i % 2 else -0.05) for i in range(8)]
+    g, f = ax.relay_pilot_read(good, words), ax.relay_pilot_read(flat, words)
+    assert g["ceiling"]["OUTCOME"] == ax.RELAY_CAPTION and g["form_next"] == "bare"
+    assert f["ceiling"]["OUTCOME"] == "NO EFFECT" and f["form_next"] == "mood"
 
 
 def test_swap_aligned_needs_the_same_qwen_positions(runner):
