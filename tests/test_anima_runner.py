@@ -1182,16 +1182,22 @@ def test_relay_pilot_picks_the_first_single_words_and_reads_the_ceiling():
     assert f["ceiling"]["OUTCOME"] == "NO EFFECT" and f["form_next"] == "mood"
 
 
-def _relay_fakes(s, pipe, monkeypatch, relay_frac=0.5, control_frac=0.1):
+def _relay_fakes(s, pipe, monkeypatch, relay_frac=0.5, control_frac=0.1, bare_carries=True):
     """e029's fakes: a word-per-token tokenizer; every caption's fake fp32 states are its phrase's mood (+1 / -1; a filler 0)
     on every token, the usual bf16 encoding the same values; a picture's grey level follows the mean of the states it is
-    given (or its caption's mood); the export's relay arms carry relay_frac and control_frac of the mood."""
+    given (or its caption's mood); the export's relay arms carry relay_frac and control_frac of the mood. bare_carries=False:
+    the bare form's captions carry no mood (only the '..., {phrase} mood.' form does)."""
     from types import SimpleNamespace
     from PIL import Image
     moods = {p["text"]: (1.0 if p["mood"] == "up" else -1.0) for p in ax.RELAY_PHRASES}
 
     def mood_of(caption):
-        return next((m for t, m in moods.items() if caption.endswith(f", {t}.")), 0.0)
+        for t, m in moods.items():
+            if caption.endswith(f", {t}."):
+                return m if bare_carries else 0.0
+            if caption.endswith(f", {t} mood."):
+                return m
+        return 0.0
 
     def ids(text):
         return [sum(map(ord, w)) % 997 for w in text.split()]
@@ -1223,21 +1229,22 @@ def _relay_fakes(s, pipe, monkeypatch, relay_frac=0.5, control_frac=0.1):
     return moods, ids, rendered
 
 
-def _relay_export(path, moods, ids, relay_frac=0.5, control_frac=0.1, perturb=0.0, bad_id=False):
-    """A synthetic export file in the grid's format: e029's 128 captions, the arms' fake final states, the header."""
+def _relay_export(path, moods, ids, relay_frac=0.5, control_frac=0.1, perturb=0.0, bad_id=False, form="bare"):
+    """A synthetic export file in the grid's format: e029's 128 captions in the given caption form, the arms' fake final
+    states, the header."""
     from safetensors.torch import save_file
     rows, caps = [], []
     for p in ax.RELAY_PHRASES:
         for si in range(0, len(sr.SUBJECTS), ax.RELAY_SCENE_STEP):
             rows.append((p, si))
-    L = max(len(ids(ax.relay_prompt(p["text"], sr.SUBJECTS[si]))) for p, si in rows)
+    L = max(len(ids(ax.relay_prompt(p["text"], sr.SUBJECTS[si], form))) for p, si in rows)
     n = len(rows)
     T = {"lengths": torch.zeros(n, dtype=torch.long), "qwen_ids": torch.zeros(n, L, dtype=torch.long),
          "filler_qwen_ids": torch.zeros(n, L, dtype=torch.long)}
     for arm in ("ceiling", "filler", "relay", "control"):
         T[f"states.{arm}"] = torch.zeros(n, L, 4)
     for r, (p, si) in enumerate(rows):
-        cap, fcap = ax.relay_prompt(p["text"], sr.SUBJECTS[si]), ax.relay_prompt(p["filler"], sr.SUBJECTS[si])
+        cap, fcap = ax.relay_prompt(p["text"], sr.SUBJECTS[si], form), ax.relay_prompt(p["filler"], sr.SUBJECTS[si], form)
         q, fq, m = ids(cap), ids(fcap), moods[p["text"]]
         T["lengths"][r] = len(q)
         T["qwen_ids"][r, :len(q)] = torch.tensor(q)
@@ -1249,9 +1256,10 @@ def _relay_export(path, moods, ids, relay_frac=0.5, control_frac=0.1, perturb=0.
                      "filler": p["filler"], "filler_text": fcap, "length": len(q), "t5_ids": ids(cap) + [1]})
     if bad_id:
         T["qwen_ids"][5, 0] += 1
-    header = {"form": "bare: the grid's own captions", "pick": "record|step|b16|close|k4", "companion": None,
+    status = "verified" if form == "bare" else "verified (the map, in the bare form); the mood form has no grid to check against"
+    header = {"form": f"{form}: the captions", "pick": "record|step|b16|close|k4", "companion": None,
               "precision": "fp32", "arms": {"ceiling": {"unpatched": "the caption"}, "filler": {"unpatched": "the filler"},
-                                            "relay": {"grid": "verified"}, "control": {"grid": "verified"}},
+                                            "relay": {"grid": status}, "control": {"grid": status}},
               "phrases": [{"text": p["text"], "mood": p["mood"]} for p in ax.RELAY_PHRASES], "captions": caps}
     save_file(T, str(path), metadata={"header": json.dumps(header)})
     return path
@@ -1294,6 +1302,29 @@ def test_relay_runs_stage_a_then_stage_b_from_an_export(runner, monkeypatch, tmp
     import re
     for word in (r"S-1", r"\bPhil\b", r"docket", r"canon/", r"Fable", r"pod\b"):
         assert not re.search(word, readme), word
+
+
+def test_relay_moves_to_the_mood_form_when_the_bare_ceiling_fails(runner, monkeypatch, tmp_path):
+    """When the bare caption's own ceiling does not carry the mood, stage B runs in the '..., {phrase} mood.' form: a bare-form
+    export is refused; a mood-form export (its maps verified in the bare form) is read with every set rendered in the mood form
+    (nothing reused from stage A), the relay at its known half size and above the untrained trunk."""
+    s, repo, pipe, _ = runner
+    moods, ids, rendered = _relay_fakes(s, pipe, monkeypatch, bare_carries=False)
+    a = s.run_relay(stage="A")
+    assert a["stage_a"]["read"]["ceiling"]["OUTCOME"] == "NO EFFECT" and a["stage_a"]["read"]["form_next"] == "mood"
+    n_a = len(rendered)
+    with pytest.raises(ValueError, match="sent stage B to the 'mood' form"):
+        s.run_relay(stage="B", export_path=str(_relay_export(tmp_path / "bare.safetensors", moods, ids)))
+    assert len(rendered) == n_a
+    b = s.run_relay(stage="B", export_path=str(_relay_export(tmp_path / "mood.safetensors", moods, ids, form="mood")))
+    r = b["result"]["reads"]
+    assert b["status"] == "done" and b["result"]["form"] == "mood" and r["TEST"] == ax.RELAY_ANSWER
+    assert r["all"]["size"] == pytest.approx(0.5, abs=0.05) and r["all"]["over_control"]["OUTCOME"] == ax.RELAY_CONTROL
+    stage_b = rendered[n_a:]
+    assert len(stage_b) == 16 * 4 * 8 + 3 + 1                 # every set in the mood form, the identity checks' three, the export's
+    assert all(c.endswith(" mood.") for c in stage_b)
+    readme = repo.files_[f"experiments/{ax.RELAY_TEST_ID}/README.md"].decode()
+    assert "stage B runs in the **mood** form" in readme
 
 
 def test_relay_stage_b_refuses_a_mismatched_export(runner, monkeypatch, tmp_path):

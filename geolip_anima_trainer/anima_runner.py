@@ -1344,10 +1344,11 @@ class AnimaRunner(_sr.SanaRunner):
     # ---- e029: a relayed phrase reading in pictures -------------------------------------------------------------------
     def run_relay(self, *, stage: str = "A", export_path: "str | None" = None, force: bool = False) -> dict:
         """e029 into its own folder of cfg.repo_id, in its two stages. stage='A': the bare caption form's ceiling pilot (the
-        first two single words of each mood, ceiling and filler; 64 images; no outside input). stage='B' (after A): the
-        remaining sets, the relay arms' final Qwen3 states read from export_path (a safetensors file with its header, made
-        where the maps were fitted), the ceiling and filler arms at this runner's fp32 encoding like stage A's, whose images
-        are reused. force=True reruns a stage."""
+        first two single words of each mood, ceiling and filler; 64 images; no outside input). stage='B' (after A), in the
+        caption form stage A's read chose (the bare form, or the 'mood' form when the bare caption's own ceiling did not
+        carry the mood): the relay arms' final Qwen3 states read from export_path (a safetensors file with its header, made
+        where the maps were fitted, in that form), the ceiling and filler arms at this runner's fp32 encoding like stage A's;
+        in the bare form stage A's images are reused, in the mood form every set is rendered. force=True reruns a stage."""
         self._need_model()
         _drop_torchao()
         repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
@@ -1522,8 +1523,8 @@ class AnimaRunner(_sr.SanaRunner):
         if not H["form"].startswith(form):
             raise ValueError(f"stage A sent stage B to the {form!r} form; the export is {H['form'][:40]!r}")
         arms = H["arms"]
-        for a in ("relay", "companion"):
-            if a in arms and arms[a].get("grid") != "verified":
+        for a in ("relay", "companion"):                   # the mood form's maps are verified in the bare form (no grid of its own)
+            if a in arms and not str(arms[a].get("grid", "")).startswith("verified"):
                 raise RuntimeError(f"the export's {a} arm is not verified against its grid: {arms[a].get('grid')}")
         if [(p["text"], p["mood"]) for p in H["phrases"]] != [(p["text"], p["mood"]) for p in ax.RELAY_PHRASES]:
             raise ValueError("the export's phrases are not e029's")
@@ -1532,7 +1533,7 @@ class AnimaRunner(_sr.SanaRunner):
         L = T["lengths"]
         fill = {p["text"]: p["filler"] for p in ax.RELAY_PHRASES}
         texts = {x for p in ax.RELAY_PHRASES for x in (p["text"], p["filler"])}
-        P = {t: [ax.relay_prompt(t, SUBJECTS[si]) for si, _ in cells] for t in texts}
+        P = {t: [ax.relay_prompt(t, SUBJECTS[si], form) for si, _ in cells] for t in texts}
         bad = []                                          # every caption, its filler and their ids against the export
         for p in ax.RELAY_PHRASES:
             t = p["text"]
@@ -1572,7 +1573,7 @@ class AnimaRunner(_sr.SanaRunner):
               f"{identity['export_vs_fp32_picture']['mean']:.2f} mean absolute pixel difference, against its usual one "
               f"{identity['export_vs_own_pixel_mean']:.2f}", flush=True)
         sets = ax.relay_sets(list(ax.RELAY_PHRASES), control="control" in arms, companion="companion" in arms)
-        reuse = {k: v for k, v in stage_a["scores"].items() if k in sets}
+        reuse = {k: v for k, v in stage_a["scores"].items() if k in sets} if form == "bare" else {}   # stage A's are bare-form
         need = sorted({p for k, (q, _, r) in sets.items() if r is None and k not in reuse for p in P[q]})
         enc = dict(zip(need, pipe.encode_fp32(need)))
         arm_of = {"her": "relay", "companion": "companion", "untrained": "control"}

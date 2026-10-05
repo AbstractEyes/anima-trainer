@@ -1441,7 +1441,8 @@ def render_relay_readme(meta: dict, recipe: dict) -> str:
            "bf16 encoding and the fp32 one is measured and quoted. Every token id is checked against the supplied file.",
            f"- **Stage A** (64 images): the first two single words of each mood ({', '.join(p['text'] for p in pilot)}) x "
            "{ceiling, filler} x the scenes. **Stage B**: the remaining sets, 384 images in all with stage A's 64 (reused), "
-           "512 with the control, 640 with the companion.", "",
+           "512 with the control, 640 with the companion; in the 'mood' form every set is rendered in that form (384 / 512 / "
+           "640 new images; stage A's 64 stay its own read).", "",
            "## Recipe", "| setting | value |", "|---|---|", rec, "",
            "## The rule (fixed before the run)",
            "e001's rule on per-cell differences of the mood score: a set **moves it** when the mean goes the stated way, at "
@@ -1449,7 +1450,7 @@ def render_relay_readme(meta: dict, recipe: dict) -> str:
            "errors of zero or under 60% that way; **MIXED** otherwise. Stage A: per (word, scene) the ceiling minus the "
            f"filler in the word's mood direction, pooled over its 32 cells: **{RELAY_CAPTION}** -> stage B in this form; "
            "otherwise stage B moves to the form \"..., {phrase} mood.\" with Beatrix's states taken on those captions "
-           f"through the same map. Stage B, deciding: per (phrase, scene) the relay minus the filler in the phrase's mood "
+           f"through the same map (fitted and checked in the bare form; the grid has no 'mood' form). Stage B, deciding: per (phrase, scene) the relay minus the filler in the phrase's mood "
            f"direction, pooled over all 16 phrases: **{RELAY_ANSWER}**, **NO EFFECT** or **MIXED**; beside it the ceiling "
            "minus the filler (the caption's own answer) and the size (the mean signed relay effect over the mean signed "
            f"ceiling effect), pooled, per mood and per phrase; the relay minus the control under the same rule (**"
