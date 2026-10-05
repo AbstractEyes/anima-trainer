@@ -1037,6 +1037,10 @@ SWAP_TEST_TITLE = ("The stock model: a mood word cut into pieces, read with anot
                    "picture follow the answer's mood?")
 SWAP_WORDS = {"up": ("gleeful", "elated"), "down": ("gloomy", "melancholy")}   # cut into pieces by T5, two Qwen3 tokens each
 SWAP_FILLER = "workaday"                 # a neutral word of the same two Qwen3 tokens: the answer absent, or a neutral carrier
+SWAP_FRAGMENT = "quotidian"              # a second neutral carrier whose T5 pieces are all fragments (▁ quot i dian; two
+#                                          Qwen3 tokens): 'workaday' opens with a real word (▁work), so it is a morpheme-type
+#                                          carrier; picked before any image as the first qualifying word of mundane, quotidian,
+#                                          middling, tepid, staid, prosaic, bland (mundane is one Qwen3 token)
 SWAP_SCENE_STEP = 4                      # e001's scenes [::4]: the eight contact-sheet rows
 SWAP_N_SCENES = 8                        # len(e001's 32 scenes [::4]); the runner asserts it
 SWAP_SEEDS = WORD_SEEDS                  # e026's seed
@@ -1060,6 +1064,8 @@ def swap_sets() -> dict:
     out.update({f"swap_{a}_{x}": (x, a) for a in W for x in W if x != a})
     out.update({f"filler_{a}": (F, a) for a in W})
     out.update({f"carrier_{x}": (x, F) for x in W})
+    out["fragment_own"] = (SWAP_FRAGMENT, SWAP_FRAGMENT)
+    out.update({f"fcarrier_{x}": (x, SWAP_FRAGMENT) for x in W})
     return out
 
 
@@ -1089,7 +1095,24 @@ def word_swap_reads(scores: dict) -> dict:
     own_axis = (np.mean([scores[f"own_{w}"] for w in W if swap_mood(w) == "up"], axis=0)
                 - np.mean([scores[f"own_{w}"] for w in W if swap_mood(w) == "down"], axis=0))
     oa = float(np.mean(own_axis))
-    words, r5_cells, r5_num, r5_den = {}, [], [], []
+
+    def carrier_read(own_key: str, prefix: str):
+        """R5's form for one carrier: per (answer X, scene) (carrier|X - carrier|carrier) in X's direction, pooled and per
+        word under the rule; the size = the mean signed numerator over the mean signed (X|X - carrier|carrier)."""
+        cc = np.array(scores[own_key])
+        cells, num, den, per = [], [], [], {}
+        for w in W:
+            c = list(np.subtract(scores[f"{prefix}_{w}"], cc))
+            cells += [sgn(w) * x for x in c]
+            num.append(sgn(w) * float(np.mean(c)))
+            den.append(sgn(w) * float(np.mean(np.subtract(scores[f"own_{w}"], cc))))
+            per[w] = (flavor_outcome(c, sgn(w), label="THE CARRIER DELIVERS THE ANSWER"), num[-1] / den[-1] if den[-1] else None)
+        sd = float(np.mean(den))
+        return flavor_outcome(cells, 1, label="THE CARRIER DELIVERS THE ANSWER"), (float(np.mean(num)) / sd if sd else None), per
+
+    r5, r5_size, r5_per = carrier_read("filler_own", "carrier")
+    r5f, r5f_size, r5f_per = carrier_read("fragment_own", "fcarrier")
+    words = {}
     for w in W:
         s = sgn(w)
         own = flavor_outcome(list(np.subtract(scores[f"own_{w}"], base)), s, label="THE WORD MOVES IT")
@@ -1098,36 +1121,29 @@ def word_swap_reads(scores: dict) -> dict:
             qs = [a for a in W if a != w and (swap_mood(a) == swap_mood(w)) == (kind == "same")]
             num = float(np.mean([np.subtract(scores[f"swap_{a}_{w}"], base) for a in qs]))
             delivery[kind] = num / own["mean"] if own["mean"] else None
-        carrier = list(np.subtract(scores[f"carrier_{w}"], ff))
-        r5_cells += [s * c for c in carrier]
-        r5_num.append(float(np.mean(carrier)))
-        r5_den.append(float(np.mean(np.subtract(scores[f"own_{w}"], ff))))
         words[w] = {"mood": swap_mood(w), "own": own,
                     "answer_adds": flavor_outcome(list(np.subtract(scores[f"own_{w}"], scores[f"filler_{w}"])), s,
                                                   label="THE ANSWER ADDS"),
                     "question_under_filler": flavor_outcome(list(np.subtract(scores[f"filler_{w}"], ff)), s,
                                                             label="THE QUESTION ALONE MOVES IT"),
                     "foreign_delivery": delivery,
-                    "carrier": flavor_outcome(carrier, s, label="THE CARRIER DELIVERS THE ANSWER"),
-                    "carrier_size": r5_num[-1] / r5_den[-1] if r5_den[-1] else None,
+                    "carrier": r5_per[w][0], "carrier_size": r5_per[w][1],
+                    "fcarrier": r5f_per[w][0], "fcarrier_size": r5f_per[w][1],
                     "same_mood_swaps_minus_own": float(np.mean([np.subtract(scores[f"swap_{a}_{w}"], scores[f"own_{w}"])
                                                                 for a in W if a != w and swap_mood(a) == swap_mood(w)]))}
-    r5 = flavor_outcome(r5_cells, 1, label="THE CARRIER DELIVERS THE ANSWER")
-    signed_num = float(np.mean([sgn(w) * n for w, n in zip(W, r5_num)]))
-    signed_den = float(np.mean([sgn(w) * d for w, d in zip(W, r5_den)]))
     return {"R1": r1, "R1_per_question": r1_per, "R2_size": r1["mean"] / oa if oa else None, "own_axis": oa,
             "clause_tint": {**flavor_outcome(list(np.subtract(ff, base)), 0, label=""), "OUTCOME": "DESCRIPTIVE"},
-            "words": words, "R5": r5,
-            "R5_size": signed_num / signed_den if signed_den else None, "TEST": r1["OUTCOME"]}
+            "words": words, "R5": r5, "R5_size": r5_size, "R5F": r5f, "R5F_size": r5f_size, "TEST": r1["OUTCOME"]}
 
 
 def word_swap_summary(reads: dict) -> str:
     def f(v, spec):
         return "n/a" if v is None else format(v, spec)
-    r1, r5 = reads["R1"], reads["R5"]
+    r1, r5, r5f = reads["R1"], reads["R5"], reads["R5F"]
     return (f"{reads['TEST']}: a word's own pieces with another word's reading, cheerful answers minus gloomy ones "
             f"{r1['mean']:+.3f} +- {r1['se']:.3f} ({r1['frac_pos']:.0%} of cells), {f(reads['R2_size'], '.2f')} of the words' "
-            f"own axis; the neutral carrier: {r5['OUTCOME']} ({f(reads['R5_size'], '.2f')} of the answer's own effect)")
+            f"own axis; the neutral carriers: '{SWAP_FILLER}' {r5['OUTCOME']} ({f(reads['R5_size'], '.2f')} of the answer's "
+            f"own effect), '{SWAP_FRAGMENT}' {r5f['OUTCOME']} ({f(reads['R5F_size'], '.2f')})")
 
 
 def render_word_swap_readme(meta: dict, recipe: dict) -> str:
@@ -1140,7 +1156,10 @@ def render_word_swap_readme(meta: dict, recipe: dict) -> str:
 
     mood = {"up": "cheerful", "down": "gloomy"}
     rows = [f"| {w} | {mood[swap_mood(w)]} | {cut(w)} | {cut(w, 'qwen')} |" for w in swap_words()]
-    rows.append(f"| {SWAP_FILLER} | neutral (the filler) | {cut(SWAP_FILLER)} | {cut(SWAP_FILLER, 'qwen')} |")
+    rows.append(f"| {SWAP_FILLER} | neutral (the filler; a carrier whose lead piece is a real word) | {cut(SWAP_FILLER)} | "
+                f"{cut(SWAP_FILLER, 'qwen')} |")
+    rows.append(f"| {SWAP_FRAGMENT} | neutral (a carrier of fragments only) | {cut(SWAP_FRAGMENT)} | "
+                f"{cut(SWAP_FRAGMENT, 'qwen')} |")
     n_sets = len(swap_sets())
     n_scenes = SWAP_N_SCENES
     out = [f"# {SWAP_TEST_ID}: {SWAP_TEST_TITLE}", "",
@@ -1156,13 +1175,17 @@ def render_word_swap_readme(meta: dict, recipe: dict) -> str:
            "## Design",
            f"- One mood word after the scene, \"{WORD_TEMPLATE.replace(PREFIX, '').format(s='{scene}', w='{word}')}\" "
            f"(after the model card's quality prefix; the negative prompt unchanged); e001's scenes [::{SWAP_SCENE_STEP}] at "
-           f"seed {SWAP_SEEDS[0]} ({n_scenes} scenes). Four words cut into pieces by T5, each two Qwen3 tokens, and a neutral "
-           "filler of the same two tokens, so every swap keeps every position (asserted per scene before any image):", "",
+           f"seed {SWAP_SEEDS[0]} ({n_scenes} scenes). Four words cut into pieces by T5, each two Qwen3 tokens, and two "
+           "neutral words of the same two tokens, so every swap keeps every position (asserted per scene before any image): "
+           f"'{SWAP_FILLER}', the filler, whose lead T5 piece is a real word, and '{SWAP_FRAGMENT}', whose T5 pieces are all "
+           "fragments (chosen before any image as the first word of a fixed list that is two Qwen3 tokens with no "
+           "meaningful T5 piece):", "",
            "| word | mood | T5 pieces | Qwen3 pieces |", "|---|---|---|---|", *rows, "",
            "- A set = the T5 ids of one caption (the question) with the Qwen3 states of another (the answer): the scene "
            "caption; the filler caption on both sides; each word's own caption; each word's pieces with every other word's "
            "answer (cheerful and gloomy); each word's pieces with the filler's answer; the filler's pieces with each word's "
-           f"answer. {n_sets} sets x {n_scenes} scenes = {n_sets * n_scenes} images.", "",
+           f"answer; '{SWAP_FRAGMENT}' on both sides, and its pieces with each word's answer. {n_sets} sets x {n_scenes} "
+           f"scenes = {n_sets * n_scenes} images.", "",
            "## Recipe", "| setting | value |", "|---|---|", rec, "",
            "## The rule (fixed before the run)",
            "e001's rule on per-cell differences of the mood score: a set **moves it** when the mean goes the stated way, at "
@@ -1178,35 +1201,43 @@ def render_word_swap_readme(meta: dict, recipe: dict) -> str:
            "the mean over the foreign questions of (swap minus scene) over (own minus scene), split by the question's mood. "
            "**R5**, the neutral carrier: per (answer word, scene), the filler's pieces with the word's answer minus the "
            "filler caption, in the word's direction under the rule (**THE CARRIER DELIVERS THE ANSWER**), pooled over the "
-           "four words and per word, with its size over the word's own caption minus the filler caption.", "",
+           "four words and per word, with its size over the word's own caption minus the filler caption. **R5-F**: the same "
+           f"read for '{SWAP_FRAGMENT}' (its pieces with the word's answer minus its own caption, and the size over the "
+           "word's own caption minus its own caption): a carrier of fragments only beside one whose lead piece means "
+           "something.", "",
            f"**Limits fixed in advance**: one seed; {n_scenes} scenes; two words per mood; 'elated' was not read in pictures "
-           "before; the filler is one word, and whether its lead T5 piece is a real word decides what kind of carrier it "
-           "is (see the pieces above).", "", ANIMA.judge_text, ""]
+           "before; one word of each carrier kind.", "", ANIMA.judge_text, ""]
     if meta.get("status") == "done":
         r = meta["result"]
-        r1, r5, ct = r["R1"], r["R5"], r["clause_tint"]
+        r1, r5, r5f, ct = r["R1"], r["R5"], r["R5F"], r["clause_tint"]
         size = "n/a" if r["R2_size"] is None else f"{r['R2_size']:.2f}"
         out += ["## Result", meta.get("summary", ""), "",
                 "| read | effect (mean +- SE) | cells that way | verdict |", "|---|---|---|---|",
                 f"| R1: cheerful answers minus gloomy answers under foreign pieces | {r1['mean']:+.3f} +- {r1['se']:.3f} | "
                 f"{r1['frac_pos']:.0%} | **{r1['OUTCOME']}** |",
-                f"| R5: the filler's pieces with a mood word's answer | {r5['mean']:+.3f} +- {r5['se']:.3f} | "
+                f"| R5: '{SWAP_FILLER}''s pieces with a mood word's answer | {r5['mean']:+.3f} +- {r5['se']:.3f} | "
                 f"{r5['frac_pos']:.0%} | **{r5['OUTCOME']}** |",
+                f"| R5-F: '{SWAP_FRAGMENT}''s pieces with a mood word's answer | {r5f['mean']:+.3f} +- {r5f['se']:.3f} | "
+                f"{r5f['frac_pos']:.0%} | **{r5f['OUTCOME']}** |",
                 f"| the mood clause's own tint (filler caption minus scene caption) | {ct['mean']:+.3f} +- {ct['se']:.3f} | "
                 f"{ct['frac_pos']:.0%} upward | descriptive |", "",
-                f"R2: R1 is {size} of the words' own axis ({r['own_axis']:+.3f}). R5's size: "
-                f"{'n/a' if r['R5_size'] is None else format(r['R5_size'], '.2f')} of the answer's own effect.", "",
+                f"R2: R1 is {size} of the words' own axis ({r['own_axis']:+.3f}). The carriers' sizes: '{SWAP_FILLER}' "
+                f"{'n/a' if r['R5_size'] is None else format(r['R5_size'], '.2f')}, '{SWAP_FRAGMENT}' "
+                f"{'n/a' if r['R5F_size'] is None else format(r['R5F_size'], '.2f')} of the answer's own effect.", "",
                 "| word | own caption (mean +- SE, verdict) | the answer adds | its pieces under the filler's answer | a "
-                "same-mood question delivers | an opposite-mood question delivers | the neutral carrier (size) |",
-                "|---|---|---|---|---|---|---|"]
+                f"same-mood question delivers | an opposite-mood question delivers | '{SWAP_FILLER}' carries (size) | "
+                f"'{SWAP_FRAGMENT}' carries (size) |",
+                "|---|---|---|---|---|---|---|---|"]
+
+        def sz(v):
+            return "n/a" if v is None else format(v, ".2f")
         for w, v in r["words"].items():
             fd = v["foreign_delivery"]
             out.append(f"| {w} | {v['own']['mean']:+.3f} +- {v['own']['se']:.3f} ({v['own']['OUTCOME']}) | "
                        f"{v['answer_adds']['mean']:+.3f} ({v['answer_adds']['OUTCOME']}) | "
                        f"{v['question_under_filler']['mean']:+.3f} ({v['question_under_filler']['OUTCOME']}) | "
-                       f"{'n/a' if fd['same'] is None else format(fd['same'], '.2f')} | "
-                       f"{'n/a' if fd['opposite'] is None else format(fd['opposite'], '.2f')} | "
-                       f"{v['carrier']['OUTCOME']} ({'n/a' if v['carrier_size'] is None else format(v['carrier_size'], '.2f')}) |")
+                       f"{sz(fd['same'])} | {sz(fd['opposite'])} | {v['carrier']['OUTCOME']} ({sz(v['carrier_size'])}) | "
+                       f"{v['fcarrier']['OUTCOME']} ({sz(v['fcarrier_size'])}) |")
         out += ["", "| set | mood score | content kept |", "|---|---|---|"]
         for k in swap_sets():
             out.append(f"| {k} | {r['mood_score'][k]:+.3f} | {r['content_kept'][k]:.3f} |")

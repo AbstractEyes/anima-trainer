@@ -1219,7 +1219,7 @@ class AnimaRunner(_sr.SanaRunner):
         recipe = self._flavor_recipe()
         model = self._eval_pipe().model                 # each word as Anima's two tokenizers cut it, after a space
         pieces = {w: {"t5": list(model.t5_tokenizer.tokenize(" " + w)), "qwen": list(model.tokenizer.tokenize(" " + w))}
-                  for w in [*ax.swap_words(), ax.SWAP_FILLER]}
+                  for w in [*ax.swap_words(), ax.SWAP_FILLER, ax.SWAP_FRAGMENT]}
         meta = {"id": rid, "title": ax.SWAP_TEST_TITLE, "date": "2026-10-04", "kind": "word_swap", "status": "running",
                 "recipe": recipe, "pieces": pieces}
         repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_word_swap_readme(meta, recipe)},
@@ -1252,7 +1252,7 @@ class AnimaRunner(_sr.SanaRunner):
         same positions (else a swap shifts every later position); returns the words' shared Qwen3 positions per scene."""
         import torch
         pipe = self._eval_pipe()
-        words = [*ax.swap_words(), ax.SWAP_FILLER]
+        words = [*ax.swap_words(), ax.SWAP_FILLER, ax.SWAP_FRAGMENT]
         ref = None
         for w in words:
             _, m_q = pipe.slot_masks(P[w], w, device="cpu")
@@ -1270,15 +1270,16 @@ class AnimaRunner(_sr.SanaRunner):
         cells = [(si, sd) for si in range(0, len(SUBJECTS), ax.SWAP_SCENE_STEP) for sd in ax.SWAP_SEEDS]
         assert len(cells) == ax.SWAP_N_SCENES * len(ax.SWAP_SEEDS), (len(cells), ax.SWAP_N_SCENES)
         S = [sd for _, sd in cells]
-        P = {w: [ax.word_prompt(w, SUBJECTS[si]) for si, _ in cells] for w in [None, *ax.swap_words(), ax.SWAP_FILLER]}
+        P = {w: [ax.word_prompt(w, SUBJECTS[si]) for si, _ in cells]
+             for w in [None, *ax.swap_words(), ax.SWAP_FILLER, ax.SWAP_FRAGMENT]}
         positions = self._swap_aligned(P)
         sets = ax.swap_sets()
         print(f"[anima] e028: {len(sets)} sets of {len(cells)} images (T5 ids of one caption with the Qwen3 states of "
               f"another), one line per set; the swapped words' Qwen3 positions per scene {positions}", flush=True)
         eta = _sr._Eta(self.TAG, "e028", len(sets) * len(cells))
         g, d = ax.SWAP_WORDS["up"][0], ax.SWAP_WORDS["down"][0]
-        cols = ["neutral", "filler_own", f"own_{g}", f"swap_{g}_{d}", f"filler_{g}", f"carrier_{g}",
-                f"own_{d}", f"swap_{d}_{g}", f"filler_{d}", f"carrier_{d}"]
+        cols = ["neutral", "filler_own", "fragment_own", f"own_{g}", f"swap_{g}_{d}", f"filler_{g}", f"carrier_{g}",
+                f"fcarrier_{g}", f"own_{d}", f"swap_{d}_{g}", f"filler_{d}", f"carrier_{d}", f"fcarrier_{d}"]
         sheet, feat0, scores, kept = {}, None, {}, {}
         for key, (wq, wt) in sets.items():                 # the scene caption first: content kept is read against it
             ims = self._render_routes(P[wq], P[wt], S, eta)
