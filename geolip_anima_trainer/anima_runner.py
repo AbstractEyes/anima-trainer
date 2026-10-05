@@ -256,6 +256,44 @@ class AnimaPipe:
         out[~t5_mask.bool()] = 0
         return out
 
+    def qwen_ids(self, prompts: list[str]) -> list:
+        """Per prompt, the Qwen3 token ids the encoder reads (the trainer's tokenization, without its padding)."""
+        return [self.model.tokenizer(p, truncation=True, max_length=512)["input_ids"] for p in prompts]
+
+    def encode_fp32(self, prompts: list[str]) -> list:
+        """Per prompt, Qwen3's final states [L, D] float32 from an fp32 copy of the encoder (its bf16 weights upcast, no autocast;
+        one prompt at a time, unpadded): the reference that externally computed fp32 states of the same caption are checked
+        against."""
+        import copy
+        import torch
+        te = copy.deepcopy(self.model.text_encoder).float()
+        out = []
+        try:
+            with torch.no_grad():
+                for p in prompts:
+                    enc = self.model.tokenizer(p, return_tensors="pt", truncation=True, max_length=512)
+                    h = te(input_ids=enc.input_ids.to("cuda"), attention_mask=enc.attention_mask.to("cuda")).last_hidden_state
+                    out.append(h[0].float().cpu())
+        finally:
+            del te
+            torch.cuda.empty_cache()
+        return out
+
+    @staticmethod
+    def with_source_states(conds: tuple, states) -> tuple:
+        """conds with the Qwen3 states replaced per image by given final states [L, D] (any float dtype): placed at the prompt's
+        own L positions in the encoder's dtype, zeros past them (the trainer's padding); L must equal the prompt's token count.
+        Fed the encoder's own output, it returns the same conditioning exactly."""
+        import torch
+        pe, am, ids, tm = conds
+        out = torch.zeros_like(pe)
+        for b, s in enumerate(states):
+            n = int(am[b].sum())
+            if tuple(s.shape) != (n, pe.shape[-1]):
+                raise ValueError(f"image {b}: states of shape {tuple(s.shape)} for a prompt of {n} tokens")
+            out[b, :n] = s.to(pe.device, pe.dtype)
+        return (out, am, ids, tm)
+
     @staticmethod
     def add_at_tokens(states, mask, vec):
         """states + vec at every token the mask marks (padding untouched); vec is [D] or per image [B, 1, D]."""
@@ -415,7 +453,7 @@ class AnimaPipe:
     def generate(self, prompts: list[str], seeds: list[int], *, res: int, steps: int, cfg: float, shift: float,
                  negative: str = "", batch: int = 8, source_add=None, context_add=None, uncond_add=None,
                  t5_prompts: "list[str] | None" = None, query_add=None, source_token=None, slot_word: "str | None" = None,
-                 slot_query=None, slot_source=None) -> list:
+                 slot_query=None, slot_source=None, source_states=None) -> list:
         """PIL images, one per (prompt, seed). source_add / context_add: a 1024-vector added to every prompt token
         before / after the LLM adapter, on the conditional branch; uncond_add: the same after the adapter on the
         negative prompt's branch (a trained push goes on both branches, as a LoRA acts; e001's dial on neither).
@@ -423,12 +461,15 @@ class AnimaPipe:
         the Qwen3 states stay the prompt's (the adapter's two inputs from one caption, split). query_add: a vector
         added to the adapter's query embeddings (before its blocks) at the caption's T5 tokens; source_token: one
         extra source position appended after the caption's Qwen3 tokens. slot_query / slot_source: a vector added to
-        the query embedding / the Qwen3 state at slot_word's own tokens only (slot_masks). All on the conditional
-        branch only."""
+        the query embedding / the Qwen3 state at slot_word's own tokens only (slot_masks). source_states: per image,
+        Qwen3's final states [L, D] for its prompt, used in place of the encoder's output (with_source_states; the other
+        source edits apply after it). All on the conditional branch only."""
         import torch
         from utils.previews import to_pil
         if len(prompts) != len(seeds):
             raise ValueError("one seed per prompt")
+        if source_states is not None and len(source_states) != len(prompts):
+            raise ValueError("one state tensor per prompt")
         if t5_prompts is not None and len(t5_prompts) != len(prompts):
             raise ValueError("one T5 prompt per prompt")
         if (slot_query is not None or slot_source is not None) and (slot_word is None or query_add is not None
@@ -441,6 +482,8 @@ class AnimaPipe:
                 p, s = list(prompts[i:i + batch]), list(seeds[i:i + batch])
                 n = len(p)
                 conds = self.encode(p)
+                if source_states is not None:
+                    conds = self.with_source_states(conds, source_states[i:i + batch])
                 if t5_prompts is not None:                         # both encodings pad to the same 512 tokens
                     t5 = self.encode(list(t5_prompts[i:i + batch]))
                     conds = (conds[0], conds[1], t5[2], t5[3])
