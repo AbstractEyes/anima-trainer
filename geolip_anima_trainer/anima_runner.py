@@ -1341,6 +1341,275 @@ class AnimaRunner(_sr.SanaRunner):
                            for j, (si, sd) in enumerate(cells)]
         return result
 
+    # ---- e029: a relayed phrase reading in pictures -------------------------------------------------------------------
+    def run_relay(self, *, stage: str = "A", export_path: "str | None" = None, force: bool = False) -> dict:
+        """e029 into its own folder of cfg.repo_id, in its two stages. stage='A': the bare caption form's ceiling pilot (the
+        first two single words of each mood, ceiling and filler; 64 images; no outside input). stage='B' (after A): the
+        remaining sets, the relay arms' final Qwen3 states read from export_path (a safetensors file with its header, made
+        where the maps were fitted), the ceiling and filler arms at this runner's fp32 encoding like stage A's, whose images
+        are reused. force=True reruns a stage."""
+        self._need_model()
+        _drop_torchao()
+        repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
+        metas = repo.metas()
+        try:
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        rid, recipe = ax.RELAY_TEST_ID, self._flavor_recipe()
+        base = f"experiments/{rid}"
+        out_dir = Path(self._need("data_root")) / "experiments" / rid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        meta = dict(metas.get(rid) or {})
+        if stage not in ("A", "B"):
+            raise ValueError(f"stage must be 'A' or 'B', got {stage!r}")
+        if stage == "A" and meta.get("stage_a") and not force:
+            print(f"[anima] {rid} stage A is done already (force=True reruns it)", flush=True)
+            return meta
+        if stage == "B":
+            if not meta.get("stage_a"):
+                raise RuntimeError(f"{rid}: stage A first (run_relay(stage='A'))")
+            if meta.get("status") == "done" and not force:
+                print(f"[anima] {rid} is done already (force=True reruns stage B)", flush=True)
+                return meta
+            if export_path is None:
+                raise ValueError("stage B reads the relay arms' states from export_path")
+        if stage == "A":
+            meta = {"id": rid, "title": ax.RELAY_TEST_TITLE, "date": "2026-10-05", "kind": "relay", "status": "running",
+                    "recipe": recipe}
+        meta["status"] = "running"
+        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_relay_readme(meta, recipe)},
+                    f"{rid}: stage {stage} started")
+        t0 = time.time()
+        try:
+            if stage == "A":
+                res = self._relay_stage_a(out_dir)
+            else:
+                res = self._relay_stage_b(out_dir, export_path, meta["stage_a"])
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="failed", error=f"stage {stage}: {type(e).__name__}: {e}"[:500])
+            self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                                            f"{base}/README.md": ax.render_relay_readme(meta, recipe)}, f"{rid}: failed"))
+            raise
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        if stage == "A":
+            meta.update(stage_a={k: v for k, v in res.items() if k != "cells"}, status="running", seconds_a=round(time.time() - t0),
+                        finished_a_utc=stamp)
+            meta["summary"] = ax.relay_summary({"stage_a": meta["stage_a"]})
+            (out_dir / "result_stage_a.json").write_text(json.dumps(res, indent=1, default=float), encoding="utf-8")
+            files = {f"{base}/result_stage_a.json": out_dir / "result_stage_a.json",
+                     f"{base}/sheet_stage_a.jpg": out_dir / "sheet_stage_a.jpg"}
+        else:
+            meta.update(status="done", result={k: v for k, v in res.items() if k != "cells"}, seconds_b=round(time.time() - t0),
+                        finished_utc=stamp)
+            meta["summary"] = ax.relay_summary({"stage_a": meta["stage_a"], "reads": res["reads"]})
+            (out_dir / "result.json").write_text(json.dumps(res, indent=1, default=float), encoding="utf-8")
+            files = {f"{base}/result.json": out_dir / "result.json", f"{base}/sheet_stage_b.jpg": out_dir / "sheet_stage_b.jpg"}
+        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_relay_readme(meta, recipe), **files},
+                    f"{rid}: stage {stage} result")
+        metas[rid] = meta
+        self._safe(lambda: self._publish_index(repo, metas))
+        print(f"[anima] {rid} stage {stage} done in {round(time.time() - t0)} s: {meta['summary']}", flush=True)
+        return meta
+
+    def _relay_cells(self) -> "tuple[list, list]":
+        cells = [(si, sd) for si in range(0, len(SUBJECTS), ax.RELAY_SCENE_STEP) for sd in ax.RELAY_SEEDS]
+        assert len(cells) == ax.RELAY_N_SCENES * len(ax.RELAY_SEEDS), (len(cells), ax.RELAY_N_SCENES)
+        return cells, [sd for _, sd in cells]
+
+    def _render_states(self, qwen_prompts: list[str], t5_prompts: list[str], states: list, seeds: list[int], eta=None) -> list:
+        """Images from given final Qwen3 states (one [L, D] per image, in place of the encoder's output; AnimaPipe
+        with_source_states), the T5 ids from t5_prompts (the prompts' own when equal), in gen_batch chunks."""
+        out, b = [], self.cfg.gen_batch
+        for i in range(0, len(qwen_prompts), b):
+            kw = {"source_states": states[i:i + b]}
+            if t5_prompts != qwen_prompts:
+                kw["t5_prompts"] = t5_prompts[i:i + b]
+            out += self._render(qwen_prompts[i:i + b], seeds[i:i + b], **kw)
+            if eta is not None:
+                eta.add(len(qwen_prompts[i:i + b]))
+        return out
+
+    @staticmethod
+    def _token_rel(a, b) -> float:
+        """The largest per-token relative difference |a - b| / |b| between two [L, D] state sets (float32)."""
+        a, b = a.float().cpu(), b.float().cpu()
+        return float(((a - b).norm(dim=-1) / b.norm(dim=-1).clamp(min=1e-12)).max())
+
+    @staticmethod
+    def _pixel_diff(x, y) -> dict:
+        import numpy as np
+        d = np.abs(np.asarray(x).astype(np.float32) - np.asarray(y).astype(np.float32))
+        return {"mean": float(d.mean()), "max": float(d.max()), "over_8": float((d > 8).mean())}
+
+    def _relay_identity_path(self, caption: str, seed: int, fp32_states) -> tuple:
+        """Identity checks (i) and (iii) on one caption: the supplied-states path fed this runner's own encoder output must
+        reproduce its usual picture pixel for pixel (else the run stops); the usual bf16 encoding against the fp32 one,
+        states and picture, quoted. Returns (the numbers, the usual picture, the fp32 one)."""
+        import numpy as np
+        pipe = self._eval_pipe()
+        own = self._render([caption], [seed])[0]
+        pe, am = pipe.encode([caption])[:2]
+        n = int(am[0].sum())
+        same = self._render([caption], [seed], source_states=[pe[0, :n]])[0]
+        if not np.array_equal(np.asarray(own), np.asarray(same)):
+            raise RuntimeError(f"identity check (i) failed: the supplied-states path with the runner's own encoder output does "
+                               f"not reproduce its picture ({self._pixel_diff(own, same)}) for {caption!r}")
+        fp = self._render([caption], [seed], source_states=[fp32_states])[0]
+        pix = self._pixel_diff(own, fp)
+        out = {"caption": caption, "seed": seed, "path_exact": True,
+               "bf16_vs_fp32_state_rel": self._token_rel(pe[0, :n], fp32_states),
+               "bf16_vs_fp32_pixel_mean": pix["mean"], "bf16_vs_fp32_pixel_max": pix["max"],
+               "bf16_vs_fp32_pixels_over_8": pix["over_8"]}
+        print(f"[anima] e029 identity: (i) the supplied-states path reproduces the runner's own picture pixel for pixel; (iii) "
+              f"the usual bf16 encoding against fp32: states {out['bf16_vs_fp32_state_rel']:.2e} (largest per-token relative), "
+              f"picture {pix['mean']:.2f} mean / {pix['max']:.0f} largest absolute pixel difference, {pix['over_8']:.1%} of "
+              f"values over 8 levels", flush=True)
+        return out, own, fp
+
+    def _relay_stage_a(self, out_dir: Path) -> dict:
+        import numpy as np
+        pipe = self._eval_pipe()
+        self._assert_stock()
+        cells, S = self._relay_cells()
+        words = ax.relay_pilot_words(list(ax.RELAY_PHRASES))
+        sets = ax.relay_pilot_sets(words)
+        P = {t: [ax.relay_prompt(t, SUBJECTS[si]) for si, _ in cells] for k in sets.values() for t in k[:2]}
+        for w in words:                                    # the filler keeps the phrase's Qwen3 token count on every scene
+            nq = [len(x) for x in pipe.qwen_ids(P[w["text"]])]
+            nf = [len(x) for x in pipe.qwen_ids(P[w["filler"]])]
+            if nq != nf:
+                raise ValueError(f"{w['filler']!r} does not keep {w['text']!r}'s Qwen3 token count ({nf} vs {nq})")
+        need = sorted({p for q, _, _ in sets.values() for p in P[q]})
+        print(f"[anima] e029 stage A: {len(sets)} sets of {len(cells)} images ({', '.join(w['text'] for w in words)}: ceiling "
+              f"and filler), every caption at this runner's fp32 encoding ({len(need)} captions encoded once)", flush=True)
+        enc = dict(zip(need, pipe.encode_fp32(need)))
+        first = P[words[0]["text"]][0]
+        identity, _, _ = self._relay_identity_path(first, S[0], enc[first])
+        eta = _sr._Eta(self.TAG, "e029 stage A", len(sets) * len(cells))
+        scores, sheet = {}, {}
+        img_dir = out_dir / "stage_a"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        for key, (q, t, _r) in sets.items():
+            ims = self._render_states(P[q], P[t], [enc[p] for p in P[q]], S, eta)
+            _, sc = self._score(ims)
+            scores[key], sheet[key] = [float(x) for x in sc], ims
+            for (si, _), im in zip(cells, ims):
+                im.save(img_dir / f"{key.replace('|', '_').replace(' ', '_')}_{si:02d}.png")
+            print(f"[anima] e029 stage A {key}: mood score {np.mean(scores[key]):+.3f}", flush=True)
+        read = ax.relay_pilot_read(scores, words)
+        cols = [k for w in words for k in (f"ceiling|{w['text']}", f"filler|{w['text']}")]
+        _grid([[sheet[k][r] for k in cols] for r in range(len(cells))], out_dir / "sheet_stage_a.jpg")
+        per = {w["text"]: {"mood": w["mood"], "filler": w["filler"],
+                           "diff": float(np.mean(np.subtract(scores[f"ceiling|{w['text']}"], scores[f"filler|{w['text']}"])))}
+               for w in words}
+        return {"read": read, "scores": scores, "words": per, "identity": identity, "sheet_columns": cols,
+                "cells": [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
+                          for j, (si, sd) in enumerate(cells)]}
+
+    def _relay_stage_b(self, out_dir: Path, export_path: str, stage_a: dict) -> dict:
+        import hashlib
+
+        import numpy as np
+        from safetensors import safe_open
+        from safetensors.torch import load_file
+        pipe = self._eval_pipe()
+        self._assert_stock()
+        form = stage_a["read"]["form_next"]
+        T = load_file(export_path)
+        with safe_open(export_path, "pt") as f:
+            H = json.loads(f.metadata()["header"])
+        if not H["form"].startswith(form):
+            raise ValueError(f"stage A sent stage B to the {form!r} form; the export is {H['form'][:40]!r}")
+        arms = H["arms"]
+        for a in ("relay", "companion"):
+            if a in arms and arms[a].get("grid") != "verified":
+                raise RuntimeError(f"the export's {a} arm is not verified against its grid: {arms[a].get('grid')}")
+        if [(p["text"], p["mood"]) for p in H["phrases"]] != [(p["text"], p["mood"]) for p in ax.RELAY_PHRASES]:
+            raise ValueError("the export's phrases are not e029's")
+        cells, S = self._relay_cells()
+        row = {(c["phrase"], c["scene_index"]): c["row"] for c in H["captions"]}
+        L = T["lengths"]
+        fill = {p["text"]: p["filler"] for p in ax.RELAY_PHRASES}
+        texts = {x for p in ax.RELAY_PHRASES for x in (p["text"], p["filler"])}
+        P = {t: [ax.relay_prompt(t, SUBJECTS[si]) for si, _ in cells] for t in texts}
+        bad = []                                          # every caption, its filler and their ids against the export
+        for p in ax.RELAY_PHRASES:
+            t = p["text"]
+            for j, (si, _) in enumerate(cells):
+                n = row[(t, si)]
+                c = H["captions"][n]
+                q_ids = pipe.qwen_ids([P[t][j], P[fill[t]][j]])
+                t5 = pipe.model.t5_tokenizer(P[t][j])["input_ids"]
+                if (c["text"] != P[t][j] or c["filler_text"] != P[fill[t]][j] or c["filler"] != fill[t]
+                        or q_ids[0] != T["qwen_ids"][n, :L[n]].tolist() or q_ids[1] != T["filler_qwen_ids"][n, :L[n]].tolist()
+                        or t5 != c["t5_ids"]):
+                    bad.append((t, si))
+        if bad:
+            raise ValueError(f"the export's captions or ids differ from this runner's for {bad[:6]} ({len(bad)} cells)")
+        print(f"[anima] e029 stage B ({form} form): the export {Path(export_path).name}: the pick {H.get('pick')}, the companion "
+              f"{H.get('companion')}; arms {sorted(arms)}; every caption's text, Qwen3 ids, filler ids and T5 ids equal this "
+              f"runner's ({len(ax.RELAY_PHRASES) * len(cells)} cells)", flush=True)
+        # identity check (ii) on two captions of different scenes, then (iii) at the picture level
+        probe = [(ax.RELAY_PHRASES[0]["text"], cells[0][0], 0), (ax.RELAY_PHRASES[0]["text"], cells[1][0], 1)]
+        f32 = pipe.encode_fp32([P[t][j] for t, _, j in probe])
+        rels = [self._token_rel(T["states.ceiling"][row[(t, si)], :L[row[(t, si)]]], f) for (t, si, _), f in zip(probe, f32)]
+        if max(rels) > ax.RELAY_ENCODING_TOL:
+            for (t, si, j), f in zip(probe, f32):
+                e = T["states.ceiling"][row[(t, si)], :L[row[(t, si)]]]
+                per_tok = ((e - f).norm(dim=-1) / f.norm(dim=-1)).tolist()
+                print(f"[anima] e029 identity (ii) per token, {P[t][j]!r}: " + ", ".join(f"{x:.1e}" for x in per_tok), flush=True)
+            raise RuntimeError(f"identity check (ii) failed: the export's unpatched states differ from this runner's fp32 "
+                               f"encoding by {max(rels):.2e} (the bar {ax.RELAY_ENCODING_TOL:g}); read the per-token lines above")
+        t0_, si0, j0 = probe[0]
+        _, own, fp = self._relay_identity_path(P[t0_][j0], S[j0], f32[0])
+        ex = self._render([P[t0_][j0]], [S[j0]], source_states=[T["states.ceiling"][row[(t0_, si0)], :L[row[(t0_, si0)]]]])[0]
+        identity = {"export_vs_fp32_rel": max(rels), "export_vs_fp32_rel_each": rels,
+                    "export_vs_own_pixel_mean": self._pixel_diff(own, ex)["mean"],
+                    "export_vs_fp32_picture": self._pixel_diff(fp, ex)}
+        print(f"[anima] e029 identity (ii): the export's unpatched states against this runner's fp32 encoding "
+              f"{max(rels):.2e} (bar {ax.RELAY_ENCODING_TOL:g}); pictures: the export's against the runner's fp32 one "
+              f"{identity['export_vs_fp32_picture']['mean']:.2f} mean absolute pixel difference, against its usual one "
+              f"{identity['export_vs_own_pixel_mean']:.2f}", flush=True)
+        sets = ax.relay_sets(list(ax.RELAY_PHRASES), control="control" in arms, companion="companion" in arms)
+        reuse = {k: v for k, v in stage_a["scores"].items() if k in sets}
+        need = sorted({p for k, (q, _, r) in sets.items() if r is None and k not in reuse for p in P[q]})
+        enc = dict(zip(need, pipe.encode_fp32(need)))
+        arm_of = {"her": "relay", "companion": "companion", "untrained": "control"}
+        todo = [k for k in sets if k not in reuse]
+        print(f"[anima] e029 stage B: {len(todo)} sets of {len(cells)} images ({len(reuse)} sets reused from stage A); the "
+              f"ceiling and filler arms at this runner's fp32 encoding ({len(need)} captions), the relay arms from the export",
+              flush=True)
+        eta = _sr._Eta(self.TAG, "e029 stage B", len(todo) * len(cells))
+        scores, sheet = dict(reuse), {}
+        for key in todo:
+            q, t, r = sets[key]
+            if r is None:
+                st = [enc[p] for p in P[q]]
+            else:
+                st = [T[f"states.{arm_of[r]}"][row[(t, si)], :L[row[(t, si)]]] for si, _ in cells]
+            ims = self._render_states(P[q], P[t], st, S, eta)
+            _, sc = self._score(ims)
+            scores[key], sheet[key] = [float(x) for x in sc], ims
+            print(f"[anima] e029 stage B {key}: mood score {np.mean(scores[key]):+.3f}", flush=True)
+        reads = ax.relay_reads(scores, list(ax.RELAY_PHRASES))
+        for k in reuse:                                    # stage A's pictures, for the sheet, when this runtime has them
+            fs = [out_dir / "stage_a" / f"{k.replace('|', '_').replace(' ', '_')}_{si:02d}.png" for si, _ in cells]
+            if all(f.is_file() for f in fs):
+                from PIL import Image
+                sheet[k] = [Image.open(f).convert("RGB") for f in fs]
+        show = [next(p["text"] for p in ax.RELAY_PHRASES if p["mood"] == m) for m in ("up", "down")]
+        kinds = ["ceiling", "relay", *(["companion"] if "companion" in arms else []), *(["control"] if "control" in arms else []),
+                 "filler"]
+        cols = [f"{k}|{t}" for t in show for k in kinds if f"{k}|{t}" in sheet]
+        _grid([[sheet[k][r] for k in cols] for r in range(len(cells))], out_dir / "sheet_stage_b.jpg")
+        h = hashlib.sha256(Path(export_path).read_bytes()).hexdigest()
+        return {"form": form, "reads": reads, "scores": scores, "identity_b": identity, "sheet_columns": cols,
+                "export": {"file": Path(export_path).name, "sha256": h, "pick": H.get("pick"), "companion": H.get("companion"),
+                           "arms": arms, "precision": H.get("precision")},
+                "cells": [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
+                          for j, (si, sd) in enumerate(cells)]}
+
     # ---- e012: the attribute screen ----------------------------------------------------------------------
     def _tagger(self):
         if getattr(self, "_tagger_fns", None) is None:

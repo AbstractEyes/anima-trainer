@@ -1182,6 +1182,134 @@ def test_relay_pilot_picks_the_first_single_words_and_reads_the_ceiling():
     assert f["ceiling"]["OUTCOME"] == "NO EFFECT" and f["form_next"] == "mood"
 
 
+def _relay_fakes(s, pipe, monkeypatch, relay_frac=0.5, control_frac=0.1):
+    """e029's fakes: a word-per-token tokenizer; every caption's fake fp32 states are its phrase's mood (+1 / -1; a filler 0)
+    on every token, the usual bf16 encoding the same values; a picture's grey level follows the mean of the states it is
+    given (or its caption's mood); the export's relay arms carry relay_frac and control_frac of the mood."""
+    from types import SimpleNamespace
+    from PIL import Image
+    moods = {p["text"]: (1.0 if p["mood"] == "up" else -1.0) for p in ax.RELAY_PHRASES}
+
+    def mood_of(caption):
+        return next((m for t, m in moods.items() if caption.endswith(f", {t}.")), 0.0)
+
+    def ids(text):
+        return [sum(map(ord, w)) % 997 for w in text.split()]
+
+    class Tok:
+        def __call__(self, text, **kw):
+            return {"input_ids": ids(text) + ([1] if kw.get("eos", True) else [])}
+
+    pipe.model = SimpleNamespace(t5_tokenizer=Tok(), tokenizer=Tok())
+    pipe.qwen_ids = lambda prompts: [ids(p) for p in prompts]
+    pipe.encode_fp32 = lambda prompts: [torch.full((len(ids(p)), 4), mood_of(p)) for p in prompts]
+
+    def encode(prompts):
+        pe = torch.zeros(len(prompts), 512, 4, dtype=torch.bfloat16)
+        am = torch.zeros(len(prompts), 512, dtype=torch.long)
+        for b, p in enumerate(prompts):
+            pe[b, :len(ids(p))], am[b, :len(ids(p))] = mood_of(p), 1
+        return pe, am, None, None
+
+    pipe.encode = encode
+    rendered = []
+
+    def render(prompts, seeds, t5_prompts=None, source_states=None):
+        rendered.extend(prompts)
+        lv = [float(st.float().mean()) for st in source_states] if source_states is not None else [mood_of(p) for p in prompts]
+        return [Image.new("RGB", (8, 8), (int(round(128 + 20 * x)),) * 3) for x in lv]
+
+    monkeypatch.setattr(s, "_render", render)
+    return moods, ids, rendered
+
+
+def _relay_export(path, moods, ids, relay_frac=0.5, control_frac=0.1, perturb=0.0, bad_id=False):
+    """A synthetic export file in the grid's format: e029's 128 captions, the arms' fake final states, the header."""
+    from safetensors.torch import save_file
+    rows, caps = [], []
+    for p in ax.RELAY_PHRASES:
+        for si in range(0, len(sr.SUBJECTS), ax.RELAY_SCENE_STEP):
+            rows.append((p, si))
+    L = max(len(ids(ax.relay_prompt(p["text"], sr.SUBJECTS[si]))) for p, si in rows)
+    n = len(rows)
+    T = {"lengths": torch.zeros(n, dtype=torch.long), "qwen_ids": torch.zeros(n, L, dtype=torch.long),
+         "filler_qwen_ids": torch.zeros(n, L, dtype=torch.long)}
+    for arm in ("ceiling", "filler", "relay", "control"):
+        T[f"states.{arm}"] = torch.zeros(n, L, 4)
+    for r, (p, si) in enumerate(rows):
+        cap, fcap = ax.relay_prompt(p["text"], sr.SUBJECTS[si]), ax.relay_prompt(p["filler"], sr.SUBJECTS[si])
+        q, fq, m = ids(cap), ids(fcap), moods[p["text"]]
+        T["lengths"][r] = len(q)
+        T["qwen_ids"][r, :len(q)] = torch.tensor(q)
+        T["filler_qwen_ids"][r, :len(fq)] = torch.tensor(fq)
+        T["states.ceiling"][r, :len(q)] = m * (1 + perturb)
+        T["states.relay"][r, :len(q)] = relay_frac * m
+        T["states.control"][r, :len(q)] = control_frac * m
+        caps.append({"row": r, "text": cap, "scene_index": si, "scene": sr.SUBJECTS[si], "phrase": p["text"], "mood": p["mood"],
+                     "filler": p["filler"], "filler_text": fcap, "length": len(q), "t5_ids": ids(cap) + [1]})
+    if bad_id:
+        T["qwen_ids"][5, 0] += 1
+    header = {"form": "bare: the grid's own captions", "pick": "record|step|b16|close|k4", "companion": None,
+              "precision": "fp32", "arms": {"ceiling": {"unpatched": "the caption"}, "filler": {"unpatched": "the filler"},
+                                            "relay": {"grid": "verified"}, "control": {"grid": "verified"}},
+              "phrases": [{"text": p["text"], "mood": p["mood"]} for p in ax.RELAY_PHRASES], "captions": caps}
+    save_file(T, str(path), metadata={"header": json.dumps(header)})
+    return path
+
+
+def test_relay_runs_stage_a_then_stage_b_from_an_export(runner, monkeypatch, tmp_path):
+    """e029 end to end on fakes: stage A reads the bare caption's ceiling against its filler (THE CAPTION CARRIES THE MOOD), with
+    the supplied-states path reproducing the usual picture exactly; stage B checks every caption's ids against the export,
+    checks the export's unpatched states against the runner's fp32 encoding, reuses stage A's 8 sets (never rendered again),
+    reads the relay at its known half size and above the untrained trunk, and writes a plain README."""
+    s, repo, pipe, _ = runner
+    moods, ids, rendered = _relay_fakes(s, pipe, monkeypatch)
+    with pytest.raises(RuntimeError, match="stage A first"):
+        s.run_relay(stage="B", export_path="x")
+    a = s.run_relay(stage="A")
+    sa = a["stage_a"]
+    assert a["status"] == "running" and sa["read"]["ceiling"]["OUTCOME"] == ax.RELAY_CAPTION and sa["read"]["form_next"] == "bare"
+    assert sa["identity"]["path_exact"] and sa["identity"]["bf16_vs_fp32_pixel_mean"] == 0.0
+    assert sorted(sa["scores"]) == sorted(f"{k}|{w}" for w in ("elated", "blithe", "dismal", "despondent")
+                                          for k in ("ceiling", "filler"))
+    n_a = len(rendered)
+    assert n_a == 64 + 3                                     # the 64 images and the identity check's three
+    exp = _relay_export(tmp_path / "e029_export_record.safetensors", moods, ids)
+    b = s.run_relay(stage="B", export_path=str(exp))
+    r = b["result"]["reads"]
+    assert b["status"] == "done" and r["TEST"] == ax.RELAY_ANSWER and r["control"] and not r["companion"]
+    assert r["all"]["size"] == pytest.approx(0.5, abs=0.05) and r["all"]["over_control"]["OUTCOME"] == ax.RELAY_CONTROL
+    assert b["result"]["identity_b"]["export_vs_fp32_rel"] == 0.0
+    stage_b = rendered[n_a:]
+    pilot_caps = {ax.relay_prompt(w, sr.SUBJECTS[0]) for w in ("elated", "blithe", "dismal", "despondent")}
+    assert len(stage_b) == (16 * 4 - 8) * 8 + 3 + 1           # the new sets, the identity checks' three, the export's picture
+    # the pilot words' scene-0 captions: their relay and control arms (2 x 4) and the identity probe's four pictures, never their
+    # ceiling again (reused from stage A; a re-render would add 4)
+    assert sum(c in pilot_caps for c in stage_b) == 2 * 4 + 4
+    base = f"experiments/{ax.RELAY_TEST_ID}"
+    for f in ("meta.json", "README.md", "result.json", "result_stage_a.json", "sheet_stage_a.jpg", "sheet_stage_b.jpg"):
+        assert f"{base}/{f}" in repo.files_, f
+    readme = repo.files_[f"{base}/README.md"].decode()
+    assert "## Result: stage A" in readme and "## Result: stage B" in readme and "| elated | cheerful | workaday |" in readme
+    import re
+    for word in (r"S-1", r"\bPhil\b", r"docket", r"canon/", r"Fable", r"pod\b"):
+        assert not re.search(word, readme), word
+
+
+def test_relay_stage_b_refuses_a_mismatched_export(runner, monkeypatch, tmp_path):
+    """Stage B stops before any relay image when a caption's ids differ from the export's, or when the export's unpatched
+    states differ from the runner's fp32 encoding by more than the bar."""
+    s, repo, pipe, _ = runner
+    moods, ids, rendered = _relay_fakes(s, pipe, monkeypatch)
+    s.run_relay(stage="A")
+    n_a = len(rendered)
+    with pytest.raises(ValueError, match="ids differ"):
+        s.run_relay(stage="B", export_path=str(_relay_export(tmp_path / "bad_ids.safetensors", moods, ids, bad_id=True)))
+    with pytest.raises(RuntimeError, match=r"identity check \(ii\) failed"):
+        s.run_relay(stage="B", export_path=str(_relay_export(tmp_path / "far.safetensors", moods, ids, perturb=1e-3)))
+    assert len(rendered) == n_a                                # nothing rendered by the refused runs
+
+
 def test_swap_aligned_needs_the_same_qwen_positions(runner):
     """e028's guard: every swapped caption keeps the first word's Qwen3 positions and length, or the run stops."""
     from types import SimpleNamespace

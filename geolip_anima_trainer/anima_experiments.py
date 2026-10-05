@@ -1251,7 +1251,7 @@ def render_word_swap_readme(meta: dict, recipe: dict) -> str:
     return "\n".join(out)
 
 
-# ---- e029 (planned; the set list and the read only, no runner yet): a relayed phrase reading in pictures ----------------
+# ---- e029: a relayed phrase reading in pictures (the sets, the reads, the README; the runner is AnimaRunner.run_relay) ------
 # Beatrix's states for a phrase, mapped into Qwen3's space by a ridge regression, written over Qwen3's states at every token of the
 # phrase at one depth; the adapter's T5 queries unchanged. The adapter-level grid picks the map and the depth; pictures confirm.
 RELAY_TEST_ID = "e029_anima_relay_in_pictures"
@@ -1263,23 +1263,52 @@ RELAY_ANSWER = "THE RELAY CARRIES THE MOOD"
 RELAY_CAPTION = "THE CAPTION CARRIES THE MOOD"
 RELAY_CONTROL = "HER RELAY BEATS THE UNTRAINED ONE"
 RELAY_PILOT_PER_MOOD = 2                                  # stage A: the first two single words of each mood, in the record order
+RELAY_SEEDS = SWAP_SEEDS                                  # e026-e028's seed: one image per (phrase, scene)
+RELAY_N_SCENES = 8                                        # len(e001's 32 scenes [::4]); the runner asserts it
+RELAY_TEST_TITLE = "A relayed phrase reading in pictures"
+RELAY_ENCODING_TOL = 1e-4                                 # identity check (ii): externally computed fp32 states against this
+#                                                           runner's own fp32 encoding of the same caption (largest per-token
+#                                                           relative difference)
+# The grid's 16 held-out phrases split by T5 into fragments, in the grid's order, each with the neutral filler of the same Qwen3
+# token count (the grid's answer-absent caption); stage B checks this list against the export's header.
+RELAY_PHRASES = (
+    {"text": "elated", "mood": "up", "filler": "workaday"},
+    {"text": "jubilant and gleeful", "mood": "up", "filler": "workaday and nondescript"},
+    {"text": "forlorn and desolate", "mood": "down", "filler": "workaday and nondescript"},
+    {"text": "dismal", "mood": "down", "filler": "neutral"},
+    {"text": "blithe", "mood": "up", "filler": "workaday"},
+    {"text": "jaunty", "mood": "up", "filler": "nondescript"},
+    {"text": "jovial", "mood": "up", "filler": "workaday"},
+    {"text": "giddy", "mood": "up", "filler": "workaday"},
+    {"text": "chirpy", "mood": "up", "filler": "workaday"},
+    {"text": "exultant", "mood": "up", "filler": "nondescript"},
+    {"text": "despondent", "mood": "down", "filler": "nondescript"},
+    {"text": "dejected", "mood": "down", "filler": "workaday"},
+    {"text": "sullen", "mood": "down", "filler": "workaday"},
+    {"text": "lugubrious", "mood": "down", "filler": "nondescript"},
+    {"text": "brooding", "mood": "down", "filler": "workaday"},
+    {"text": "anguished", "mood": "down", "filler": "nondescript"},
+)
 
 
 def relay_prompt(p: str, scene: str, form: str = "bare") -> str:
     return RELAY_FORMS[form].format(s=scene, p=p)
 
 
-def relay_sets(phrases: list, control: bool = True) -> dict:
+def relay_sets(phrases: list, control: bool = True, companion: bool = False) -> dict:
     """e029's image sets per phrase (dicts: text, mood 'up' / 'down', filler = the neutral phrase of the same Qwen3 token count):
     {key: (the phrase whose caption gives Qwen3's states, the phrase whose caption gives the T5 ids, the relay written over
-    Qwen3's states at the phrase's tokens: None, 'her' or 'untrained')}. ceiling = the phrase's caption on both sides; relay = the
-    same with her relayed states at the chosen depth; control = the same with an untrained trunk's states through the same cell;
-    filler = the phrase's T5 ids with the filler caption's Qwen3 states (the answer absent)."""
+    Qwen3's states at the phrase's tokens: None, 'her', 'companion' or 'untrained')}. ceiling = the phrase's caption on both
+    sides; relay = the same with her relayed states at the chosen cell; companion = the same at the companion cell (when the two
+    picks differ); control = the same with an untrained trunk's states through the chosen cell; filler = the phrase's T5 ids
+    with the filler caption's Qwen3 states (the answer absent)."""
     out: dict = {}
     for p in phrases:
         t = p["text"]
         out[f"ceiling|{t}"] = (t, t, None)
         out[f"relay|{t}"] = (t, t, "her")
+        if companion:
+            out[f"companion|{t}"] = (t, t, "companion")
         if control:
             out[f"control|{t}"] = (t, t, "untrained")
         out[f"filler|{t}"] = (p["filler"], t, None)
@@ -1313,12 +1342,15 @@ def relay_reads(scores: dict, phrases: list) -> dict:
     filler in the phrase's mood direction under e001's rule (THE RELAY CARRIES THE MOOD), pooled over all phrases and per mood;
     beside it the ceiling minus the filler under the same rule (the caption's own answer); the size = the mean signed relay effect
     over the mean signed ceiling effect, pooled, per mood and per phrase; with the control set, her relay minus the untrained relay
-    in the phrase's mood direction under the same rule (HER RELAY BEATS THE UNTRAINED ONE)."""
+    in the phrase's mood direction under the same rule (HER RELAY BEATS THE UNTRAINED ONE); with the companion set, the
+    companion cell's relay minus the filler under the same rule, with its size, beside the chosen cell's (the test is scored at
+    the chosen cell)."""
     import numpy as np
     has_control = all(f"control|{p['text']}" in scores for p in phrases)
+    has_comp = all(f"companion|{p['text']}" in scores for p in phrases)
 
     def block(ps):
-        rel, cei, ctl, num, den = [], [], [], [], []
+        rel, cei, ctl, cmp_, num, den, cnum = [], [], [], [], [], [], []
         for p in ps:
             s = 1 if p["mood"] == "up" else -1
             f = np.array(scores[f"filler|{p['text']}"])
@@ -1327,6 +1359,10 @@ def relay_reads(scores: dict, phrases: list) -> dict:
             cei += [s * x for x in c]
             if has_control:
                 ctl += [s * x for x in np.subtract(scores[f"relay|{p['text']}"], scores[f"control|{p['text']}"])]
+            if has_comp:
+                k = np.subtract(scores[f"companion|{p['text']}"], f)
+                cmp_ += [s * x for x in k]
+                cnum.append(s * float(np.mean(k)))
             num.append(s * float(np.mean(r)))
             den.append(s * float(np.mean(c)))
         sd = float(np.mean(den))
@@ -1334,12 +1370,140 @@ def relay_reads(scores: dict, phrases: list) -> dict:
                  "size": float(np.mean(num)) / sd if sd else None}
         if has_control:
             out_b["over_control"] = flavor_outcome(ctl, 1, label=RELAY_CONTROL)
+        if has_comp:                                      # the companion cell, read the same way beside the pick of record
+            out_b["companion"] = flavor_outcome(cmp_, 1, label=RELAY_ANSWER)
+            out_b["companion_size"] = float(np.mean(cnum)) / sd if sd else None
         return out_b
 
     out = {"all": block(phrases), "by_mood": {m: block([p for p in phrases if p["mood"] == m]) for m in ("up", "down")},
-           "phrases": {p["text"]: block([p]) for p in phrases}, "control": has_control}
+           "phrases": {p["text"]: block([p]) for p in phrases}, "control": has_control, "companion": has_comp}
     out["TEST"] = out["all"]["relay"]["OUTCOME"]
     return out
+
+
+def relay_summary(result: dict) -> str:
+    """e029's one line: stage A's read, and stage B's when it has run."""
+    def f(v, spec):
+        return "n/a" if v is None else format(v, spec)
+    out = []
+    a = result.get("stage_a")
+    if a:
+        c = a["read"]["ceiling"]
+        out.append(f"stage A: {c['OUTCOME']} in the bare form ({c['mean']:+.3f} +- {c['se']:.3f}, {c['frac_pos']:.0%} of cells; "
+                   f"stage B in the {a['read']['form_next']} form)")
+    b = result.get("reads")
+    if b:
+        al = b["all"]
+        s = (f"stage B: {b['TEST']}: the relay minus the filler {al['relay']['mean']:+.3f} +- {al['relay']['se']:.3f} "
+             f"({al['relay']['frac_pos']:.0%} of cells), {f(al['size'], '.2f')} of the caption's own effect")
+        if b.get("control"):
+            s += f"; against the untrained trunk {al['over_control']['OUTCOME']} ({al['over_control']['mean']:+.3f})"
+        if b.get("companion"):
+            s += f"; the companion cell {al['companion']['OUTCOME']} ({f(al['companion_size'], '.2f')} of the caption's effect)"
+        out.append(s)
+    return "; ".join(out) or "running"
+
+
+def render_relay_readme(meta: dict, recipe: dict) -> str:
+    """e029's README: the question, the design and the rule fixed before the run, and each stage's result when it is done."""
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    mood = {"up": "cheerful", "down": "gloomy"}
+    rows = [f"| {p['text']} | {mood[p['mood']]} | {p['filler']} |" for p in RELAY_PHRASES]
+    pilot = relay_pilot_words(list(RELAY_PHRASES))
+    out = [f"# {RELAY_TEST_ID}: {RELAY_TEST_TITLE}", "",
+           f"Date: 2026-10-05. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Question",
+           "Beatrix is a byte-level language model. A grid of closed-form linear maps (ridge regressions fitted on other "
+           "captions) carries her state at each token of a phrase into Qwen3's residual stream at one layer depth, at that "
+           "token's own position, and Qwen3's remaining layers then run. At the output of Anima's text adapter the grid "
+           "measured how much of the caption's own mood the relayed states deliver, for phrases the maps never saw. Does the "
+           "picture follow: with Beatrix's relayed states written over Qwen3's at the phrase's tokens, does the picture move "
+           "toward the phrase's mood as the caption itself moves it? And is that her training, not any plausible state at "
+           "those positions (the same map applied to an untrained Beatrix of the same shape)?", "",
+           "## Design",
+           f"- The grid's own caption form, \"{RELAY_TEMPLATE.replace(PREFIX, '').format(s='{scene}', p='{phrase}')}\" (after "
+           f"the model card's quality prefix; no 'mood' word, unlike e026-e028); e001's scenes [::{RELAY_SCENE_STEP}] at seed "
+           f"{RELAY_SEEDS[0]} ({RELAY_N_SCENES} scenes).",
+           "- The phrases: the grid's 16 held-out phrases that T5 cuts into fragments, each with a neutral filler of the same "
+           "Qwen3 token count:", "", "| phrase | mood | filler |", "|---|---|---|", *rows, "",
+           "- The sets, per phrase: **ceiling** = the caption's own Qwen3 states; **filler** = the filler caption's Qwen3 states "
+           "under the phrase caption's T5 ids (the phrase's meaning gone from Qwen3's side); **relay** = the caption's Qwen3 "
+           "states with Beatrix's relayed states written in at the chosen cell's depth at every token of the phrase, the "
+           "remaining layers run; **control** = the same through the same map from an untrained Beatrix (random "
+           "initialisation, seed 0); **companion** = the relay at a second cell (a paired tie band's pick) when it differs "
+           "from the chosen one.",
+           "- The encoding: every arm is encoded in fp32 (Qwen3's bf16 weights upcast; this runner's usual pictures encode in "
+           "bf16): the ceiling and filler arms by this runner's own fp32 encoding, the relay arms as fp32 final states "
+           "computed outside the runner with the grid's arithmetic and supplied in place of the encoder's output. Before any "
+           "image the checks: (i) the supplied-states path, fed this runner's own encoder output, reproduces its picture "
+           f"pixel for pixel; (ii) supplied unpatched states match this runner's fp32 encoding of the same caption within "
+           f"{RELAY_ENCODING_TOL:g} (the largest per-token relative difference); (iii) the picture difference between the usual "
+           "bf16 encoding and the fp32 one is measured and quoted. Every token id is checked against the supplied file.",
+           f"- **Stage A** (64 images): the first two single words of each mood ({', '.join(p['text'] for p in pilot)}) x "
+           "{ceiling, filler} x the scenes. **Stage B**: the remaining sets, 384 images in all with stage A's 64 (reused), "
+           "512 with the control, 640 with the companion.", "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           "e001's rule on per-cell differences of the mood score: a set **moves it** when the mean goes the stated way, at "
+           "least 75% of the cells go that way and the mean is beyond 3 standard errors; **NO EFFECT** within 2 standard "
+           "errors of zero or under 60% that way; **MIXED** otherwise. Stage A: per (word, scene) the ceiling minus the "
+           f"filler in the word's mood direction, pooled over its 32 cells: **{RELAY_CAPTION}** -> stage B in this form; "
+           "otherwise stage B moves to the form \"..., {phrase} mood.\" with Beatrix's states taken on those captions "
+           f"through the same map. Stage B, deciding: per (phrase, scene) the relay minus the filler in the phrase's mood "
+           f"direction, pooled over all 16 phrases: **{RELAY_ANSWER}**, **NO EFFECT** or **MIXED**; beside it the ceiling "
+           "minus the filler (the caption's own answer) and the size (the mean signed relay effect over the mean signed "
+           f"ceiling effect), pooled, per mood and per phrase; the relay minus the control under the same rule (**"
+           f"{RELAY_CONTROL}**); the companion cell read the same way beside the chosen cell (the test is scored at the chosen "
+           "cell).", "",
+           "**The prediction registered before any result**: stage A passes in the bare form at a smaller size than the "
+           "'mood' form's; the relay reads NO EFFECT or MIXED on the mood; her relay stands above the untrained one.", "",
+           f"**Limits fixed in advance**: one seed; {RELAY_N_SCENES} scenes; 16 phrases; one linear map per cell.", "",
+           ANIMA.judge_text, ""]
+    a = meta.get("stage_a")
+    if a:
+        r, idt = a["read"]["ceiling"], a.get("identity", {})
+        out += ["## Result: stage A", f"**{r['OUTCOME']}**: the ceiling minus the filler {r['mean']:+.3f} +- {r['se']:.3f}, "
+                f"{r['frac_pos']:.0%} of the cells that way; stage B runs in the **{a['read']['form_next']}** form.", "",
+                "| word | mood | ceiling minus filler (mean) |", "|---|---|---|"]
+        out += [f"| {w} | {mood[v['mood']]} | {v['diff']:+.3f} |" for w, v in a.get("words", {}).items()]
+        if idt:
+            out += ["", f"Identity checks: (i) the supplied-states path fed the runner's own encoder output: "
+                    f"{'pixel for pixel' if idt.get('path_exact') else 'NOT identical'}; (iii) the usual bf16 encoding against "
+                    f"the fp32 one: states {idt.get('bf16_vs_fp32_state_rel', float('nan')):.2e} (largest per-token relative), "
+                    f"pictures {idt.get('bf16_vs_fp32_pixel_mean', float('nan')):.2f} mean absolute pixel difference (0-255), "
+                    f"{idt.get('bf16_vs_fp32_pixel_max', float('nan')):.0f} at most.", ""]
+        out += ["![stage A](sheet_stage_a.jpg)", "", "Rows: the scenes. Columns: per word, the ceiling then the filler.", ""]
+    if meta.get("status") == "done" and meta.get("result", {}).get("reads"):
+        res = meta["result"]
+        b, idt = res["reads"], res.get("identity_b", {})
+        out += ["## Result: stage B", meta.get("summary", ""), "",
+                f"Identity check (ii): the supplied unpatched states against the runner's fp32 encoding, the largest per-token "
+                f"relative difference {idt.get('export_vs_fp32_rel', float('nan')):.2e} (the bar {RELAY_ENCODING_TOL:g}); the "
+                f"picture from the supplied states against the runner's usual one: "
+                f"{idt.get('export_vs_own_pixel_mean', float('nan')):.2f} mean absolute pixel difference.", "",
+                "| phrases | relay minus filler | ceiling minus filler | size | relay minus control | companion |",
+                "|---|---|---|---|---|---|"]
+
+        def cell(v, key):
+            x = v.get(key)
+            return "n/a" if not x else f"{x['mean']:+.3f} +- {x['se']:.3f} ({x['OUTCOME']})"
+
+        def sz(x):
+            return "n/a" if x is None else format(x, ".2f")
+        for lab, v in [("all", b["all"]), *[(f"{mood[m]}", v) for m, v in b["by_mood"].items()],
+                       *list(b["phrases"].items())]:
+            out.append(f"| {lab} | {cell(v, 'relay')} | {cell(v, 'ceiling')} | {sz(v['size'])} | {cell(v, 'over_control')} | "
+                       f"{cell(v, 'companion')} |")
+        out += ["", "![stage B](sheet_stage_b.jpg)", "",
+                "Rows: the scenes, for the first phrase of each mood. Columns: " + ", ".join(res.get("sheet_columns", [])) + ".",
+                ""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    elif not a:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files", "- `result.json`: every cell's scores, the reads and the identity checks.",
+            "- `sheet_stage_a.jpg`, `sheet_stage_b.jpg`: the contact sheets.", ""]
+    return "\n".join(out)
 
 
 # ---- e013-e015: Beatrix as a second conditioning source (a learned push after the adapter) ------------------------
