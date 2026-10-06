@@ -1341,6 +1341,105 @@ def test_relay_stage_b_refuses_a_mismatched_export(runner, monkeypatch, tmp_path
     assert len(rendered) == n_a                                # nothing rendered by the refused runs
 
 
+def _offline_twin(s, pipe, monkeypatch, tmp_path, name):
+    """A second runner on the same fakes that writes its repo files to a local mirror (publish=False) in its own data root."""
+    s2 = ar.AnimaRunner(data_root=str(tmp_path / name), repo_root=str(tmp_path / "repo"), seeds_per_subject=2,
+                        data_repo_id=None, publish=False)
+    s2.state.update({k: v for k, v in s.state.items() if k != "hf_token"}, data_root=str(tmp_path / name))
+    s2._pipe = pipe
+    monkeypatch.setattr(s2, "_point_at_fork", lambda: "fork")
+    monkeypatch.setattr(s2, "_score", s._score)
+    return s2
+
+
+def test_relay_on_two_cards_reads_what_one_card_reads(runner, monkeypatch, tmp_path):
+    """e029 on two cards (DeepSpeed's launcher; here the two ranks run one after the other): each card renders all sets of its
+    own phrases and nothing else, card 0 scores every picture from disk, and every score, read and identity number equals the
+    one-card run's. The two-card runner writes its repo files to the local mirror only, and publish_local() uploads them."""
+    s, repo, pipe, _ = runner
+    moods, ids, _ = _relay_fakes(s, pipe, monkeypatch)
+    exp = _relay_export(tmp_path / "e029_export_record.safetensors", moods, ids)
+    one_a, one_b = s.run_relay(stage="A"), s.run_relay(stage="B", export_path=str(exp))
+    n_commits = len(repo.commits)
+
+    s2 = _offline_twin(s, pipe, monkeypatch, tmp_path, "data2")
+    _, _, rendered = _relay_fakes(s2, pipe, monkeypatch)
+    barriers = []
+
+    def as_rank(rank, stage, **kw):
+        s2.set_data_parallel(rank, 2, barrier=lambda: barriers.append(rank), token="launch-1")
+        n0 = len(rendered)
+        out = s2.run_relay(stage=stage, **kw)
+        return out, rendered[n0:]
+
+    r1a, caps1 = as_rank(1, "A")
+    r0a, caps0 = as_rank(0, "A")
+    assert r1a == {"id": ax.RELAY_TEST_ID, "stage": "A", "rank": 1, "world": 2}
+    # the pilot words in the record order: elated, blithe, dismal, despondent -> card 0 elated + dismal, card 1 the others;
+    # every card checks its own supplied-states path on elated's first caption (three pictures)
+    count = lambda caps, w: sum(c.endswith(f", {w}.") for c in caps)   # noqa: E731
+    assert [count(caps0, w) for w in ("elated", "blithe", "dismal", "despondent")] == [8 + 3, 0, 8, 0]
+    assert [count(caps1, w) for w in ("elated", "blithe", "dismal", "despondent")] == [3, 8, 0, 8]
+    assert len(caps0) == len(caps1) == 2 * 2 * 8 + 3
+    sa = r0a["stage_a"]
+    assert sa["scores"] == one_a["stage_a"]["scores"] and sa["read"] == one_a["stage_a"]["read"]
+    assert sa["cards"] == 2 and len(sa["identity_cards"]) == 2 and sa["identity"] == one_a["stage_a"]["identity"]
+
+    r1b, caps1 = as_rank(1, "B", export_path=str(exp))
+    r0b, caps0 = as_rank(0, "B", export_path=str(exp))
+    rb, ob = r0b["result"], one_b["result"]
+    assert rb["scores"] == ob["scores"] and rb["reads"] == ob["reads"] and rb["identity_b"] == ob["identity_b"]
+    assert rb["cards"] == 2 and len(rb["identity_b_cards"]) == 2 and r0b["status"] == "done"
+    phrases = [p["text"] for p in ax.RELAY_PHRASES]
+    for rank, caps in ((0, caps0), (1, caps1)):               # a phrase's ceiling, relay and control renders on one card
+        own = {t for i, t in enumerate(phrases) if i % 2 == rank}
+        drawn = {t for t in phrases if any(c.endswith(f", {t}.") for c in caps[4:])}   # after the identity checks' four
+        assert drawn == own, (rank, sorted(drawn ^ own))
+    assert barriers == [1, 0, 1, 0]                            # one barrier per card per stage
+    assert len(repo.commits) == n_commits                     # nothing of the two-card run reached the hub
+
+    mirror = tmp_path / "data2" / "hub_mirror" / "experiments" / ax.RELAY_TEST_ID
+    for f in ("meta.json", "README.md", "result.json", "result_stage_a.json", "sheet_stage_a.jpg", "sheet_stage_b.jpg"):
+        assert (mirror / f).is_file(), f
+    s2.publish_local()
+    assert len(repo.commits) == n_commits + 2                 # the experiment's files in one commit, then the index
+    base = f"experiments/{ax.RELAY_TEST_ID}"
+    for f in ("meta.json", "result.json", "sheet_stage_b.jpg"):
+        assert repo.files_[f"{base}/{f}"] == (mirror / f).read_bytes(), f
+
+
+def test_relay_card_zero_refuses_a_missing_or_foreign_marker(runner, monkeypatch, tmp_path):
+    """Card 0 reads no picture unless every card left its marker under this launch's token: a card that never rendered, or a
+    marker left by another launch, stops the stage before any score."""
+    s, repo, pipe, _ = runner
+    s3 = _offline_twin(s, pipe, monkeypatch, tmp_path, "data3")
+    _relay_fakes(s3, pipe, monkeypatch)
+    s3.set_data_parallel(0, 2, barrier=lambda: None, token="launch-2")
+    with pytest.raises(RuntimeError, match="rank 1's marker"):
+        s3.run_relay(stage="A")
+    marker = tmp_path / "data3" / "experiments" / ax.RELAY_TEST_ID / "stage_a" / "rank1.json"
+    marker.write_text(json.dumps({"rank": 1, "world": 2, "token": "another-launch", "sets": []}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="from another launch"):
+        s3.run_relay(stage="A", force=True)
+    with pytest.raises(ValueError, match="barrier"):
+        s3.set_data_parallel(1, 2)
+    with pytest.raises(ValueError, match="outside"):
+        s3.set_data_parallel(2, 2, barrier=lambda: None)
+
+
+def test_relay_dp_keeps_one_card_per_process():
+    from geolip_anima_trainer import relay_dp
+    assert relay_dp.one_card({}) is None
+    assert relay_dp.one_card({"LOCAL_RANK": "1", "CUDA_VISIBLE_DEVICES": "0,1"}) == "1"
+    assert relay_dp.one_card({"LOCAL_RANK": "0", "CUDA_VISIBLE_DEVICES": "3, 5"}) == "3"
+    assert relay_dp.one_card({"LOCAL_RANK": "1"}) == "1"
+    with pytest.raises(RuntimeError, match="no card"):
+        relay_dp.one_card({"LOCAL_RANK": "2", "CUDA_VISIBLE_DEVICES": "0,1"})
+    a = relay_dp.parse(["--stage", "B", "--export", "x.safetensors", "--data-root", "d", "--models-dir", "m", "--offline",
+                        "--local_rank=1"])
+    assert a.stage == "B" and a.offline and a.local_rank == 1 and a.barrier_hours == 6.0
+
+
 def test_swap_aligned_needs_the_same_qwen_positions(runner):
     """e028's guard: every swapped caption keeps the first word's Qwen3 positions and length, or the run stops."""
     from types import SimpleNamespace

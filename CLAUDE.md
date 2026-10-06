@@ -578,6 +578,21 @@ and 'downbeat' share most of their state); the byte after the phrase does not. e
 [a, n] mapped before W, relu [max(a,0), max(-a,0), n] (e023 Beatrix, e024 untrained), exp [e^a, e^-a, n] (e025, e023's
 seed); contrast_l1 is taken on the mapped rows; the weights' metadata 'input map' names the map.
 `_connector_inputs()` builds every arm's input rows.
+SEVERAL CARDS FOR e029 (`relay_dp.py`, 2026-10-05): `deepspeed --num_gpus=N geolip_anima_trainer/relay_dp.py --stage A|B ...`
+runs one process per card under DeepSpeed's launcher (the same launcher the trainer uses); each process keeps only its own card
+(`one_card`: the launcher's CUDA_VISIBLE_DEVICES entry at LOCAL_RANK, set before CUDA starts, so the card is cuda:0 there) and
+the cards meet at gloo barriers (no tensor crosses cards). `AnimaRunner.set_data_parallel(rank, world, barrier, token)`: every
+card renders ALL sets of its own phrases (`_relay_share`: phrases dealt round-robin in the record order, so a phrase's paired
+arms render on one card, batched exactly as on a single card), saves them as PNG, and leaves a marker (`stage_a|stage_b/
+rank<r>.json`: the sets it rendered, its identity checks, the launch's token); card 0 alone, after the barrier, reads every
+card's marker, scores every picture read back from disk (lossless: the judge sees the rendered pixels), writes the result and
+commits the repo; the other cards return `{"id", "stage", "rank", "world"}`. With N cards the result adds `cards` and each card's
+identity numbers (`identity_cards` / `identity_b_cards`); on one card nothing changes. OFFLINE: `AnimaConfig.publish = False`
+(or `ANIMA_OFFLINE=1`, relay_dp's `--offline`) makes run_relay write the experiments repo's files to `{data_root}/hub_mirror`
+through `sana_runner._LocalRepo` (the hub repo's interface over a folder; whole-file writes renamed into place), for a machine
+with no write token; `publish_local(rid)` uploads that experiment's files in one commit and refreshes the README index where a
+token is set. Tests: `test_relay_on_two_cards_reads_what_one_card_reads` (every score, read and identity number equal to the
+one-card run; each card drew only its phrases; nothing reached the hub until publish_local), the marker refusals, `one_card`.
 
 ### Training previews — `SamplesConfig` → `[samples]`
 `TrainConfig.samples = SamplesConfig(prompts=[...])` renders a `[samples]` table into the lora toml

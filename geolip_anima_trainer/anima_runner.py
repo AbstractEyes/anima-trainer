@@ -44,7 +44,7 @@ from . import sana_experiments as sx
 from . import sana_runner as _sr
 from . import training_sets as _ts
 from .cache_factory import get_hf_token
-from .sana_runner import HELD_OUT, SUBJECTS, _HubRepo, _drop_torchao, _grid
+from .sana_runner import HELD_OUT, SUBJECTS, _HubRepo, _LocalRepo, _drop_torchao, _grid
 
 GEN_STEPS, GEN_CFG, GEN_SHIFT = 30, 4.5, 3.0          # the card: 30-50 steps, guidance 4-5; shift 3 = ComfyUI's
 RESOLUTION = 768                                       # inside the card's 512-1536; about half the cost of 1024
@@ -78,10 +78,15 @@ class AnimaConfig:
     eval_seeds: list[int] = field(default_factory=lambda: [101, 202, 303, 404])
     eval_scales: list[float] = field(default_factory=lambda: [0.0, 0.5, 1.0])
     backup_repo: str | None = None
+    # False: run_relay writes the experiments repo's files to a local mirror ({data_root}/hub_mirror) instead of the hub,
+    # for a machine with no write token (a shared pod); publish_local() uploads them from one that has a token
+    publish: bool = True
 
     @classmethod
     def from_env(cls, **overrides) -> "AnimaConfig":
         env: dict = {}
+        if os.environ.get("ANIMA_OFFLINE") == "1":
+            env["publish"] = False
         if os.environ.get("ANIMA_DATA_ROOT"):
             env["data_root"] = os.environ["ANIMA_DATA_ROOT"]
         if os.environ.get("ANIMA_EXPERIMENTS_REPO"):
@@ -558,6 +563,54 @@ class AnimaRunner(_sr.SanaRunner):
         self._judge_fns = None
         self._base = None
         self._cbase = None
+        self._dp: "dict | None" = None
+
+    # ---- several cards (e029 under DeepSpeed's launcher; relay_dp.py) --------------------------------
+    def set_data_parallel(self, rank: int, world: int, barrier=None, token: str = "") -> None:
+        """This process is card `rank` of `world`: run_relay renders only this card's share of the phrases and card 0 scores
+        every picture after `barrier` (a callable every card reaches; None only when world is 1). `token` is the same on
+        every card of one launch, so card 0 never reads another launch's markers."""
+        if not 0 <= rank < world:
+            raise ValueError(f"rank {rank} is outside 0..{world - 1}")
+        if world > 1 and barrier is None:
+            raise ValueError("several cards need a barrier every card reaches")
+        self._dp = {"rank": int(rank), "world": int(world), "barrier": barrier, "token": str(token)}
+
+    def _rank_world(self) -> "tuple[int, int]":
+        return (self._dp["rank"], self._dp["world"]) if self._dp else (0, 1)
+
+    def _barrier(self) -> None:
+        if self._dp and self._dp["barrier"] is not None:
+            self._dp["barrier"]()
+
+    def _save_state(self) -> None:
+        if self._rank_world()[0] == 0:            # one writer when several cards run the same setup
+            super()._save_state()
+
+    # ---- where the experiments repo's files go ----------------------------------------------------
+    def _mirror_root(self) -> Path:
+        return Path(self._need("data_root")) / "hub_mirror"
+
+    def _experiments_repo(self):
+        """The experiments repo: the hub, or the local mirror when cfg.publish is False."""
+        if self.cfg.publish:
+            return _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
+        return _LocalRepo(self._mirror_root())
+
+    def publish_local(self, rid: str = ax.RELAY_TEST_ID, mirror: "str | Path | None" = None) -> dict:
+        """Upload what an offline run wrote to its local mirror into the experiments repo: every file under
+        experiments/<rid>/ in one commit, then the repo README's index with that experiment's meta (the hub's other
+        folders kept). Run where a write token is set, after copying the mirror over."""
+        local = _LocalRepo(mirror or self._mirror_root())
+        files = {f: local.root / f for f in local.files() if f.startswith(f"experiments/{rid}/")}
+        meta = local.metas().get(rid)
+        if not files or meta is None:
+            raise FileNotFoundError(f"{local.root} holds no experiments/{rid}/meta.json")
+        repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token") or get_hf_token())
+        repo.commit(files, f"{rid}: {meta.get('status')} (written offline, {len(files)} files)")
+        self._publish_index(repo, {rid: meta})
+        print(f"[{self.TAG}] published {len(files)} files of {rid} from {local.root} to {self.cfg.repo_id}", flush=True)
+        return meta
 
     # ---- setup ------------------------------------------------------------------------------------
     def setup(self) -> dict:
@@ -1348,15 +1401,21 @@ class AnimaRunner(_sr.SanaRunner):
         caption form stage A's read chose (the bare form, or the 'mood' form when the bare caption's own ceiling did not
         carry the mood): the relay arms' final Qwen3 states read from export_path (a safetensors file with its header, made
         where the maps were fitted, in that form), the ceiling and filler arms at this runner's fp32 encoding like stage A's;
-        in the bare form stage A's images are reused, in the mood form every set is rendered. force=True reruns a stage."""
+        in the bare form stage A's images are reused, in the mood form every set is rendered. force=True reruns a stage.
+        On several cards (set_data_parallel; relay_dp.py under DeepSpeed's launcher) every card renders its share of the
+        phrases and card 0 alone scores the pictures and writes the repo; the other cards return a short dict."""
         self._need_model()
         _drop_torchao()
-        repo = _HubRepo(self.cfg.repo_id, self.state.get("hf_token"))
+        rank, world = self._rank_world()
+        lead = rank == 0
+        repo = self._experiments_repo()
         metas = repo.metas()
-        try:
-            self._publish_index(repo, metas)
-        except Exception as e:  # noqa: BLE001
-            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        if lead:
+            try:
+                self._publish_index(repo, metas)
+            except Exception as e:  # noqa: BLE001
+                where = self.cfg.repo_id if self.cfg.publish else str(self._mirror_root())
+                raise RuntimeError(f"cannot write to {where} ({e}); the HF_TOKEN needs WRITE access") from e
         rid, recipe = ax.RELAY_TEST_ID, self._flavor_recipe()
         base = f"experiments/{rid}"
         out_dir = Path(self._need("data_root")) / "experiments" / rid
@@ -1379,8 +1438,9 @@ class AnimaRunner(_sr.SanaRunner):
             meta = {"id": rid, "title": ax.RELAY_TEST_TITLE, "date": "2026-10-05", "kind": "relay", "status": "running",
                     "recipe": recipe}
         meta["status"] = "running"
-        repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_relay_readme(meta, recipe)},
-                    f"{rid}: stage {stage} started")
+        if lead:
+            repo.commit({f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_relay_readme(meta, recipe)},
+                        f"{rid}: stage {stage} started")
         t0 = time.time()
         try:
             if stage == "A":
@@ -1388,10 +1448,15 @@ class AnimaRunner(_sr.SanaRunner):
             else:
                 res = self._relay_stage_b(out_dir, export_path, meta["stage_a"])
         except Exception as e:  # noqa: BLE001
-            meta.update(status="failed", error=f"stage {stage}: {type(e).__name__}: {e}"[:500])
-            self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
-                                            f"{base}/README.md": ax.render_relay_readme(meta, recipe)}, f"{rid}: failed"))
+            if lead:
+                meta.update(status="failed", error=f"stage {stage}: {type(e).__name__}: {e}"[:500])
+                self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                                                f"{base}/README.md": ax.render_relay_readme(meta, recipe)}, f"{rid}: failed"))
             raise
+        if not lead:
+            print(f"[anima] {rid} stage {stage}: rank {rank} of {world} rendered its share in {round(time.time() - t0)} s; "
+                  f"rank 0 scores and writes the result", flush=True)
+            return {"id": rid, "stage": stage, "rank": rank, "world": world}
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
         if stage == "A":
             meta.update(stage_a={k: v for k, v in res.items() if k != "cells"}, status="running", seconds_a=round(time.time() - t0),
@@ -1416,7 +1481,57 @@ class AnimaRunner(_sr.SanaRunner):
     def _relay_cells(self) -> "tuple[list, list]":
         cells = [(si, sd) for si in range(0, len(SUBJECTS), ax.RELAY_SCENE_STEP) for sd in ax.RELAY_SEEDS]
         assert len(cells) == ax.RELAY_N_SCENES * len(ax.RELAY_SEEDS), (len(cells), ax.RELAY_N_SCENES)
+        assert len({si for si, _ in cells}) == len(cells), "one seed per scene: a picture's file is named by its scene"
         return cells, [sd for _, sd in cells]
+
+    @staticmethod
+    def _relay_png(key: str, si: int) -> str:
+        return f"{key.replace('|', '_').replace(' ', '_')}_{si:02d}.png"
+
+    def _relay_share(self, keys: list, group_of, groups: list) -> list:
+        """This card's sets: all sets of one phrase on one card, so its paired arms render on the same card and are batched
+        exactly as on a single card; the phrases dealt round-robin over the cards in the record order."""
+        rank, world = self._rank_world()
+        return [k for k in keys if groups.index(group_of(k)) % world == rank]
+
+    def _relay_marker(self, folder: Path, done: list, extra: dict) -> None:
+        """Written by every card after its last picture: which sets it rendered, under this launch's token."""
+        rank, world = self._rank_world()
+        token = (self._dp or {}).get("token", "")
+        (folder / f"rank{rank}.json").write_text(
+            json.dumps({"rank": rank, "world": world, "token": token, "sets": list(done), **extra}, default=float),
+            encoding="utf-8")
+
+    def _relay_gather(self, folder: Path, keys: list, cells: list) -> "tuple[list, dict]":
+        """Card 0, after the barrier: every card's marker (this launch's token; together they cover every set) and every set's
+        pictures read back from disk in the cell order (PNG is lossless: the judge sees the pixels rendered). Returns (the
+        markers in rank order, {set key: [picture per cell]})."""
+        from PIL import Image
+        _, world = self._rank_world()
+        token = (self._dp or {}).get("token", "")
+        marks, done = [], set()
+        for r in range(world):
+            p = folder / f"rank{r}.json"
+            m = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else None
+            if m is None or m.get("token") != token or m.get("world") != world:
+                raise RuntimeError(f"rank {r}'s marker {p} is missing or from another launch: its pictures are not read")
+            marks.append(m)
+            done |= set(m["sets"])
+        missing = [k for k in keys if k not in done]
+        if missing:
+            raise RuntimeError(f"no card rendered {missing[:4]} ({len(missing)} sets)")
+        ims = {}
+        for k in keys:
+            paths = [folder / self._relay_png(k, si) for si, _ in cells]
+            absent = [p.name for p in paths if not p.is_file()]
+            if absent:
+                raise RuntimeError(f"{k}: pictures missing on disk ({absent[:3]})")
+            got = []
+            for p in paths:
+                with Image.open(p) as im:
+                    got.append(im.convert("RGB"))
+            ims[k] = got
+        return marks, ims
 
     def _render_states(self, qwen_prompts: list[str], t5_prompts: list[str], states: list, seeds: list[int], eta=None) -> list:
         """Images from given final Qwen3 states (one [L, D] per image, in place of the encoder's output; AnimaPipe
@@ -1468,10 +1583,11 @@ class AnimaRunner(_sr.SanaRunner):
               f"values over 8 levels", flush=True)
         return out, own, fp
 
-    def _relay_stage_a(self, out_dir: Path) -> dict:
+    def _relay_stage_a(self, out_dir: Path) -> "dict | None":
         import numpy as np
         pipe = self._eval_pipe()
         self._assert_stock()
+        rank, world = self._rank_world()
         cells, S = self._relay_cells()
         words = ax.relay_pilot_words(list(ax.RELAY_PHRASES))
         sets = ax.relay_pilot_sets(words)
@@ -1482,21 +1598,30 @@ class AnimaRunner(_sr.SanaRunner):
             if nq != nf:
                 raise ValueError(f"{w['filler']!r} does not keep {w['text']!r}'s Qwen3 token count ({nf} vs {nq})")
         need = sorted({p for q, _, _ in sets.values() for p in P[q]})
+        mine = self._relay_share(list(sets), lambda k: sets[k][1], [w["text"] for w in words])
         print(f"[anima] e029 stage A: {len(sets)} sets of {len(cells)} images ({', '.join(w['text'] for w in words)}: ceiling "
-              f"and filler), every caption at this runner's fp32 encoding ({len(need)} captions encoded once)", flush=True)
+              f"and filler), every caption at this runner's fp32 encoding ({len(need)} captions encoded once)"
+              + (f"; rank {rank} of {world} renders {len(mine)} of the sets" if world > 1 else ""), flush=True)
         enc = dict(zip(need, pipe.encode_fp32(need)))
         first = P[words[0]["text"]][0]
         identity, _, _ = self._relay_identity_path(first, S[0], enc[first])
-        eta = _sr._Eta(self.TAG, "e029 stage A", len(sets) * len(cells))
-        scores, sheet = {}, {}
+        eta = _sr._Eta(self.TAG, "e029 stage A" + (f" (rank {rank} of {world})" if world > 1 else ""), len(mine) * len(cells))
         img_dir = out_dir / "stage_a"
         img_dir.mkdir(parents=True, exist_ok=True)
-        for key, (q, t, _r) in sets.items():
+        for key in mine:
+            q, t, _r = sets[key]
             ims = self._render_states(P[q], P[t], [enc[p] for p in P[q]], S, eta)
-            _, sc = self._score(ims)
-            scores[key], sheet[key] = [float(x) for x in sc], ims
             for (si, _), im in zip(cells, ims):
-                im.save(img_dir / f"{key.replace('|', '_').replace(' ', '_')}_{si:02d}.png")
+                im.save(img_dir / self._relay_png(key, si))
+        self._relay_marker(img_dir, mine, {"identity": identity})
+        self._barrier()
+        if rank != 0:
+            return None
+        marks, sheet = self._relay_gather(img_dir, list(sets), cells)
+        scores = {}
+        for key in sets:
+            _, sc = self._score(sheet[key])
+            scores[key] = [float(x) for x in sc]
             print(f"[anima] e029 stage A {key}: mood score {np.mean(scores[key]):+.3f}", flush=True)
         read = ax.relay_pilot_read(scores, words)
         cols = [k for w in words for k in (f"ceiling|{w['text']}", f"filler|{w['text']}")]
@@ -1504,9 +1629,12 @@ class AnimaRunner(_sr.SanaRunner):
         per = {w["text"]: {"mood": w["mood"], "filler": w["filler"],
                            "diff": float(np.mean(np.subtract(scores[f"ceiling|{w['text']}"], scores[f"filler|{w['text']}"])))}
                for w in words}
-        return {"read": read, "scores": scores, "words": per, "identity": identity, "sheet_columns": cols,
-                "cells": [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
-                          for j, (si, sd) in enumerate(cells)]}
+        out = {"read": read, "scores": scores, "words": per, "identity": identity, "sheet_columns": cols,
+               "cells": [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
+                         for j, (si, sd) in enumerate(cells)]}
+        if world > 1:                                     # each card proved its own supplied-states path
+            out.update(cards=world, identity_cards=[m["identity"] for m in marks])
+        return out
 
     def _relay_stage_b(self, out_dir: Path, export_path: str, stage_a: dict) -> dict:
         import hashlib
@@ -1578,24 +1706,36 @@ class AnimaRunner(_sr.SanaRunner):
         enc = dict(zip(need, pipe.encode_fp32(need)))
         arm_of = {"her": "relay", "companion": "companion", "untrained": "control"}
         todo = [k for k in sets if k not in reuse]
+        rank, world = self._rank_world()
+        mine = self._relay_share(todo, lambda k: sets[k][1], [p["text"] for p in ax.RELAY_PHRASES])
         print(f"[anima] e029 stage B: {len(todo)} sets of {len(cells)} images ({len(reuse)} sets reused from stage A); the "
-              f"ceiling and filler arms at this runner's fp32 encoding ({len(need)} captions), the relay arms from the export",
-              flush=True)
-        eta = _sr._Eta(self.TAG, "e029 stage B", len(todo) * len(cells))
-        scores, sheet = dict(reuse), {}
-        for key in todo:
+              f"ceiling and filler arms at this runner's fp32 encoding ({len(need)} captions), the relay arms from the export"
+              + (f"; rank {rank} of {world} renders {len(mine)} of the sets" if world > 1 else ""), flush=True)
+        eta = _sr._Eta(self.TAG, "e029 stage B" + (f" (rank {rank} of {world})" if world > 1 else ""), len(mine) * len(cells))
+        img_dir = out_dir / "stage_b"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        for key in mine:
             q, t, r = sets[key]
             if r is None:
                 st = [enc[p] for p in P[q]]
             else:
                 st = [T[f"states.{arm_of[r]}"][row[(t, si)], :L[row[(t, si)]]] for si, _ in cells]
             ims = self._render_states(P[q], P[t], st, S, eta)
-            _, sc = self._score(ims)
-            scores[key], sheet[key] = [float(x) for x in sc], ims
+            for (si, _), im in zip(cells, ims):
+                im.save(img_dir / self._relay_png(key, si))
+        self._relay_marker(img_dir, mine, {"identity_b": identity})
+        self._barrier()
+        if rank != 0:
+            return None
+        marks, sheet = self._relay_gather(img_dir, todo, cells)
+        scores = dict(reuse)
+        for key in todo:
+            _, sc = self._score(sheet[key])
+            scores[key] = [float(x) for x in sc]
             print(f"[anima] e029 stage B {key}: mood score {np.mean(scores[key]):+.3f}", flush=True)
         reads = ax.relay_reads(scores, list(ax.RELAY_PHRASES))
         for k in reuse:                                    # stage A's pictures, for the sheet, when this runtime has them
-            fs = [out_dir / "stage_a" / f"{k.replace('|', '_').replace(' ', '_')}_{si:02d}.png" for si, _ in cells]
+            fs = [out_dir / "stage_a" / self._relay_png(k, si) for si, _ in cells]
             if all(f.is_file() for f in fs):
                 from PIL import Image
                 sheet[k] = [Image.open(f).convert("RGB") for f in fs]
@@ -1605,11 +1745,14 @@ class AnimaRunner(_sr.SanaRunner):
         cols = [f"{k}|{t}" for t in show for k in kinds if f"{k}|{t}" in sheet]
         _grid([[sheet[k][r] for k in cols] for r in range(len(cells))], out_dir / "sheet_stage_b.jpg")
         h = hashlib.sha256(Path(export_path).read_bytes()).hexdigest()
-        return {"form": form, "reads": reads, "scores": scores, "identity_b": identity, "sheet_columns": cols,
-                "export": {"file": Path(export_path).name, "sha256": h, "pick": H.get("pick"), "companion": H.get("companion"),
-                           "arms": arms, "precision": H.get("precision")},
-                "cells": [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
-                          for j, (si, sd) in enumerate(cells)]}
+        out = {"form": form, "reads": reads, "scores": scores, "identity_b": identity, "sheet_columns": cols,
+               "export": {"file": Path(export_path).name, "sha256": h, "pick": H.get("pick"), "companion": H.get("companion"),
+                          "arms": arms, "precision": H.get("precision")},
+               "cells": [{"scene": SUBJECTS[si], "seed": sd, **{k: scores[k][j] for k in scores}}
+                         for j, (si, sd) in enumerate(cells)]}
+        if world > 1:                                     # each card checked the export against its own encoding
+            out.update(cards=world, identity_b_cards=[m["identity_b"] for m in marks])
+        return out
 
     # ---- e012: the attribute screen ----------------------------------------------------------------------
     def _tagger(self):

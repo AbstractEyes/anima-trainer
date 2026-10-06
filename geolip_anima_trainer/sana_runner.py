@@ -324,6 +324,48 @@ class _HubRepo:
         self.commit(_folder_files(folder, path_in_repo, allow), msg)
 
 
+class _LocalRepo:
+    """The experiments repo's interface over a local folder laid out like the repo: a machine with no write token (a shared
+    pod) writes here, and AnimaRunner.publish_local() uploads the files later from one that has a token. Every file is
+    written whole and then renamed into place, so another process reading meta.json never sees half a file."""
+
+    def __init__(self, root: "str | Path"):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def files(self) -> list[str]:
+        return sorted(p.relative_to(self.root).as_posix() for p in self.root.rglob("*")
+                      if p.is_file() and not p.name.endswith(".part"))
+
+    def read(self, path_in_repo: str) -> "str | None":
+        p = self.root / path_in_repo
+        return p.read_text(encoding="utf-8") if p.is_file() else None
+
+    def metas(self) -> dict:
+        """Every experiments/<id>/meta.json in the folder, keyed by id."""
+        return {p.parent.name: json.loads(p.read_text(encoding="utf-8"))
+                for p in sorted((self.root / "experiments").glob("*/meta.json"))}
+
+    def commit(self, files: dict, msg: str, *, retry: bool = True) -> None:
+        for path, v in files.items():
+            dst = self.root / path
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.with_name(dst.name + ".part")
+            if isinstance(v, Path):
+                shutil.copyfile(v, tmp)
+            else:
+                tmp.write_bytes(v.encode("utf-8") if isinstance(v, str) else v)
+            os.replace(tmp, dst)
+        with open(self.root.parent / f"{self.root.name}_commits.log", "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\t{msg}\t{len(files)} files\n")
+
+    def put(self, path_in_repo: str, data: "bytes | str", msg: str, *, retry: bool = True) -> None:
+        self.commit({path_in_repo: data.encode("utf-8") if isinstance(data, str) else data}, msg, retry=retry)
+
+    def put_folder(self, folder: "str | Path", path_in_repo: str, msg: str, *, allow: "list[str] | None" = None) -> None:
+        self.commit(_folder_files(folder, path_in_repo, allow), msg)
+
+
 @dataclass
 class SanaConfig:
     """Everything the Sana runs need, overridable from the notebook (kwargs) or env (ANIMA_*)."""
