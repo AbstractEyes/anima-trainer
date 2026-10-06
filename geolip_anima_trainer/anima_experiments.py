@@ -1262,6 +1262,7 @@ RELAY_SCENE_STEP = 4                                      # e001's scenes [::4]:
 RELAY_ANSWER = "THE RELAY CARRIES THE MOOD"
 RELAY_CAPTION = "THE CAPTION CARRIES THE MOOD"
 RELAY_CONTROL = "HER RELAY BEATS THE UNTRAINED ONE"
+RELAY_MOUNT = "THE MOUNTED RELAY BEATS THE BARE ONE"       # added 2026-10-06, before any stage-B picture: a mount arm minus the relay
 RELAY_PILOT_PER_MOOD = 2                                  # stage A: the first two single words of each mood, in the record order
 RELAY_SEEDS = SWAP_SEEDS                                  # e026-e028's seed: one image per (phrase, scene)
 RELAY_N_SCENES = 8                                        # len(e001's 32 scenes [::4]); the runner asserts it
@@ -1295,13 +1296,14 @@ def relay_prompt(p: str, scene: str, form: str = "bare") -> str:
     return RELAY_FORMS[form].format(s=scene, p=p)
 
 
-def relay_sets(phrases: list, control: bool = True, companion: bool = False) -> dict:
+def relay_sets(phrases: list, control: bool = True, companion: bool = False, mounts: tuple = ()) -> dict:
     """e029's image sets per phrase (dicts: text, mood 'up' / 'down', filler = the neutral phrase of the same Qwen3 token count):
     {key: (the phrase whose caption gives Qwen3's states, the phrase whose caption gives the T5 ids, the relay written over
-    Qwen3's states at the phrase's tokens: None, 'her', 'companion' or 'untrained')}. ceiling = the phrase's caption on both
-    sides; relay = the same with her relayed states at the chosen cell; companion = the same at the companion cell (when the two
-    picks differ); control = the same with an untrained trunk's states through the chosen cell; filler = the phrase's T5 ids
-    with the filler caption's Qwen3 states (the answer absent)."""
+    Qwen3's states at the phrase's tokens: None, 'her', 'companion', 'untrained' or a mount arm's name)}. ceiling = the phrase's
+    caption on both sides; relay = the same with her relayed states at the chosen cell; companion = the same at the companion cell
+    (when the two picks differ); control = the same with an untrained trunk's states through the chosen cell; each mount arm
+    (mount_<group>, mount_<group>_own: the export's arms of her trunk with an arm group mounted) = the same with that arm's
+    relayed states; filler = the phrase's T5 ids with the filler caption's Qwen3 states (the answer absent)."""
     out: dict = {}
     for p in phrases:
         t = p["text"]
@@ -1311,8 +1313,20 @@ def relay_sets(phrases: list, control: bool = True, companion: bool = False) -> 
             out[f"companion|{t}"] = (t, t, "companion")
         if control:
             out[f"control|{t}"] = (t, t, "untrained")
+        for m in mounts:
+            assert m.startswith("mount_"), m
+            out[f"{m}|{t}"] = (t, t, m)
         out[f"filler|{t}"] = (p["filler"], t, None)
     return out
+
+
+def mount_label(arm: str) -> str:
+    """A mount arm's plain name: mount_gCA -> 'nine arms, first seed'; mount_gCB_own -> 'nine arms, second seed, own cell'."""
+    parts = arm.split("_")
+    group = parts[1] if len(parts) > 1 else arm
+    kind = {"gC": "nine arms", "gX": "eight arms"}.get(group[:2], f"arms {group}")
+    seed = {"A": "first seed", "B": "second seed"}.get(group[-1:], group)
+    return f"{kind}, {seed}" + (", own cell" if arm.endswith("_own") else "")
 
 
 def relay_pilot_words(phrases: list) -> list:
@@ -1344,13 +1358,18 @@ def relay_reads(scores: dict, phrases: list) -> dict:
     over the mean signed ceiling effect, pooled, per mood and per phrase; with the control set, her relay minus the untrained relay
     in the phrase's mood direction under the same rule (HER RELAY BEATS THE UNTRAINED ONE); with the companion set, the
     companion cell's relay minus the filler under the same rule, with its size, beside the chosen cell's (the test is scored at
-    the chosen cell)."""
+    the chosen cell). With mount arms (added 2026-10-06, before any stage-B picture): each read like the relay (minus the filler,
+    its size) and against the relay, per (phrase, scene) in the phrase's mood direction under the same rule (THE MOUNTED RELAY
+    BEATS THE BARE ONE); the deciding test stays the relay's."""
     import numpy as np
     has_control = all(f"control|{p['text']}" in scores for p in phrases)
     has_comp = all(f"companion|{p['text']}" in scores for p in phrases)
+    mounts = sorted(m for m in {k.split("|", 1)[0] for k in scores if k.startswith("mount_")}
+                    if all(f"{m}|{p['text']}" in scores for p in phrases))
 
     def block(ps):
         rel, cei, ctl, cmp_, num, den, cnum = [], [], [], [], [], [], []
+        mnt, mnum, mvr = ({m: [] for m in mounts} for _ in range(3))
         for p in ps:
             s = 1 if p["mood"] == "up" else -1
             f = np.array(scores[f"filler|{p['text']}"])
@@ -1363,6 +1382,11 @@ def relay_reads(scores: dict, phrases: list) -> dict:
                 k = np.subtract(scores[f"companion|{p['text']}"], f)
                 cmp_ += [s * x for x in k]
                 cnum.append(s * float(np.mean(k)))
+            for m in mounts:
+                k = np.subtract(scores[f"{m}|{p['text']}"], f)
+                mnt[m] += [s * x for x in k]
+                mnum[m].append(s * float(np.mean(k)))
+                mvr[m] += [s * x for x in np.subtract(scores[f"{m}|{p['text']}"], scores[f"relay|{p['text']}"])]
             num.append(s * float(np.mean(r)))
             den.append(s * float(np.mean(c)))
         sd = float(np.mean(den))
@@ -1373,10 +1397,15 @@ def relay_reads(scores: dict, phrases: list) -> dict:
         if has_comp:                                      # the companion cell, read the same way beside the pick of record
             out_b["companion"] = flavor_outcome(cmp_, 1, label=RELAY_ANSWER)
             out_b["companion_size"] = float(np.mean(cnum)) / sd if sd else None
+        for m in mounts:                                  # each mount arm: read like the relay, and against it
+            out_b[m] = {"relay": flavor_outcome(mnt[m], 1, label=RELAY_ANSWER),
+                        "size": float(np.mean(mnum[m])) / sd if sd else None,
+                        "over_relay": flavor_outcome(mvr[m], 1, label=RELAY_MOUNT)}
         return out_b
 
     out = {"all": block(phrases), "by_mood": {m: block([p for p in phrases if p["mood"] == m]) for m in ("up", "down")},
-           "phrases": {p["text"]: block([p]) for p in phrases}, "control": has_control, "companion": has_comp}
+           "phrases": {p["text"]: block([p]) for p in phrases}, "control": has_control, "companion": has_comp,
+           "mounts": mounts}
     out["TEST"] = out["all"]["relay"]["OUTCOME"]
     return out
 
@@ -1400,6 +1429,10 @@ def relay_summary(result: dict) -> str:
             s += f"; against the untrained trunk {al['over_control']['OUTCOME']} ({al['over_control']['mean']:+.3f})"
         if b.get("companion"):
             s += f"; the companion cell {al['companion']['OUTCOME']} ({f(al['companion_size'], '.2f')} of the caption's effect)"
+        for m in b.get("mounts", []):
+            v = al[m]
+            s += (f"; {mount_label(m)}: {v['relay']['OUTCOME']} ({f(v['size'], '.2f')} of the caption's effect), against the "
+                  f"relay {v['over_relay']['OUTCOME']} ({v['over_relay']['mean']:+.3f})")
         out.append(s)
     return "; ".join(out) or "running"
 
@@ -1432,6 +1465,13 @@ def render_relay_readme(meta: dict, recipe: dict) -> str:
            "remaining layers run; **control** = the same through the same map from an untrained Beatrix (random "
            "initialisation, seed 0); **companion** = the relay at a second cell (a paired tie band's pick) when it differs "
            "from the chosen one.",
+           *([f"- Added 2026-10-06, before any stage-B picture: the **mount arms** "
+              f"({', '.join(mount_label(m) for m in meta['mounts'])}) = the relay with Beatrix's trunk carrying a group of "
+              "trained adapter arms (her eight stage arms with a caption arm trained over them), at the chosen cell and, "
+              "labelled 'own cell', at that armed trunk's own chosen cell when it differs (128 images per arm). Each is read "
+              "like the relay and "
+              f"against it, per cell in the phrase's mood direction under the same rule (**{RELAY_MOUNT}**); the deciding "
+              "test stays the relay's."] if meta.get("mounts") else []),
            "- The encoding: every arm is encoded in fp32 (Qwen3's bf16 weights upcast; this runner's usual pictures encode in "
            "bf16): the ceiling and filler arms by this runner's own fp32 encoding, the relay arms as fp32 final states "
            "computed outside the runner with the grid's arithmetic and supplied in place of the encoder's output. Before any "
@@ -1495,6 +1535,12 @@ def render_relay_readme(meta: dict, recipe: dict) -> str:
                        *list(b["phrases"].items())]:
             out.append(f"| {lab} | {cell(v, 'relay')} | {cell(v, 'ceiling')} | {sz(v['size'])} | {cell(v, 'over_control')} | "
                        f"{cell(v, 'companion')} |")
+        for m in b.get("mounts", []):
+            out += ["", f"The mount arm **{mount_label(m)}**:", "",
+                    "| phrases | mount relay minus filler | size | mount relay minus the relay |", "|---|---|---|---|"]
+            for lab, v in [("all", b["all"]), *[(f"{mood[k]}", v) for k, v in b["by_mood"].items()],
+                           *list(b["phrases"].items())]:
+                out.append(f"| {lab} | {cell(v[m], 'relay')} | {sz(v[m]['size'])} | {cell(v[m], 'over_relay')} |")
         out += ["", "![stage B](sheet_stage_b.jpg)", "",
                 "Rows: the scenes, for the first phrase of each mood. Columns: " + ", ".join(res.get("sheet_columns", [])) + ".",
                 ""]

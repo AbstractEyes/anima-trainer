@@ -1434,6 +1434,9 @@ class AnimaRunner(_sr.SanaRunner):
                 return meta
             if export_path is None:
                 raise ValueError("stage B reads the relay arms' states from export_path")
+            from safetensors import safe_open
+            with safe_open(export_path, "pt") as f:                 # the mount arms the export carries (named in the README)
+                meta["mounts"] = sorted(a for a in json.loads(f.metadata()["header"])["arms"] if a.startswith("mount_"))
         if stage == "A":
             meta = {"id": rid, "title": ax.RELAY_TEST_TITLE, "date": "2026-10-05", "kind": "relay", "status": "running",
                     "recipe": recipe}
@@ -1651,7 +1654,8 @@ class AnimaRunner(_sr.SanaRunner):
         if not H["form"].startswith(form):
             raise ValueError(f"stage A sent stage B to the {form!r} form; the export is {H['form'][:40]!r}")
         arms = H["arms"]
-        for a in ("relay", "companion"):                   # the mood form's maps are verified in the bare form (no grid of its own)
+        mounts = tuple(sorted(a for a in arms if a.startswith("mount_")))   # her trunk with an arm group mounted (2026-10-06)
+        for a in ("relay", "companion", *mounts):          # the mood form's maps are verified in the bare form (no grid of its own)
             if a in arms and not str(arms[a].get("grid", "")).startswith("verified"):
                 raise RuntimeError(f"the export's {a} arm is not verified against its grid: {arms[a].get('grid')}")
         if [(p["text"], p["mood"]) for p in H["phrases"]] != [(p["text"], p["mood"]) for p in ax.RELAY_PHRASES]:
@@ -1700,11 +1704,11 @@ class AnimaRunner(_sr.SanaRunner):
               f"{max(rels):.2e} (bar {ax.RELAY_ENCODING_TOL:g}); pictures: the export's against the runner's fp32 one "
               f"{identity['export_vs_fp32_picture']['mean']:.2f} mean absolute pixel difference, against its usual one "
               f"{identity['export_vs_own_pixel_mean']:.2f}", flush=True)
-        sets = ax.relay_sets(list(ax.RELAY_PHRASES), control="control" in arms, companion="companion" in arms)
+        sets = ax.relay_sets(list(ax.RELAY_PHRASES), control="control" in arms, companion="companion" in arms, mounts=mounts)
         reuse = {k: v for k, v in stage_a["scores"].items() if k in sets} if form == "bare" else {}   # stage A's are bare-form
         need = sorted({p for k, (q, _, r) in sets.items() if r is None and k not in reuse for p in P[q]})
         enc = dict(zip(need, pipe.encode_fp32(need)))
-        arm_of = {"her": "relay", "companion": "companion", "untrained": "control"}
+        arm_of = {"her": "relay", "companion": "companion", "untrained": "control", **{m: m for m in mounts}}
         todo = [k for k in sets if k not in reuse]
         rank, world = self._rank_world()
         mine = self._relay_share(todo, lambda k: sets[k][1], [p["text"] for p in ax.RELAY_PHRASES])
@@ -1741,7 +1745,7 @@ class AnimaRunner(_sr.SanaRunner):
                 sheet[k] = [Image.open(f).convert("RGB") for f in fs]
         show = [next(p["text"] for p in ax.RELAY_PHRASES if p["mood"] == m) for m in ("up", "down")]
         kinds = ["ceiling", "relay", *(["companion"] if "companion" in arms else []), *(["control"] if "control" in arms else []),
-                 "filler"]
+                 *mounts, "filler"]
         cols = [f"{k}|{t}" for t in show for k in kinds if f"{k}|{t}" in sheet]
         _grid([[sheet[k][r] for k in cols] for r in range(len(cells))], out_dir / "sheet_stage_b.jpg")
         h = hashlib.sha256(Path(export_path).read_bytes()).hexdigest()

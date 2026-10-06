@@ -1159,6 +1159,36 @@ def test_relay_reads_score_the_relay_against_the_ceiling():
     assert not ax.relay_reads(no_ctl, phrases)["control"] and "over_control" not in ax.relay_reads(no_ctl, phrases)["all"]
 
 
+def test_relay_reads_score_the_mount_arms_against_the_relay():
+    """e029 with mount arms (added 2026-10-06): the sets carry each mount arm per phrase; a mount arm carrying 1.5 per unit of mood
+    where the relay carries 1.0 reads THE RELAY CARRIES THE MOOD at its own size and THE MOUNTED RELAY BEATS THE BARE ONE against
+    the relay; a mount arm equal to the relay reads NO EFFECT against it; the deciding test stays the relay's."""
+    phrases = [{"text": "elated", "mood": "up", "filler": "workaday"}, {"text": "dismal", "mood": "down", "filler": "neutral"}]
+    sets = ax.relay_sets(phrases, mounts=("mount_gCA", "mount_gCB_own"))
+    assert len(sets) == 2 * 6 and sets["mount_gCA|dismal"] == ("dismal", "dismal", "mount_gCA")
+    assert ax.mount_label("mount_gCA") == "nine arms, first seed"
+    assert ax.mount_label("mount_gCB_own") == "nine arms, second seed, own cell"
+    scores = {}
+    for p in phrases:
+        s = 1 if p["mood"] == "up" else -1
+        base = [0.1 * i for i in range(8)]
+        scores[f"filler|{p['text']}"] = base
+        scores[f"ceiling|{p['text']}"] = [b + s * 2.0 for b in base]
+        scores[f"control|{p['text']}"] = [b + s * 0.2 for b in base]
+        scores[f"relay|{p['text']}"] = [b + s * (1.0 + 0.05 * (i % 2)) for i, b in enumerate(base)]
+        scores[f"mount_gCA|{p['text']}"] = [b + s * (1.5 + 0.05 * (i % 2)) for i, b in enumerate(base)]
+        scores[f"mount_gCB_own|{p['text']}"] = list(scores[f"relay|{p['text']}"])
+    r = ax.relay_reads(scores, phrases)
+    assert r["mounts"] == ["mount_gCA", "mount_gCB_own"] and r["TEST"] == ax.RELAY_ANSWER
+    a = r["all"]["mount_gCA"]
+    assert a["relay"]["OUTCOME"] == ax.RELAY_ANSWER and a["size"] == pytest.approx(1.525 / 2.0, abs=1e-6)
+    assert a["over_relay"]["OUTCOME"] == ax.RELAY_MOUNT and a["over_relay"]["mean"] == pytest.approx(0.5, abs=1e-6)
+    assert r["all"]["mount_gCB_own"]["over_relay"]["OUTCOME"] == "NO EFFECT"
+    assert "nine arms, first seed" in ax.relay_summary({"reads": r})
+    plain = ax.relay_reads({k: v for k, v in scores.items() if not k.startswith("mount_")}, phrases)
+    assert plain["mounts"] == [] and "mount_gCA" not in plain["all"]
+
+
 def test_relay_pilot_picks_the_first_single_words_and_reads_the_ceiling():
     """e029's stage A: the first two single words of each mood in the record order (phrases with a space skipped); ceiling and
     filler only; a ceiling 1.5 over its filler reads THE CAPTION CARRIES THE MOOD (stage B stays in the bare form), a flat one
