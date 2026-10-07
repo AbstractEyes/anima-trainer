@@ -514,7 +514,8 @@ def test_connector_registry_and_rules():
     ids_here = {v for v in vars(ax).values() if isinstance(v, str) and v[:1] == "e" and v[1:4].isdigit() and v[4:5] == "_"}
     ids_here |= set(ax.CONNECTOR_IDS) | set(ax.SEQUENCE_IDS)
     assert ax.HUB_READ_ID in ax.HUB_READ and {i for i in ids_here if i[:4] == ax.HUB_READ_ID[:4]} == {ax.HUB_READ_ID}
-    assert all(a.features is None and not a.reading for a in ax.CONNECTOR_ARMS[:10])
+    assert all(a.features is None and not a.reading and not a.date for a in ax.CONNECTOR_ARMS[:10])
+    assert {a.date for a in hub} == {"2026-10-07"}
     assert not set(ax.CONNECTOR_IDS) & set(ax.SEQUENCE_IDS)
     assert ax.CONNECTOR_STEPS * ax.CONNECTOR_BATCH == 5 * 576 and ax.CONNECTOR_SAVE_EVERY * ax.CONNECTOR_BATCH == 576
     assert ax.connector_lrs("trained", 4096) == {"W": 1e-3 / 4096, "b": 1e-3}          # the fan-in rule (e013, e014)
@@ -819,6 +820,7 @@ def test_hub_sliders_end_to_end(runner, monkeypatch, tmp_path):
     for arm in ax.CONNECTOR_ARMS[10:]:
         readme = repo.files_[f"experiments/{arm.id}/README.md"].decode()
         assert arm.reading in readme and arm.side_check in readme and ax.HUB_TRUNK in readme
+        assert f"Date: {ax.HUB_DATE}." in readme and m[arm.id]["date"] == ax.HUB_DATE      # their own day, not e013's
         rec = m[arm.id]["recipe"]
         assert rec["features file"].endswith(arm.features) and "batches of 3" in rec["evaluation"]
     assert "nine trained arms mounted" in m[hub[2]]["recipe"]["input"]

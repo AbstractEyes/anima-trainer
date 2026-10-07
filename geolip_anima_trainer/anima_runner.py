@@ -2227,7 +2227,7 @@ class AnimaRunner(_sr.SanaRunner):
         bdir = f"experiments/{arm.id}"
         ci = self._connector_inputs(arm, feats, phrases)
         recipe = self._connector_recipe(arm, ci)
-        meta = {"id": arm.id, "title": arm.title, "date": ax.DATE, "kind": "beatrix_connector", "status": "running",
+        meta = {"id": arm.id, "title": arm.title, "date": arm.date or ax.DATE, "kind": "beatrix_connector", "status": "running",
                 "recipe": recipe, "phrases": None if arm.source == "onehot" else phrases}
 
         def readme() -> str:

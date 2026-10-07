@@ -1571,10 +1571,12 @@ class ConnectorArm:
     checkpoint: str = ""             # the trunk the arm's features come from (empty: CONNECTOR_CHECKPOINT)
     reading: str = ""                # the README's description of her features when the arm has its own file
     side_check: str = ""             # a two-sided slider's dead-zone check, measured on the arm's own training phrases
+    date: str = ""                   # the day the arm was registered (empty: DATE, the first connectors')
 
 
 # ---- e031-e037: the hub sliders (her final trunk; three readings chosen and measured by the hub read, e030) ------------
 HUB_TRUNK = "AbstractPhil/alephllm-mini-beatrix-training, mini-beatrix-3 at step 245,674, her final checkpoint"
+HUB_DATE = "2026-10-07"
 HUB_READ_ID = "e030_beatrix_hub_read"    # written by alephllm_diffusion.hubs (github AbstractEyes/alephllm-diffusion-experiments)
 HUB_READ = f"the hub read ({HUB_READ_ID} in this repo: a read of her states made before any of these arms, 2026-10-07)"
 HUB_FEATURES = {r: f"beatrix/mood_phrases_{r.replace('/', '-')}_mini-beatrix-3_step245674.safetensors"
@@ -1624,7 +1626,8 @@ def _hub_arm(n: int, name: str, title: str, source: str, reading: str, changed: 
     tag = f"e0{n}"
     return ConnectorArm(f"{tag}_{name}", title, source, 32 if source == "random" else 30, question=question, changed=changed,
                         axis=True, sides="relu", features=HUB_FEATURES[reading], checkpoint=HUB_TRUNK,
-                        reading=HUB_READINGS[reading], side_check=_side_check(tag, "its" if source == "random" else "her"))
+                        reading=HUB_READINGS[reading], side_check=_side_check(tag, "its" if source == "random" else "her"),
+                        date=HUB_DATE)
 
 
 CONNECTOR_ARMS = (
@@ -1887,7 +1890,8 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
     rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
     refs = "\n".join(f"- {t}: {u}" for t, u in CONNECTOR_REFERENCES)
     out = [f"# {arm.id}: {arm.title}", "",
-           f"Date: {DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), frozen: the "
+           f"Date: {arm.date or DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), "
+           "frozen: the "
            "only trained numbers are the push's.", "",
            "## Question", arm.question, "",
            f"Changed from the reference connector (e013): {arm.changed}.", "",
