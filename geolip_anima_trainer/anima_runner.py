@@ -29,6 +29,7 @@ shift 3, the model card's quality prefix and negative prompt.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -66,6 +67,8 @@ class AnimaConfig:
     dataset_dir: str | None = None
     seeds_per_subject: int = 8                   # 24 training scenes x 8 = 192 images
     gen_batch: int = 8
+    eval_batch: int | None = None                # the connectors' evaluation renders (None: gen_batch); the training sets
+                                                 # keep gen_batch, which is part of their key in the data repo
     # recipe (the arms override lr / data per arm)
     rank: int = 32
     lr: float = ax.LR
@@ -563,6 +566,7 @@ class AnimaRunner(_sr.SanaRunner):
         self._judge_fns = None
         self._base = None
         self._cbase = None
+        self._cfeats: dict = {}
         self._dp: "dict | None" = None
 
     # ---- several cards (e029 under DeepSpeed's launcher; relay_dp.py) --------------------------------
@@ -1921,18 +1925,20 @@ class AnimaRunner(_sr.SanaRunner):
             self._eval_pipe()
             self._assert_stock()
             self._judge()                          # the judge before any GPU minute: a judge fault fails at once
-            feats, phrases = self._connector_features()
+            feats_of = {a.id: self._connector_features_of(a) for a in todo}     # a missing file fails before any GPU work
             bank = self._connector_bank()
-            base = self._connector_baseline()
-            n_score = sum(len(ax.connector_eval_sets(phrases, a.source)) for a in todo) * len(base["prompts"])
-            print(f"[{self.TAG}] the job: {len(todo)} connectors x {ax.CONNECTOR_STEPS} steps of {ax.CONNECTOR_BATCH} "
-                  f"images, then {n_score} images to score; data + baseline ready in {_sr._hms(time.time() - t0)}",
-                  flush=True)
-            arms_eta = _sr._Eta(self.TAG, "connectors", len(todo), unit="arms done", every=0)
-            for arm in todo:
-                metas[arm.id] = self._connector_arm(arm, repo, metas, feats, phrases, bank, base)
-                arms_eta.add()
-                self._safe(lambda: self._publish_index(repo, metas))
+            with self._eval_batch() as eb:
+                base = self._connector_baseline()
+                n_score = sum(len(ax.connector_eval_sets(feats_of[a.id][1], a.source)) for a in todo) * len(base["prompts"])
+                print(f"[{self.TAG}] the job: {len(todo)} connectors x {ax.CONNECTOR_STEPS} steps of {ax.CONNECTOR_BATCH} "
+                      f"images, then {n_score} images to score in batches of {eb}; data + baseline ready in "
+                      f"{_sr._hms(time.time() - t0)}", flush=True)
+                arms_eta = _sr._Eta(self.TAG, "connectors", len(todo), unit="arms done", every=0)
+                for arm in todo:
+                    feats, phrases = feats_of[arm.id]
+                    metas[arm.id] = self._connector_arm(arm, repo, metas, feats, phrases, bank, base)
+                    arms_eta.add()
+                    self._safe(lambda: self._publish_index(repo, metas))
         self._connector_cross(repo, metas)
         return {a.id: metas.get(a.id) for a in specs}
 
@@ -1952,6 +1958,43 @@ class AnimaRunner(_sr.SanaRunner):
         print(f"[{self.TAG}] Beatrix features: {len(phrases)} phrases x {feats['trained'].shape[1]} "
               f"({repo}/{ax.CONNECTOR_FEATURES})", flush=True)
         return feats, phrases
+
+    def _connector_features_of(self, arm: "ax.ConnectorArm") -> tuple:
+        """The arm's features and phrase table: its own file in the data repo (arm.features; the tensor named by its
+        source) or, without one, the connectors' first file (_connector_features); each file is read once."""
+        key = arm.features
+        if key not in self._cfeats:
+            if key is None:
+                self._cfeats[key] = self._connector_features()
+            else:
+                from huggingface_hub import hf_hub_download
+                from safetensors import safe_open
+                repo = self.cfg.data_repo_id or _ts.DATA_REPO
+                path = hf_hub_download(repo, key, repo_type="dataset", token=self.state.get("hf_token") or None)
+                with safe_open(path, framework="pt") as f:
+                    phrases = json.loads(f.metadata()["phrases"])
+                    feats = {k: f.get_tensor(k).float() for k in f.keys()}
+                if any(v.shape[0] != len(phrases) for v in feats.values()):
+                    raise ValueError(f"{key}: {len(phrases)} phrases, features {[tuple(v.shape) for v in feats.values()]}")
+                print(f"[{self.TAG}] Beatrix features: {len(phrases)} phrases x "
+                      + ", ".join(f"{k} {v.shape[1]}" for k, v in feats.items()) + f" ({repo}/{key})", flush=True)
+                self._cfeats[key] = (feats, phrases)
+        feats, phrases = self._cfeats[key]
+        if arm.source != "onehot" and arm.source not in feats:
+            raise ValueError(f"{arm.id}: the features file has no tensor {arm.source!r} (it has {sorted(feats)})")
+        return feats, phrases
+
+    @contextlib.contextmanager
+    def _eval_batch(self):
+        """The connectors' evaluation renders (the baseline and every arm's sets) in batches of cfg.eval_batch when it is
+        set; the training sets are drawn and keyed at cfg.gen_batch. Yields the batch in force."""
+        keep = self.cfg.gen_batch
+        if self.cfg.eval_batch:
+            self.cfg.gen_batch = int(self.cfg.eval_batch)
+        try:
+            yield self.cfg.gen_batch
+        finally:
+            self.cfg.gen_batch = keep
 
     def _connector_bank(self) -> dict:
         """The training data on the GPU: the LoRA arms' first-draw sets of the three classes (pulled from the data
@@ -2036,9 +2079,11 @@ class AnimaRunner(_sr.SanaRunner):
         data_repo, d = self.cfg.data_repo_id or _ts.DATA_REPO, ax.CONNECTOR_DRAW
         n_feat = None if arm.source == "onehot" else int(ci["projection"]["V"].shape[1] if ci["projection"] is not None
                                                          else fan_in)
+        trunk = arm.checkpoint or ax.CONNECTOR_CHECKPOINT
         rec = {"image model": "Anima-Base v1.0, frozen (no LoRA)",
-               "input": {"trained": f"Beatrix ({ax.CONNECTOR_CHECKPOINT}): her features for the phrase ({n_feat} "
-                                    "numbers)",
+               "input": {"trained": f"Beatrix ({trunk}): her features for the phrase ({n_feat} numbers)",
+                         "arms9": f"Beatrix ({trunk}) with her nine trained arms mounted, all live: her features for the "
+                                  f"phrase ({n_feat} numbers)",
                          "random": f"an untrained Beatrix of the same shape (random initialisation, seed 0): its features "
                                    f"for the phrase ({n_feat} numbers), standardized the same way",
                          "onehot": "the mood class as a one-hot vector (3 numbers); no encoder"}[arm.source]}
@@ -2055,7 +2100,8 @@ class AnimaRunner(_sr.SanaRunner):
             rec["input"] += (f", projected on the top {fan_in} principal components of the training phrases' features and "
                              "scaled to unit variance per component (fit on the training phrases only)")
         if arm.source != "onehot":
-            rec["features file"] = f"https://huggingface.co/datasets/{data_repo}/blob/main/{ax.CONNECTOR_FEATURES}"
+            rec["features file"] = (f"https://huggingface.co/datasets/{data_repo}/blob/main/"
+                                    f"{arm.features or ax.CONNECTOR_FEATURES}")
         lr = (f"{lrs['W']:g} for W and b" if arm.source == "onehot" else
               f"{lrs['W']:.3g} for W ({lrs['b']:g} x 2 / {ci['contrast_l1']:.2f}, the L1 size of the training inputs' "
               f"cheerful-minus-gloomy class-mean difference: the free vector's pace) and {lrs['b']:g} for b"
@@ -2076,7 +2122,8 @@ class AnimaRunner(_sr.SanaRunner):
             "training seed": str(arm.seed),
             "evaluation": f"8 held-out scenes x seeds {', '.join(map(str, ax.CONNECTOR_SEEDS))} = 16 cells; Euler, "
                           f"{self.GEN_STEPS} steps, guidance {self.GEN_CFG}, shift {self.GEN_SHIFT:g}, "
-                          f"{self._need('resolution')} px, the card's quality prefix and negative prompt",
+                          f"{self._need('resolution')} px, the card's quality prefix and negative prompt; rendered in "
+                          f"batches of {self.cfg.gen_batch}",
             **self._card()})
         try:                                             # the exact training images, when the data repo holds them
             links = []

@@ -1566,6 +1566,65 @@ class ConnectorArm:
     whiten_k: "int | None" = None    # the features projected on the top k whitened components of the training phrases
     axis: bool = False               # the features reduced to a slider value on the training phrases' mood axis (+ neutral)
     sides: str = "one"               # the slider's input map: 'one' [a, n]; 'relu' [max(a,0), max(-a,0), n]; 'exp' [e^a, e^-a, n]
+    features: "str | None" = None    # the arm's own features file in the data repo (None: CONNECTOR_FEATURES); source names
+                                     # its tensor ('trained', 'arms9' = her nine arms mounted, 'random')
+    checkpoint: str = ""             # the trunk the arm's features come from (empty: CONNECTOR_CHECKPOINT)
+    reading: str = ""                # the README's description of her features when the arm has its own file
+    side_check: str = ""             # a two-sided slider's dead-zone check, measured on the arm's own training phrases
+
+
+# ---- e031-e037: the hub sliders (her final trunk; three readings chosen and measured by the hub read, e030) ------------
+HUB_TRUNK = "AbstractPhil/alephllm-mini-beatrix-training, mini-beatrix-3 at step 245,674, her final checkpoint"
+HUB_READ_ID = "e030_beatrix_hub_read"    # written by alephllm_diffusion.hubs (github AbstractEyes/alephllm-diffusion-experiments)
+HUB_READ = f"the hub read ({HUB_READ_ID} in this repo: a read of her states made before any of these arms, 2026-10-07)"
+HUB_FEATURES = {r: f"beatrix/mood_phrases_{r.replace('/', '-')}_mini-beatrix-3_step245674.safetensors"
+                for r in ("close/stream/18", "close/hub/22", "close/both/18")}       # in the data repo
+_STD = ("normalized (layer norm without its affine) and standardized per feature over a reference set of mood words and "
+        "phrases that holds no word of a held-out phrase")
+HUB_READINGS = {
+    "close/stream/18": (
+        "Her features for a phrase: her state after block 18 at the full stop that closes the phrase (the phrase is read with "
+        f"a full stop after it, so the state follows the whole phrase; 1,024 numbers), {_STD}. The reading was chosen by a "
+        f"rule fixed before {HUB_READ}: among her stream's and her hubs' readings at ten blocks, the largest separation of "
+        "the unseen phrases on the slider's own axis (2.19 between the mean slider values of the unseen cheerful and gloomy "
+        "phrases, with the training centres at +1 and -1; every unseen phrase on its side; 56 of 60 training phrases on their "
+        "side when each is left out of the fit). The features are computed by the session that runs these arms and kept in "
+        "the data repo."),
+    "close/hub/22": (
+        "Her features for a phrase: the blackboard of block 22's hub after it has read the phrase and the full stop that "
+        "closes it (the hub's memory of the text: 4 x 64 slots of 1,024 numbers, each slot unit length; 262,144 numbers), "
+        f"{_STD}. In {HUB_READ} it is the best of her hubs' readings (separation 1.83, every unseen phrase on its side, 55 "
+        "of 60 left-out training phrases), below her stream's best (2.19), with the most even spread of the two moods' "
+        "training phrases on the slider's axis (standard deviations .33 and .38, against .54 and .36 for the stream's "
+        "reading) and its neutral phrases at zero (+.02, +.13; the stream's reading puts them on the gloomy side, -.23 and "
+        "-.38). Over 2,048 captions her hubs' blackboards also match the image model's own caption context better than her "
+        "stream does (a ridge from the blackboard predicts the text adapter's pooled output at R2 .60-.64, from her pooled "
+        "stream at .55-.57). The features are computed by the session that runs these arms and kept in the data repo."),
+    "close/both/18": (
+        "Her features for a phrase: the hub's blackboard at block 18 after the phrase and its closing full stop, and her "
+        f"state at that full stop after block 18, each {_STD} and each divided by the length of its own mood axis on the "
+        "training phrases, side by side (263,168 numbers). Through the slider's axis the slider value is then exactly the "
+        f"mean of the two readings' own slider values, so each counts equally whatever its width. In {HUB_READ} this mean "
+        "separated the unseen phrases by 1.98 (every unseen phrase on its side; 57 of 60 left-out training phrases). The "
+        "features are computed by the session that runs these arms and kept in the data repo."),
+}
+# the dead-zone check of each arm's own trunk, measured in the read before any run: of the 30 gloomy training phrases how many
+# sit below 0 and below -0.25 on the slider's axis, and of the 4 unseen gloomy phrases how many below -0.25
+HUB_SIDE = {"e031": (30, 29, 4), "e032": (26, 24, 2), "e033": (30, 29, 4), "e034": (30, 28, 4), "e035": (26, 24, 3),
+            "e036": (30, 30, 4), "e037": (27, 26, 2)}
+
+
+def _side_check(arm: str, whose: str = "her") -> str:
+    neg, beyond, unseen = HUB_SIDE[arm]
+    return (f"{neg} of {whose} 30 gloomy training phrases sit on the negative side and {beyond} beyond -0.25, and {unseen} "
+            "of the 4 unseen gloomy phrases sit beyond -0.25).")
+
+
+def _hub_arm(n: int, name: str, title: str, source: str, reading: str, changed: str, question: str) -> "ConnectorArm":
+    tag = f"e0{n}"
+    return ConnectorArm(f"{tag}_{name}", title, source, 32 if source == "random" else 30, question=question, changed=changed,
+                        axis=True, sides="relu", features=HUB_FEATURES[reading], checkpoint=HUB_TRUNK,
+                        reading=HUB_READINGS[reading], side_check=_side_check(tag, "its" if source == "random" else "her"))
 
 
 CONNECTOR_ARMS = (
@@ -1638,10 +1697,57 @@ CONNECTOR_ARMS = (
                          "balance (no dead zone); the same training randomness as e023",
                  question="Does a two-sided slider without a dead zone steer the unseen gloomy phrases further than the "
                           "split one (e023)?", axis=True, sides="exp"),
+    # e023-e025 read NOT LEARNED on step 212,000's last-byte features: the cheerful side moved, the gloomy side barely. The hub
+    # sliders run the split form on her final trunk at three readings the hub read (e030) chose and measured: her stream at
+    # the full stop closing the phrase (the read's rule picked it), her hub's blackboard (its two moods spread evenly) and the
+    # two together; hers share one training randomness (seed 30), the controls another (32).
+    _hub_arm(31, "beatrix_stream_closing_slider", "Beatrix's reading of a phrase at its closing full stop, as a two-sided "
+             "slider", "trained", "close/stream/18",
+             changed="e023's two-sided slider on her final trunk (step 245,674) at a new reading: her state after block 18 at "
+                     "the full stop that closes the phrase (e023: the last byte at blocks 16-24 of step 212,000)",
+             question="Does Beatrix's reading of a phrase's mood at the full stop that closes it, split into its cheerful "
+                      "and gloomy sides, steer the image both ways, for the phrases it trained on and for mood phrases it "
+                      "never saw?"),
+    _hub_arm(32, "beatrix_random_trunk_stream_closing_slider", "Control: the same slider on an untrained Beatrix of the same "
+             "shape", "random", "close/stream/18",
+             changed="e031's slider on the features of a randomly initialised trunk of the same shape (seed 0), at the "
+                     "same reading",
+             question="Does e031's held-out effect come from what Beatrix learned? (A control that must fail on the "
+                      "held-out phrases.)"),
+    _hub_arm(33, "beatrix_stream_closing_slider_nine_arms", "Beatrix's closing-stop reading with her nine trained arms "
+             "mounted", "arms9", "close/stream/18",
+             changed="e031 with her nine trained arms mounted, all live (the arm group trained on her final trunk writes "
+                     "into her states at every block); the same training randomness as e031",
+             question="With her nine trained arms mounted, does her reading steer the image as her bare trunk's does "
+                      "(e031)?"),
+    _hub_arm(34, "beatrix_hub_slider", "Beatrix's hub: the blackboard's reading of a phrase as a two-sided slider",
+             "trained", "close/hub/22",
+             changed="e031's slider with the blackboard of block 22's hub as the reading in place of the stream's state; the "
+                     "same training randomness as e031",
+             question="Does her hub's reading of a phrase steer the image both ways, beside her stream's (e031), for the "
+                      "phrases it trained on and for mood phrases it never saw?"),
+    _hub_arm(35, "beatrix_random_trunk_hub_slider", "Control: the hub slider on an untrained Beatrix of the same shape",
+             "random", "close/hub/22",
+             changed="e034's slider on the hub of a randomly initialised trunk of the same shape (seed 0)",
+             question="Does e034's held-out effect come from what Beatrix learned? (A control that must fail on the "
+                      "held-out phrases.)"),
+    _hub_arm(36, "beatrix_hub_and_stream_slider", "Beatrix's hub and stream together as a two-sided slider", "trained",
+             "close/both/18",
+             changed="e031's slider with the mean of two readings at block 18 as its value: the hub's blackboard and the "
+                     "stream's state at the closing stop; the same training randomness as e031",
+             question="Do her hub's and her stream's readings together steer the image both ways, beside each alone (e031, "
+                      "e034)?"),
+    _hub_arm(37, "beatrix_random_trunk_hub_and_stream_slider", "Control: the combined slider on an untrained Beatrix of the "
+             "same shape", "random", "close/both/18",
+             changed="e036's slider on a randomly initialised trunk of the same shape (seed 0)",
+             question="Does e036's held-out effect come from what Beatrix learned? (A control that must fail on the "
+                      "held-out phrases.)"),
 )
 CONNECTOR_IDS = [a.id for a in CONNECTOR_ARMS]
 CONNECTOR_PAIRS = ((CONNECTOR_IDS[0], CONNECTOR_IDS[1]), (CONNECTOR_IDS[3], CONNECTOR_IDS[4]),
-                   (CONNECTOR_IDS[5], CONNECTOR_IDS[6]), (CONNECTOR_IDS[7], CONNECTOR_IDS[8]))      # (Beatrix, untrained)
+                   (CONNECTOR_IDS[5], CONNECTOR_IDS[6]), (CONNECTOR_IDS[7], CONNECTOR_IDS[8]),
+                   (CONNECTOR_IDS[10], CONNECTOR_IDS[11]), (CONNECTOR_IDS[12], CONNECTOR_IDS[11]),
+                   (CONNECTOR_IDS[13], CONNECTOR_IDS[14]), (CONNECTOR_IDS[15], CONNECTOR_IDS[16]))   # (Beatrix, untrained)
 SLIDER_MAPS = {"one": "[a, n]", "relu": "[max(a, 0), max(-a, 0), n]", "exp": "[e^a, e^-a, n]"}
 CONNECTOR_FREE = CONNECTOR_IDS[2]
 CONNECTOR_FEATURES = "beatrix/mood_phrases_mini-beatrix-3_step212000.safetensors"   # in the data repo
@@ -1786,13 +1892,15 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
            "## Question", arm.question, "",
            f"Changed from the reference connector (e013): {arm.changed}.", "",
            "## Design",
-           f"- **Beatrix** is a byte-level language model from the geolip line ({CONNECTOR_CHECKPOINT}). Her features "
-           "for a phrase: the state of the phrase's last byte after blocks 16, 18, 21 and 24, each normalized (layer "
-           "norm without its affine), concatenated (4,096 numbers) and standardized per feature over a reference set of "
-           "mood words and phrases that holds no word of a held-out phrase. The place was chosen before any training, "
-           "by a probe on 60 single mood words (30 upbeat, 30 downbeat; ridge, 10-fold): .97-.98 accuracy at these "
-           "blocks against .67-.68 for an untrained trunk of the same shape. The features are computed once, outside "
-           "the notebook, and kept in the data repo.",
+           (f"- **Beatrix** is a byte-level language model from the geolip line ({arm.checkpoint}). {arm.reading}"
+            if arm.reading else
+            f"- **Beatrix** is a byte-level language model from the geolip line ({CONNECTOR_CHECKPOINT}). Her features "
+            "for a phrase: the state of the phrase's last byte after blocks 16, 18, 21 and 24, each normalized (layer "
+            "norm without its affine), concatenated (4,096 numbers) and standardized per feature over a reference set of "
+            "mood words and phrases that holds no word of a held-out phrase. The place was chosen before any training, "
+            "by a probe on 60 single mood words (30 upbeat, 30 downbeat; ridge, 10-fold): .97-.98 accuracy at these "
+            "blocks against .67-.68 for an untrained trunk of the same shape. The features are computed once, outside "
+            "the notebook, and kept in the data repo."),
            "- **The push** = W f + b (1,024 numbers), added to every caption token of the text adapter's output (what "
            "the image model reads). W and b start at zero, so training starts from the stock model exactly. For the "
            "free vector, f is the mood class as a one-hot vector.",
@@ -1821,7 +1929,8 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
               "and e018 moved only the cheerful side. "
               + ("Splitting the value by its sign gives each side its own direction; each side trains only on the "
                  "phrases on its side (checked before the run: "
-                 + ("93% of her gloomy training phrases sit on the negative side and 90% beyond -0.25, and all four "
+                 + (arm.side_check if arm.side_check else
+                    "93% of her gloomy training phrases sit on the negative side and 90% beyond -0.25, and all four "
                     "unseen gloomy phrases sit beyond -0.25)." if arm.source == "trained" else
                     "the untrained trunk places 87% of its gloomy training phrases on the negative side and 80% beyond "
                     "-0.25, and 2 of its 4 unseen gloomy phrases on the negative side).") if arm.sides == "relu" else

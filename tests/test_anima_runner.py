@@ -488,16 +488,33 @@ def test_connector_registry_and_rules():
                                 "e015_free_vector_connector", "e016_beatrix_mood_connector_whitened",
                                 "e017_beatrix_random_trunk_connector_whitened", "e018_beatrix_mood_slider",
                                 "e019_beatrix_random_trunk_slider", "e023_beatrix_mood_slider_two_sided",
-                                "e024_beatrix_random_trunk_slider_two_sided", "e025_beatrix_mood_slider_smooth"]
+                                "e024_beatrix_random_trunk_slider_two_sided", "e025_beatrix_mood_slider_smooth",
+                                "e031_beatrix_stream_closing_slider", "e032_beatrix_random_trunk_stream_closing_slider",
+                                "e033_beatrix_stream_closing_slider_nine_arms", "e034_beatrix_hub_slider",
+                                "e035_beatrix_random_trunk_hub_slider", "e036_beatrix_hub_and_stream_slider",
+                                "e037_beatrix_random_trunk_hub_and_stream_slider"]
     assert [a.source for a in ax.CONNECTOR_ARMS] == ["trained", "random", "onehot", "trained", "random", "trained", "random",
-                                                     "trained", "random", "trained"]
-    assert [a.whiten_k for a in ax.CONNECTOR_ARMS] == [None, None, None, 16, 16] + [None] * 5
-    assert [a.axis for a in ax.CONNECTOR_ARMS] == [False] * 5 + [True] * 5
-    assert [a.sides for a in ax.CONNECTOR_ARMS] == ["one"] * 7 + ["relu", "relu", "exp"]
+                                                     "trained", "random", "trained", "trained", "random", "arms9", "trained",
+                                                     "random", "trained", "random"]
+    assert [a.whiten_k for a in ax.CONNECTOR_ARMS] == [None, None, None, 16, 16] + [None] * 12
+    assert [a.axis for a in ax.CONNECTOR_ARMS] == [False] * 5 + [True] * 12
+    assert [a.sides for a in ax.CONNECTOR_ARMS] == ["one"] * 7 + ["relu", "relu", "exp"] + ["relu"] * 7
     ids = ax.CONNECTOR_IDS
-    assert ax.CONNECTOR_PAIRS == ((ids[0], ids[1]), (ids[3], ids[4]), (ids[5], ids[6]), (ids[7], ids[8]))
+    assert ax.CONNECTOR_PAIRS == ((ids[0], ids[1]), (ids[3], ids[4]), (ids[5], ids[6]), (ids[7], ids[8]), (ids[10], ids[11]),
+                                  (ids[12], ids[11]), (ids[13], ids[14]), (ids[15], ids[16]))
     seeds = [a.seed for a in ax.CONNECTOR_ARMS]
     assert len(set(seeds[:9])) == 9 and seeds[9] == seeds[7]      # e025 = e023's training randomness, another input map
+    assert seeds[10:] == [30, 32, 30, 30, 32, 30, 32]             # the hub sliders: hers share one randomness, the controls one
+    hub = ax.CONNECTOR_ARMS[10:]
+    assert [a.features for a in hub] == [ax.HUB_FEATURES[r] for r in ["close/stream/18"] * 3 + ["close/hub/22"] * 2
+                                         + ["close/both/18"] * 2]
+    assert all(a.checkpoint == ax.HUB_TRUNK and a.reading and a.side_check.endswith(").") for a in hub)
+    assert set(ax.HUB_SIDE) == {a.id[:4] for a in hub}                      # each arm's own trunk's side check, no spare
+    # e030 is the hub read's folder (written by alephllm_diffusion.hubs): no experiment of this package may take it
+    ids_here = {v for v in vars(ax).values() if isinstance(v, str) and v[:1] == "e" and v[1:4].isdigit() and v[4:5] == "_"}
+    ids_here |= set(ax.CONNECTOR_IDS) | set(ax.SEQUENCE_IDS)
+    assert ax.HUB_READ_ID in ax.HUB_READ and {i for i in ids_here if i[:4] == ax.HUB_READ_ID[:4]} == {ax.HUB_READ_ID}
+    assert all(a.features is None and not a.reading for a in ax.CONNECTOR_ARMS[:10])
     assert not set(ax.CONNECTOR_IDS) & set(ax.SEQUENCE_IDS)
     assert ax.CONNECTOR_STEPS * ax.CONNECTOR_BATCH == 5 * 576 and ax.CONNECTOR_SAVE_EVERY * ax.CONNECTOR_BATCH == 576
     assert ax.connector_lrs("trained", 4096) == {"W": 1e-3 / 4096, "b": 1e-3}          # the fan-in rule (e013, e014)
@@ -677,12 +694,13 @@ def test_beatrix_connectors_end_to_end(runner, monkeypatch):
 
     monkeypatch.setattr(s, "_render", render)
     monkeypatch.setattr(s, "_judge", lambda: loaded.append("clip"))
-    out = s.run_beatrix_connectors()
-    assert loaded == ["clip"] and set(out) == set(ax.CONNECTOR_IDS)
+    rec = ax.CONNECTOR_IDS[:10]                                       # the record's arms
+    out = s.run_beatrix_connectors(arms=rec)
+    assert loaded == ["clip"] and set(out) == set(rec)
     for c in ax.CONNECTOR_CLASSES:                                    # the three first-draw training sets were drawn
         assert len(list((Path(s.state["data_root"]) / "datasets" / f"{c}_1000" / "images").glob("*.png"))) == 48
     m = repo.metas()
-    r13, r14, r15, r16, r17, r18, r19, r23, r24, r25 = (m[k]["result"]["reads"] for k in ax.CONNECTOR_IDS)
+    r13, r14, r15, r16, r17, r18, r19, r23, r24, r25 = (m[k]["result"]["reads"] for k in rec)
     for r in (r13, r16, r18, r23, r25):
         assert r["TRAINED"] == "TRAINED WORDS MOVE IT" and r["HELD_OUT"] == "HELD-OUT WORDS CARRY IT"
         assert r["NEUTRAL"] == "NEUTRAL QUIET"
@@ -727,7 +745,7 @@ def test_beatrix_connectors_end_to_end(runner, monkeypatch):
     lr23, lr25 = (m[ax.CONNECTOR_IDS[i]]["result"]["learning_rates"] for i in (7, 9))
     assert lr25["W"] < lr23["W"] and lr23["b"] == lr25["b"] == 0.05      # the exponentials stretch the class contrast
     assert "[max(a, 0), max(-a, 0), n]" in m[ax.CONNECTOR_IDS[7]]["recipe"]["input"]
-    for k in ax.CONNECTOR_IDS:
+    for k in rec:
         base = f"experiments/{k}"
         assert m[k]["kind"] == "beatrix_connector" and m[k]["status"] == "done"
         for f in ("meta.json", "README.md", "result.json", "sheet.jpg", "trace.json", "connector/step0036.safetensors",
@@ -741,9 +759,71 @@ def test_beatrix_connectors_end_to_end(runner, monkeypatch):
     readme = repo.files_[f"experiments/{ax.CONNECTOR_IDS[0]}/README.md"].decode()
     assert "HELD-OUT WORDS CARRY IT" in readme and "| elated (held out) | up |" in readme
     n = len(repo.commits)
-    again = s.run_beatrix_connectors()                                # done already: skipped
+    again = s.run_beatrix_connectors(arms=rec)                                # done already: skipped
     assert all(v["status"] == "done" for v in again.values())
-    assert not any(c.startswith(tuple(k[:4] for k in ax.CONNECTOR_IDS)) for c in repo.commits[n:])
+    assert not any(c.startswith(tuple(k[:4] for k in rec)) for c in repo.commits[n:])
+
+
+def test_hub_sliders_end_to_end(runner, monkeypatch, tmp_path):
+    """The seven hub arms on fake features files (one per reading, tensors trained / arms9 / random): each arm reads its own
+    file and tensor, the controls pair with their arms, every README carries the arm's reading and side check, the recipe names
+    the nine arms and the arm's file, and the evaluation renders in batches of eval_batch while the training sets are drawn at
+    gen_batch."""
+    import huggingface_hub
+    from PIL import Image
+    from safetensors.torch import save_file
+    s, repo, _, _ = runner
+    s._pipe = FakeConnectorPipe()
+    for k, v in (("CONNECTOR_STEPS", 72), ("CONNECTOR_SAVE_EVERY", 36), ("CONNECTOR_TRACE_EVERY", 12),
+                 ("CONNECTOR_LR", 0.05)):
+        monkeypatch.setattr(ax, k, v)
+    fake = _fake_features()
+    files = {}
+    for reading, path in ax.HUB_FEATURES.items():
+        p = tmp_path / path.replace("/", "_")
+        save_file({"trained": fake["trained"], "arms9": fake["trained"] * 0.9, "random": fake["random"]}, str(p),
+                  metadata={"phrases": json.dumps(PHRASES), "reading": reading})
+        files[path] = str(p)
+    asked = []
+
+    def download(repo_id, filename, **kw):
+        asked.append(filename)
+        return files[filename]
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+    monkeypatch.setattr(s, "_connector_features", lambda: (fake, PHRASES))
+    batches = []
+
+    def mood(p):
+        return 1.0 if "cheerful" in p or "joyful" in p else -1.0 if "gloomy" in p or "somber" in p else 0.0
+
+    def render(prompts, seeds, source_add=None, context_add=None, uncond_add=None):
+        batches.append(("push" if context_add is not None else "plain", len(prompts)))
+        shift = float(context_add[0]) if context_add is not None else 0.0
+        return [Image.new("RGB", (8, 8), (min(255, max(0, int(round(128 + 20 * (mood(p) + shift))))),) * 3)
+                for p in prompts]
+    monkeypatch.setattr(s, "_render", render)
+    monkeypatch.setattr(s, "_judge", lambda: None)
+    s.cfg.eval_batch = 3
+    hub = ax.CONNECTOR_IDS[10:]
+    out = s.run_beatrix_connectors(arms=hub)
+    assert set(out) == set(hub) and all(v["status"] == "done" for v in out.values())
+    assert sorted(set(asked)) == sorted(ax.HUB_FEATURES.values())        # each file fetched once, by its own path
+    assert s.cfg.gen_batch == 8                                          # restored after the evaluation
+    drawn = [n for kind, n in batches[:18]]                              # the three training sets first, at gen_batch
+    assert max(drawn) == 8 and all(n <= 3 for kind, n in batches[18:]) # then the baseline and every set at eval_batch
+    m = repo.metas()
+    cross = m[hub[1]]["result"]["cross"]["controls"]
+    assert {(c["beatrix"], c["random"]) for c in cross.values()} == {(hub[0], hub[1]), (hub[2], hub[1]), (hub[3], hub[4]),
+                                                                     (hub[5], hub[6])}
+    assert all(c["OUTCOME"] == "THE CONTROL FAILS AS IT SHOULD" for c in cross.values())
+    for arm in ax.CONNECTOR_ARMS[10:]:
+        readme = repo.files_[f"experiments/{arm.id}/README.md"].decode()
+        assert arm.reading in readme and arm.side_check in readme and ax.HUB_TRUNK in readme
+        rec = m[arm.id]["recipe"]
+        assert rec["features file"].endswith(arm.features) and "batches of 3" in rec["evaluation"]
+    assert "nine trained arms mounted" in m[hub[2]]["recipe"]["input"]
+    r30, r32 = m[hub[0]]["result"]["reads"], m[hub[2]]["result"]["reads"]
+    assert r30["TRAINED"] == r32["TRAINED"] == "TRAINED WORDS MOVE IT"   # the nine-arm tensor: the same direction, 0.9 the size
 
 
 def test_connector_whitening_is_fit_on_the_training_rows_only():
