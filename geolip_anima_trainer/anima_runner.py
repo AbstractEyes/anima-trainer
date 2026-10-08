@@ -2051,18 +2051,23 @@ class AnimaRunner(_sr.SanaRunner):
         the phrase features as they are (e013, e014), projected on the top whiten_k whitened components of the training
         phrases (e016, e017) or reduced to a slider value on their mood and neutral axes (e018, e019); projections are fit
         on the training phrases only and returned with the L1 size of the up-minus-down class-mean difference of the
-        training inputs (it sets W's learning rate)."""
+        training inputs (it sets W's learning rate). With arm.neutral_sides False, 'train_inputs' holds the rows training
+        reads: the neutral training phrases' two slider sides at zero ([0, 0, n]); 'inputs' stays every phrase's map (the
+        evaluation's)."""
         import torch
         classes = ax.CONNECTOR_CLASSES
         if arm.source == "onehot":
             return {"inputs": torch.eye(len(classes)), "pool": {c: [i] for i, c in enumerate(classes)},
-                    "row_of": {c: i for i, c in enumerate(classes)}, "projection": None, "contrast_l1": None}
+                    "row_of": {c: i for i, c in enumerate(classes)}, "projection": None, "contrast_l1": None,
+                    "train_inputs": None}
         F = feats[arm.source].float()
         pool = {c: [i for i, p in enumerate(phrases) if p["class"] == c and p["split"] == "train"] for c in classes}
         if not all(pool.values()):
             raise ValueError(f"a class without training phrases: {({c: len(v) for c, v in pool.items()})}")
         out = {"inputs": F, "pool": pool, "row_of": {p["text"]: i for i, p in enumerate(phrases)}, "projection": None,
-               "contrast_l1": None}
+               "contrast_l1": None, "train_inputs": None}
+        if not arm.neutral_sides and not (arm.axis and arm.sides == "relu"):
+            raise ValueError(f"{arm.id}: the neutral rows can be kept off the sides of the split slider only (sides 'relu')")
         if arm.whiten_k or arm.axis:
             proj = (connector_axis(F, pool) if arm.axis else
                     connector_whitening(F, [i for c in classes for i in pool[c]], arm.whiten_k))
@@ -2071,6 +2076,10 @@ class AnimaRunner(_sr.SanaRunner):
                 Z = slider_map(Z, arm.sides)
             out.update(inputs=Z, projection=proj,
                        contrast_l1=float((Z[pool["up"]].mean(0) - Z[pool["down"]].mean(0)).abs().sum()))
+            if not arm.neutral_sides:
+                T = Z.clone()
+                T[pool["neutral"], :2] = 0.0
+                out["train_inputs"] = T
         return out
 
     def _connector_recipe(self, arm: "ax.ConnectorArm", ci: dict) -> dict:
@@ -2096,6 +2105,11 @@ class AnimaRunner(_sr.SanaRunner):
                                  "reading (3 numbers: " + {"relu": "each side of the slider has its own push direction "
                                  "and is zero on the other side", "exp": "both sides are on for every phrase and the "
                                  "slider value tilts the balance"}[arm.sides] + ")")
+            if not arm.neutral_sides:
+                rec["input"] += ("; in training the neutral phrases feed neither side: their two side inputs are set to "
+                                 "zero, so the neutral pictures train only the neutral reading's column and the bias, and "
+                                 "each side's direction learns from its own mood's pictures alone (at evaluation every "
+                                 "phrase, the neutral ones too, goes through the same map)")
         elif ci["projection"] is not None:
             rec["input"] += (f", projected on the top {fan_in} principal components of the training phrases' features and "
                              "scaled to unit variance per component (fit on the training phrases only)")
@@ -2149,7 +2163,7 @@ class AnimaRunner(_sr.SanaRunner):
         torch.manual_seed(arm.seed)                      # the objective's noise and timesteps
         g = torch.Generator().manual_seed(arm.seed)      # the batch order and the phrase draws
         pool = ci["pool"]
-        inputs = ci["inputs"].to(dev, torch.float32)
+        inputs = (ci["inputs"] if ci.get("train_inputs") is None else ci["train_inputs"]).to(dev, torch.float32)
         width = getattr(pipe, "context_width", 1024)
         W = torch.zeros(width, inputs.shape[1], device=dev, requires_grad=True)
         b = torch.zeros(width, device=dev, requires_grad=True)
@@ -2250,11 +2264,12 @@ class AnimaRunner(_sr.SanaRunner):
                 tensors = {"W": w.contiguous(), "b": bb.contiguous()}
                 if proj is not None:                     # the input projection travels with the weights
                     tensors.update({k: proj[k].contiguous() for k in ("mu", "V", "scale")})
-                save_file(tensors, str(p),
-                          metadata={"experiment": arm.id, "input": arm.source, "step": str(step),
-                                    "input map": arm.sides if arm.axis else "none",
-                                    "push": f"{how}, added to every caption token of the adapter's output, on both "
-                                            "guidance branches"})
+                meta_w = {"experiment": arm.id, "input": arm.source, "step": str(step),
+                          "input map": arm.sides if arm.axis else "none",
+                          "push": f"{how}, added to every caption token of the adapter's output, on both guidance branches"}
+                if not arm.neutral_sides:
+                    meta_w["neutral rows in training"] = "[0, 0, n] (neither side); evaluation reads every phrase's map"
+                save_file(tensors, str(p), metadata=meta_w)
                 files[f"{bdir}/connector/{p.name}"] = p
             (out_dir / "trace.json").write_text(json.dumps(tr["trace"], indent=1), encoding="utf-8")
             files[f"{bdir}/trace.json"] = out_dir / "trace.json"

@@ -492,22 +492,25 @@ def test_connector_registry_and_rules():
                                 "e031_beatrix_stream_closing_slider", "e032_beatrix_random_trunk_stream_closing_slider",
                                 "e033_beatrix_stream_closing_slider_nine_arms", "e034_beatrix_hub_slider",
                                 "e035_beatrix_random_trunk_hub_slider", "e036_beatrix_hub_and_stream_slider",
-                                "e037_beatrix_random_trunk_hub_and_stream_slider"]
+                                "e037_beatrix_random_trunk_hub_and_stream_slider", "e039_beatrix_block20_slider_neutral_off",
+                                "e040_beatrix_random_trunk_block20_slider_neutral_off", "e041_beatrix_block20_slider"]
     assert [a.source for a in ax.CONNECTOR_ARMS] == ["trained", "random", "onehot", "trained", "random", "trained", "random",
                                                      "trained", "random", "trained", "trained", "random", "arms9", "trained",
-                                                     "random", "trained", "random"]
-    assert [a.whiten_k for a in ax.CONNECTOR_ARMS] == [None, None, None, 16, 16] + [None] * 12
-    assert [a.axis for a in ax.CONNECTOR_ARMS] == [False] * 5 + [True] * 12
-    assert [a.sides for a in ax.CONNECTOR_ARMS] == ["one"] * 7 + ["relu", "relu", "exp"] + ["relu"] * 7
+                                                     "random", "trained", "random", "trained", "random", "trained"]
+    assert [a.whiten_k for a in ax.CONNECTOR_ARMS] == [None, None, None, 16, 16] + [None] * 15
+    assert [a.axis for a in ax.CONNECTOR_ARMS] == [False] * 5 + [True] * 15
+    assert [a.sides for a in ax.CONNECTOR_ARMS] == ["one"] * 7 + ["relu", "relu", "exp"] + ["relu"] * 10
+    assert [a.neutral_sides for a in ax.CONNECTOR_ARMS] == [True] * 17 + [False, False, True]   # session 5: e039 / e040 off
     ids = ax.CONNECTOR_IDS
     assert ax.CONNECTOR_PAIRS == ((ids[0], ids[1]), (ids[3], ids[4]), (ids[5], ids[6]), (ids[7], ids[8]), (ids[10], ids[11]),
-                                  (ids[12], ids[11]), (ids[13], ids[14]), (ids[15], ids[16]))
+                                  (ids[12], ids[11]), (ids[13], ids[14]), (ids[15], ids[16]), (ids[17], ids[18]))
     seeds = [a.seed for a in ax.CONNECTOR_ARMS]
     assert len(set(seeds[:9])) == 9 and seeds[9] == seeds[7]      # e025 = e023's training randomness, another input map
-    assert seeds[10:] == [30, 32, 30, 30, 32, 30, 32]             # the hub sliders: hers share one randomness, the controls one
+    assert seeds[10:] == [30, 32, 30, 30, 32, 30, 32, 30, 32, 30]  # hers share one randomness (e031's), the controls one
     hub = ax.CONNECTOR_ARMS[10:]
     assert [a.features for a in hub] == [ax.HUB_FEATURES[r] for r in ["close/stream/18"] * 3 + ["close/hub/22"] * 2
-                                         + ["close/both/18"] * 2]
+                                         + ["close/both/18"] * 2 + ["close/stream/20"] * 3]
+    assert ax.TRIANGULATION_ID in hub[7].reading and "-0.99" in hub[7].reading       # the block's chooser; the leak's phrase
     assert all(a.checkpoint == ax.HUB_TRUNK and a.reading and a.side_check.endswith(").") for a in hub)
     assert set(ax.HUB_SIDE) == {a.id[:4] for a in hub}                      # each arm's own trunk's side check, no spare
     # e030 is the hub read's folder (written by alephllm_diffusion.hubs): no experiment of this package may take it
@@ -817,7 +820,7 @@ def test_hub_sliders_end_to_end(runner, monkeypatch, tmp_path):
     m = repo.metas()
     cross = m[hub[1]]["result"]["cross"]["controls"]
     assert {(c["beatrix"], c["random"]) for c in cross.values()} == {(hub[0], hub[1]), (hub[2], hub[1]), (hub[3], hub[4]),
-                                                                     (hub[5], hub[6])}
+                                                                     (hub[5], hub[6]), (hub[7], hub[8])}
     assert all(c["OUTCOME"] == "THE CONTROL FAILS AS IT SHOULD" for c in cross.values())
     for arm in ax.CONNECTOR_ARMS[10:]:
         readme = repo.files_[f"experiments/{arm.id}/README.md"].decode()
@@ -825,9 +828,44 @@ def test_hub_sliders_end_to_end(runner, monkeypatch, tmp_path):
         assert f"Date: {ax.HUB_DATE}." in readme and m[arm.id]["date"] == ax.HUB_DATE      # their own day, not e013's
         rec = m[arm.id]["recipe"]
         assert rec["features file"].endswith(arm.features) and "batches of 3" in rec["evaluation"]
+        off = "feed neither side" in rec["input"]                       # the neutral rows' form, in the recipe and README
+        assert off == (not arm.neutral_sides) == ("The neutral phrases in training" in readme)
+        raw = repo.files_[f"experiments/{arm.id}/connector/step0072.safetensors"]
+        head = json.loads(raw[8:8 + int.from_bytes(raw[:8], "little")])["__metadata__"]
+        assert ("neutral rows in training" in head) == off               # and with the shipped weights
     assert "nine trained arms mounted" in m[hub[2]]["recipe"]["input"]
     r30, r32 = m[hub[0]]["result"]["reads"], m[hub[2]]["result"]["reads"]
     assert r30["TRAINED"] == r32["TRAINED"] == "TRAINED WORDS MOVE IT"   # the nine-arm tensor: the same direction, 0.9 the size
+
+
+def test_neutral_rows_off_both_sides_train_only_the_neutral_column(runner, monkeypatch):
+    """neutral_sides=False (e039, e040): training reads the neutral training phrases as [0, 0, n] while the evaluation's map is
+    every phrase's own; on neutral pictures alone W's two side columns then never move (exactly zero: Adam's step on a zero
+    gradient is zero), where the read neutral phrases move them. Only the split slider takes the form."""
+    import dataclasses
+    s, _, _, _ = runner
+    s._pipe = FakeConnectorPipe()
+    monkeypatch.setattr(ax, "CONNECTOR_STEPS", 12)
+    feats = _fake_features()
+    on = dataclasses.replace(ax.CONNECTOR_ARMS[7], neutral_sides=True)       # e023's split slider
+    off = dataclasses.replace(on, neutral_sides=False)
+    ci_on, ci_off = s._connector_inputs(on, feats, PHRASES), s._connector_inputs(off, feats, PHRASES)
+    neu = ci_off["pool"]["neutral"]
+    rest = [i for i in range(len(PHRASES)) if i not in neu]
+    assert ci_on["train_inputs"] is None and torch.equal(ci_off["inputs"], ci_on["inputs"])
+    t = ci_off["train_inputs"]
+    assert torch.equal(t[neu, :2], torch.zeros(len(neu), 2)) and torch.equal(t[neu, 2], ci_on["inputs"][neu, 2])
+    assert torch.equal(t[rest], ci_on["inputs"][rest]) and ci_off["contrast_l1"] == ci_on["contrast_l1"]
+    assert float(ci_on["inputs"][neu, :2].abs().sum()) > 0                    # read as they are, they do feed a side
+    n = 8                                                                     # neutral pictures only, a target to move to
+    bank = {"latents": torch.ones(n, 2, 1, 2, 2), "classes": ["neutral"] * n, "cap_index": torch.zeros(n, dtype=torch.long),
+            "conds": FakeConnectorPipe().encode(["x"])}
+    w_on, w_off = (s._connector_train(a, ci, bank)["W"] for a, ci in ((on, ci_on), (off, ci_off)))
+    assert float(w_on[:, :2].abs().sum()) > 0 and float(w_off[:, 2].abs().sum()) > 0
+    assert torch.equal(w_off[:, :2], torch.zeros_like(w_off[:, :2]))
+    for sides, axis in (("exp", True), ("one", True), ("one", False)):
+        with pytest.raises(ValueError, match="split slider only"):
+            s._connector_inputs(dataclasses.replace(off, sides=sides, axis=axis), feats, PHRASES)
 
 
 def test_connector_whitening_is_fit_on_the_training_rows_only():

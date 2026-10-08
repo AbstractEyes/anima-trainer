@@ -1572,6 +1572,8 @@ class ConnectorArm:
     reading: str = ""                # the README's description of her features when the arm has its own file
     side_check: str = ""             # a two-sided slider's dead-zone check, measured on the arm's own training phrases
     date: str = ""                   # the day the arm was registered (empty: DATE, the first connectors')
+    neutral_sides: bool = True       # False: in training the neutral rows enter a split slider as [0, 0, n] (neither side);
+                                     # every phrase still goes through the map at evaluation
 
 
 # ---- e031-e037: the hub sliders (her final trunk; three readings chosen and measured by the hub read, e030) ------------
@@ -1583,7 +1585,7 @@ HUB_READ = f"the hub read ({HUB_READ_ID} in this repo: a read of her states made
 # spelling of its tokens) against the Qwen3 states Anima's adapter reads; a read of her states, no pictures
 TRIANGULATION_ID = "e038_beatrix_dual_extraction_read"
 HUB_FEATURES = {r: f"beatrix/mood_phrases_{r.replace('/', '-')}_mini-beatrix-3_step245674.safetensors"
-                for r in ("close/stream/18", "close/hub/22", "close/both/18")}       # in the data repo
+                for r in ("close/stream/18", "close/hub/22", "close/both/18", "close/stream/20")}       # in the data repo
 _STD = ("normalized (layer norm without its affine) and standardized per feature over a reference set of mood words and "
         "phrases that holds no word of a held-out phrase")
 HUB_READINGS = {
@@ -1612,11 +1614,22 @@ HUB_READINGS = {
         f"mean of the two readings' own slider values, so each counts equally whatever its width. In {HUB_READ} this mean "
         "separated the unseen phrases by 1.98 (every unseen phrase on its side; 57 of 60 left-out training phrases). The "
         "features are computed by the session that runs these arms and kept in the data repo."),
+    "close/stream/20": (
+        "Her features for a phrase: her state after block 20 at the full stop that closes the phrase (the phrase is read with "
+        f"a full stop after it, so the state follows the whole phrase; 1,024 numbers), {_STD}. The block was chosen by the "
+        f"dual-extraction read ({TRIANGULATION_ID} in this repo: a read of her states made before these arms, 2026-10-07): "
+        "of her stream's blocks, the one closest to the Qwen3 states this model's text adapter reads that still carries her "
+        "mood direction onto Qwen3's, the gloomy side included (blocks 22-28 sit closer, but there only 2 of the 4 unseen "
+        "gloomy phrases land on Qwen3's gloomy side). In "
+        f"{HUB_READ} this reading separated the unseen phrases by 2.16 (every unseen phrase on its side; 57 of 60 training "
+        "phrases on their side when each is left out of the fit) and placed the four neutral training phrases at -0.19, "
+        "-0.99, -0.18 and -0.15 on the slider ('an ordinary scene', 'plain', 'everyday', 'neutral'; the gloomy centre at -1). "
+        "The features are computed by the session that runs these arms and kept in the data repo."),
 }
 # the dead-zone check of each arm's own trunk, measured in the read before any run: of the 30 gloomy training phrases how many
 # sit below 0 and below -0.25 on the slider's axis, and of the 4 unseen gloomy phrases how many below -0.25
 HUB_SIDE = {"e031": (30, 29, 4), "e032": (26, 24, 2), "e033": (30, 29, 4), "e034": (30, 28, 4), "e035": (26, 24, 3),
-            "e036": (30, 30, 4), "e037": (27, 26, 2)}
+            "e036": (30, 30, 4), "e037": (27, 26, 2), "e039": (30, 30, 4), "e040": (26, 24, 2), "e041": (30, 30, 4)}
 
 
 def _side_check(arm: str, whose: str = "her") -> str:
@@ -1625,12 +1638,13 @@ def _side_check(arm: str, whose: str = "her") -> str:
             "of the 4 unseen gloomy phrases sit beyond -0.25).")
 
 
-def _hub_arm(n: int, name: str, title: str, source: str, reading: str, changed: str, question: str) -> "ConnectorArm":
+def _hub_arm(n: int, name: str, title: str, source: str, reading: str, changed: str, question: str,
+             neutral_sides: bool = True) -> "ConnectorArm":
     tag = f"e0{n}"
     return ConnectorArm(f"{tag}_{name}", title, source, 32 if source == "random" else 30, question=question, changed=changed,
                         axis=True, sides="relu", features=HUB_FEATURES[reading], checkpoint=HUB_TRUNK,
                         reading=HUB_READINGS[reading], side_check=_side_check(tag, "its" if source == "random" else "her"),
-                        date=HUB_DATE)
+                        date=HUB_DATE, neutral_sides=neutral_sides)
 
 
 CONNECTOR_ARMS = (
@@ -1748,12 +1762,37 @@ CONNECTOR_ARMS = (
              changed="e036's slider on a randomly initialised trunk of the same shape (seed 0)",
              question="Does e036's held-out effect come from what Beatrix learned? (A control that must fail on the "
                       "held-out phrases.)"),
+    # e031-e037 read NOT LEARNED, the gloomy side unmoved; their weights show why: her readings put the neutral training
+    # phrases partly on the gloomy input, so the neutral pictures trained the gloomy push toward no change. Session 5 tests
+    # that on the reading the dual-extraction read (e038) picked, her stream at block 20: the neutral rows off both sides in
+    # training (e039; its control e040), beside the same reading with the hub sliders' recipe (e041). Hers share e031's
+    # training randomness (seed 30), the control the controls' (32).
+    _hub_arm(39, "beatrix_block20_slider_neutral_off", "Beatrix's closing-stop reading at block 20 as a two-sided slider, "
+             "the neutral phrases kept off both sides in training", "trained", "close/stream/20",
+             changed="e031's two-sided slider at block 20 (the dual-extraction read's pick, e038), with the neutral training "
+                     "phrases feeding neither side in training ([0, 0, n]); the same training randomness as e031",
+             question="With the neutral pictures kept off both sides of the slider in training, does Beatrix's reading of a "
+                      "phrase's mood steer the image both ways, for the phrases it trained on and for mood phrases it "
+                      "never saw?", neutral_sides=False),
+    _hub_arm(40, "beatrix_random_trunk_block20_slider_neutral_off", "Control: the same slider on an untrained Beatrix of "
+             "the same shape", "random", "close/stream/20",
+             changed="e039's slider (the neutral phrases off both sides in training) on the features of a randomly "
+                     "initialised trunk of the same shape (seed 0), at the same reading",
+             question="Does e039's held-out effect come from what Beatrix learned? (A control that must fail on the "
+                      "held-out phrases.)", neutral_sides=False),
+    _hub_arm(41, "beatrix_block20_slider", "Beatrix's closing-stop reading at block 20 as a two-sided slider, the hub "
+             "sliders' recipe", "trained", "close/stream/20",
+             changed="e031's two-sided slider at block 20 (the dual-extraction read's pick, e038), every training phrase "
+                     "read through the map as in e031; the same training randomness as e031 and e039",
+             question="At block 20, does the hub sliders' recipe steer the image as e039's does? (e039's one-factor "
+                      "comparison: the two differ only in the neutral phrases' inputs during training.)"),
 )
 CONNECTOR_IDS = [a.id for a in CONNECTOR_ARMS]
 CONNECTOR_PAIRS = ((CONNECTOR_IDS[0], CONNECTOR_IDS[1]), (CONNECTOR_IDS[3], CONNECTOR_IDS[4]),
                    (CONNECTOR_IDS[5], CONNECTOR_IDS[6]), (CONNECTOR_IDS[7], CONNECTOR_IDS[8]),
                    (CONNECTOR_IDS[10], CONNECTOR_IDS[11]), (CONNECTOR_IDS[12], CONNECTOR_IDS[11]),
-                   (CONNECTOR_IDS[13], CONNECTOR_IDS[14]), (CONNECTOR_IDS[15], CONNECTOR_IDS[16]))   # (Beatrix, untrained)
+                   (CONNECTOR_IDS[13], CONNECTOR_IDS[14]), (CONNECTOR_IDS[15], CONNECTOR_IDS[16]),
+                   (CONNECTOR_IDS[17], CONNECTOR_IDS[18]))                                           # (Beatrix, untrained)
 SLIDER_MAPS = {"one": "[a, n]", "relu": "[max(a, 0), max(-a, 0), n]", "exp": "[e^a, e^-a, n]"}
 CONNECTOR_FREE = CONNECTOR_IDS[2]
 CONNECTOR_FEATURES = "beatrix/mood_phrases_mini-beatrix-3_step212000.safetensors"   # in the data repo
@@ -1944,6 +1983,13 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
                  "The exponentials keep both sides on for every phrase, the sign tilting the balance (no dead zone; at a "
                  "= 0 both sides contribute equally).")]
              if arm.axis and arm.sides != "one" else []),
+           *(["- **The neutral phrases in training**: they enter training as [0, 0, n], feeding neither side of the "
+              "slider. In the hub sliders (e031-e037) her readings placed the neutral training phrases partly on the gloomy "
+              "side, so the neutral pictures, which must stay neutral, also trained the gloomy side's direction, and none "
+              "of her sliders moved the gloomy phrases. Here each side's direction learns "
+              "from its own mood's pictures alone, and the neutral pictures train only the neutral reading's column and the "
+              "bias. At evaluation every phrase, the neutral ones too, goes through the same map."]
+             if not arm.neutral_sides else []),
            "- **Training**: Anima's own flow-matching objective, computed by the trainer's code (logit-normal "
            "timesteps, the noisy latent (1 - t) x0 + t noise, mean squared error to noise - x0), on the LoRA "
            "experiments' first-draw training images: 192 upbeat, 192 downbeat and 192 neutral renders of the stock "
