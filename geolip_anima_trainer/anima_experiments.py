@@ -1579,6 +1579,9 @@ HUB_TRUNK = "AbstractPhil/alephllm-mini-beatrix-training, mini-beatrix-3 at step
 HUB_DATE = "2026-10-07"
 HUB_READ_ID = "e030_beatrix_hub_read"    # written by alephllm_diffusion.hubs (github AbstractEyes/alephllm-diffusion-experiments)
 HUB_READ = f"the hub read ({HUB_READ_ID} in this repo: a read of her states made before any of these arms, 2026-10-07)"
+# written by alephllm_diffusion.triangulate (the same repo): her trunk and hub on two byte forms of a caption (its own bytes; Qwen3's
+# spelling of its tokens) against the Qwen3 states Anima's adapter reads; a read of her states, no pictures
+TRIANGULATION_ID = "e038_beatrix_dual_extraction_read"
 HUB_FEATURES = {r: f"beatrix/mood_phrases_{r.replace('/', '-')}_mini-beatrix-3_step245674.safetensors"
                 for r in ("close/stream/18", "close/hub/22", "close/both/18")}       # in the data repo
 _STD = ("normalized (layer norm without its affine) and standardized per feature over a reference set of mood words and "

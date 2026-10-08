@@ -513,7 +513,9 @@ def test_connector_registry_and_rules():
     # e030 is the hub read's folder (written by alephllm_diffusion.hubs): no experiment of this package may take it
     ids_here = {v for v in vars(ax).values() if isinstance(v, str) and v[:1] == "e" and v[1:4].isdigit() and v[4:5] == "_"}
     ids_here |= set(ax.CONNECTOR_IDS) | set(ax.SEQUENCE_IDS)
-    assert ax.HUB_READ_ID in ax.HUB_READ and {i for i in ids_here if i[:4] == ax.HUB_READ_ID[:4]} == {ax.HUB_READ_ID}
+    assert ax.HUB_READ_ID in ax.HUB_READ
+    for rid in (ax.HUB_READ_ID, ax.TRIANGULATION_ID):      # e038 likewise: the dual-extraction read's folder (triangulate)
+        assert {i for i in ids_here if i[:4] == rid[:4]} == {rid}
     assert all(a.features is None and not a.reading and not a.date for a in ax.CONNECTOR_ARMS[:10])
     assert {a.date for a in hub} == {"2026-10-07"}
     assert not set(ax.CONNECTOR_IDS) & set(ax.SEQUENCE_IDS)
