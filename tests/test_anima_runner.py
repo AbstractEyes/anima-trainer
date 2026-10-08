@@ -493,31 +493,39 @@ def test_connector_registry_and_rules():
                                 "e033_beatrix_stream_closing_slider_nine_arms", "e034_beatrix_hub_slider",
                                 "e035_beatrix_random_trunk_hub_slider", "e036_beatrix_hub_and_stream_slider",
                                 "e037_beatrix_random_trunk_hub_and_stream_slider", "e039_beatrix_block20_slider_neutral_off",
-                                "e040_beatrix_random_trunk_block20_slider_neutral_off", "e041_beatrix_block20_slider"]
+                                "e040_beatrix_random_trunk_block20_slider_neutral_off", "e041_beatrix_block20_slider",
+                                "e042_beatrix_qwen_arm_slider", "e043_beatrix_random_trunk_qwen_arm_slider",
+                                "e044_beatrix_plain_mounted_slider"]
     assert [a.source for a in ax.CONNECTOR_ARMS] == ["trained", "random", "onehot", "trained", "random", "trained", "random",
                                                      "trained", "random", "trained", "trained", "random", "arms9", "trained",
-                                                     "random", "trained", "random", "trained", "random", "trained"]
-    assert [a.whiten_k for a in ax.CONNECTOR_ARMS] == [None, None, None, 16, 16] + [None] * 15
-    assert [a.axis for a in ax.CONNECTOR_ARMS] == [False] * 5 + [True] * 15
-    assert [a.sides for a in ax.CONNECTOR_ARMS] == ["one"] * 7 + ["relu", "relu", "exp"] + ["relu"] * 10
-    assert [a.neutral_sides for a in ax.CONNECTOR_ARMS] == [True] * 17 + [False, False, True]   # session 5: e039 / e040 off
+                                                     "random", "trained", "random", "trained", "random", "trained",
+                                                     "qwen", "qwen_random", "plain"]
+    assert [a.whiten_k for a in ax.CONNECTOR_ARMS] == [None, None, None, 16, 16] + [None] * 18
+    assert [a.axis for a in ax.CONNECTOR_ARMS] == [False] * 5 + [True] * 18
+    assert [a.sides for a in ax.CONNECTOR_ARMS] == ["one"] * 7 + ["relu", "relu", "exp"] + ["relu"] * 13
+    assert [a.neutral_sides for a in ax.CONNECTOR_ARMS] == [True] * 17 + [False, False, True] + [False] * 3   # e039's form
     ids = ax.CONNECTOR_IDS
     assert ax.CONNECTOR_PAIRS == ((ids[0], ids[1]), (ids[3], ids[4]), (ids[5], ids[6]), (ids[7], ids[8]), (ids[10], ids[11]),
-                                  (ids[12], ids[11]), (ids[13], ids[14]), (ids[15], ids[16]), (ids[17], ids[18]))
+                                  (ids[12], ids[11]), (ids[13], ids[14]), (ids[15], ids[16]), (ids[17], ids[18]),
+                                  (ids[20], ids[21]))
     seeds = [a.seed for a in ax.CONNECTOR_ARMS]
     assert len(set(seeds[:9])) == 9 and seeds[9] == seeds[7]      # e025 = e023's training randomness, another input map
-    assert seeds[10:] == [30, 32, 30, 30, 32, 30, 32, 30, 32, 30]  # hers share one randomness (e031's), the controls one
+    assert seeds[10:] == [30, 32, 30, 30, 32, 30, 32, 30, 32, 30, 30, 32, 30]   # hers share e031's randomness, controls one
     hub = ax.CONNECTOR_ARMS[10:]
     assert [a.features for a in hub] == [ax.HUB_FEATURES[r] for r in ["close/stream/18"] * 3 + ["close/hub/22"] * 2
-                                         + ["close/both/18"] * 2 + ["close/stream/20"] * 3]
+                                         + ["close/both/18"] * 2 + ["close/stream/20"] * 3 + ["frame/qwen3-arm/20"] * 3]
     assert ax.TRIANGULATION_ID in hub[7].reading and "-0.99" in hub[7].reading       # the block's chooser; the leak's phrase
-    assert all(a.checkpoint == ax.HUB_TRUNK and a.reading and a.side_check.endswith(").") for a in hub)
+    assert ax.ARM_READ_ID in hub[10].reading and "-0.86" in hub[10].reading     # the arm's read; the trained pair's place
+    measured = [a for a in hub if ax.HUB_SIDE[a.id[:4]] is not None]
+    assert all(a.checkpoint == ax.HUB_TRUNK and a.reading for a in hub)
+    assert all(a.side_check.endswith(").") for a in measured) and not any(a.side_check for a in hub if a not in measured)
+    assert [k for k, v in ax.HUB_SIDE.items() if v is None] == ["e043"]   # its arm's features wait for the untrained arm
     assert set(ax.HUB_SIDE) == {a.id[:4] for a in hub}                      # each arm's own trunk's side check, no spare
     # e030 is the hub read's folder (written by alephllm_diffusion.hubs): no experiment of this package may take it
     ids_here = {v for v in vars(ax).values() if isinstance(v, str) and v[:1] == "e" and v[1:4].isdigit() and v[4:5] == "_"}
     ids_here |= set(ax.CONNECTOR_IDS) | set(ax.SEQUENCE_IDS)
     assert ax.HUB_READ_ID in ax.HUB_READ
-    for rid in (ax.HUB_READ_ID, ax.TRIANGULATION_ID):      # e038 likewise: the dual-extraction read's folder (triangulate)
+    for rid in (ax.HUB_READ_ID, ax.TRIANGULATION_ID, ax.ARM_READ_ID):  # e038 / e045 likewise: the reads' folders (triangulate)
         assert {i for i in ids_here if i[:4] == rid[:4]} == {rid}
     assert all(a.features is None and not a.reading and not a.date for a in ax.CONNECTOR_ARMS[:10])
     assert {a.date for a in hub} == {"2026-10-07"}
@@ -787,7 +795,8 @@ def test_hub_sliders_end_to_end(runner, monkeypatch, tmp_path):
     files = {}
     for reading, path in ax.HUB_FEATURES.items():
         p = tmp_path / path.replace("/", "_")
-        save_file({"trained": fake["trained"], "arms9": fake["trained"] * 0.9, "random": fake["random"]}, str(p),
+        save_file({"trained": fake["trained"], "arms9": fake["trained"] * 0.9, "random": fake["random"],
+                   "qwen": fake["trained"] * 0.8, "plain": fake["trained"] * 0.7, "qwen_random": fake["random"].clone()}, str(p),
                   metadata={"phrases": json.dumps(PHRASES), "reading": reading})
         files[path] = str(p)
     asked = []
@@ -820,7 +829,7 @@ def test_hub_sliders_end_to_end(runner, monkeypatch, tmp_path):
     m = repo.metas()
     cross = m[hub[1]]["result"]["cross"]["controls"]
     assert {(c["beatrix"], c["random"]) for c in cross.values()} == {(hub[0], hub[1]), (hub[2], hub[1]), (hub[3], hub[4]),
-                                                                     (hub[5], hub[6]), (hub[7], hub[8])}
+                                                                     (hub[5], hub[6]), (hub[7], hub[8]), (hub[10], hub[11])}
     assert all(c["OUTCOME"] == "THE CONTROL FAILS AS IT SHOULD" for c in cross.values())
     for arm in ax.CONNECTOR_ARMS[10:]:
         readme = repo.files_[f"experiments/{arm.id}/README.md"].decode()
@@ -834,6 +843,8 @@ def test_hub_sliders_end_to_end(runner, monkeypatch, tmp_path):
         head = json.loads(raw[8:8 + int.from_bytes(raw[:8], "little")])["__metadata__"]
         assert ("neutral rows in training" in head) == off               # and with the shipped weights
     assert "nine trained arms mounted" in m[hub[2]]["recipe"]["input"]
+    assert "read through the arm" in m[hub[10]]["recipe"]["input"] and "arm masked" in m[hub[12]]["recipe"]["input"]
+    assert "its own Qwen tokenizer arm" in m[hub[11]]["recipe"]["input"]
     r30, r32 = m[hub[0]]["result"]["reads"], m[hub[2]]["result"]["reads"]
     assert r30["TRAINED"] == r32["TRAINED"] == "TRAINED WORDS MOVE IT"   # the nine-arm tensor: the same direction, 0.9 the size
 

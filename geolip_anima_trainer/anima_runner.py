@@ -2095,6 +2095,14 @@ class AnimaRunner(_sr.SanaRunner):
                                   f"phrase ({n_feat} numbers)",
                          "random": f"an untrained Beatrix of the same shape (random initialisation, seed 0): its features "
                                    f"for the phrase ({n_feat} numbers), standardized the same way",
+                         "qwen": f"Beatrix ({trunk}) with her Qwen tokenizer arm mounted over the eight stage arms it was "
+                                 "trained with: the caption's Qwen3 spelling read through the arm, her features for the "
+                                 f"phrase ({n_feat} numbers)",
+                         "plain": f"Beatrix ({trunk}) with the same arms mounted and the Qwen tokenizer arm masked: the "
+                                  f"caption's own bytes, her features for the phrase ({n_feat} numbers)",
+                         "qwen_random": f"an untrained Beatrix of the same shape (random initialisation, seed 0) with its "
+                                        "own Qwen tokenizer arm: the caption's Qwen3 spelling read through it, its features "
+                                        f"for the phrase ({n_feat} numbers), standardized the same way",
                          "onehot": "the mood class as a one-hot vector (3 numbers); no encoder"}[arm.source]}
         if ci["projection"] is not None and arm.axis:
             rec["input"] += (", reduced to a slider value: its position on the axis from the gloomy to the cheerful training "

@@ -1567,7 +1567,8 @@ class ConnectorArm:
     axis: bool = False               # the features reduced to a slider value on the training phrases' mood axis (+ neutral)
     sides: str = "one"               # the slider's input map: 'one' [a, n]; 'relu' [max(a,0), max(-a,0), n]; 'exp' [e^a, e^-a, n]
     features: "str | None" = None    # the arm's own features file in the data repo (None: CONNECTOR_FEATURES); source names
-                                     # its tensor ('trained', 'arms9' = her nine arms mounted, 'random')
+                                     # its tensor ('trained', 'arms9' = her nine arms mounted, 'random'; through a surface
+                                     # arm: 'qwen', 'plain' = the same mount with that arm masked, 'qwen_random')
     checkpoint: str = ""             # the trunk the arm's features come from (empty: CONNECTOR_CHECKPOINT)
     reading: str = ""                # the README's description of her features when the arm has its own file
     side_check: str = ""             # a two-sided slider's dead-zone check, measured on the arm's own training phrases
@@ -1584,8 +1585,12 @@ HUB_READ = f"the hub read ({HUB_READ_ID} in this repo: a read of her states made
 # written by alephllm_diffusion.triangulate (the same repo): her trunk and hub on two byte forms of a caption (its own bytes; Qwen3's
 # spelling of its tokens) against the Qwen3 states Anima's adapter reads; a read of her states, no pictures
 TRIANGULATION_ID = "e038_beatrix_dual_extraction_read"
+# written by alephllm_diffusion.triangulate.arm_read (the same repo): the dual-extraction read's gauges on her Qwen tokenizer arm
+# (a surface arm: she reads Qwen3's spelling of a text as she reads its own bytes), mounted; a read of her states, no pictures
+ARM_READ_ID = "e045_beatrix_qwen_arm_read"
 HUB_FEATURES = {r: f"beatrix/mood_phrases_{r.replace('/', '-')}_mini-beatrix-3_step245674.safetensors"
-                for r in ("close/stream/18", "close/hub/22", "close/both/18", "close/stream/20")}       # in the data repo
+                for r in ("close/stream/18", "close/hub/22", "close/both/18", "close/stream/20",
+                          "frame/qwen3-arm/20")}                                                     # in the data repo
 _STD = ("normalized (layer norm without its affine) and standardized per feature over a reference set of mood words and "
         "phrases that holds no word of a held-out phrase")
 HUB_READINGS = {
@@ -1625,14 +1630,34 @@ HUB_READINGS = {
         "phrases on their side when each is left out of the fit) and placed the four neutral training phrases at -0.19, "
         "-0.99, -0.18 and -0.15 on the slider ('an ordinary scene', 'plain', 'everyday', 'neutral'; the gloomy centre at -1). "
         "The features are computed by the session that runs these arms and kept in the data repo."),
+    "frame/qwen3-arm/20": (
+        "Her features for a phrase, read through her Qwen tokenizer arm: the phrase in this model's caption form ('" + PREFIX
+        + "an illustration of a quiet street, <phrase>.'), its Qwen3 tokens spelled as Qwen3 spells them and read through the "
+        "arm (AbstractPhil/beatrix-tokenizers, surface/qwen3/mse_gXA_o0: a detachable adapter after each of her 32 blocks, "
+        "trained over eight of her stage arms, which stay mounted, so that she reads Qwen3's spelling of a text as she reads "
+        "its own bytes); her state after block 20 at the full stop that closes the caption (1,024 numbers), " + _STD + ". "
+        f"The read of the mounted arm ({ARM_READ_ID} in this repo, 2026-10-08, before these arms) measured the reading on "
+        "10,000 caption tokens: through the arm, Qwen3's spelling lines up with her own bytes at every block (.955-.971 after "
+        "whitening, .41-.73 without the arm), it sits as close to the Qwen3 states this model's text adapter reads as her own "
+        "bytes in the same mount (.546 against .544 at block 24), and it carries her mood direction onto Qwen3's at blocks "
+        "14-20; block 20 passed the mood rule on both caption draws and stays the slider's block. Read on the training "
+        "phrases' axis, it places the trained gloomy pair at -0.86 and -0.94 ('gloomy and downbeat', 'somber and "
+        "melancholy'; the gloomy centre at -1) and the four neutral training phrases at +0.17, -0.31, +0.08 and -0.27 "
+        "('an ordinary scene', 'plain', 'everyday', 'neutral'). The features are computed by the session that runs these "
+        "arms and kept in the data repo."),
 }
 # the dead-zone check of each arm's own trunk, measured in the read before any run: of the 30 gloomy training phrases how many
 # sit below 0 and below -0.25 on the slider's axis, and of the 4 unseen gloomy phrases how many below -0.25
 HUB_SIDE = {"e031": (30, 29, 4), "e032": (26, 24, 2), "e033": (30, 29, 4), "e034": (30, 28, 4), "e035": (26, 24, 3),
-            "e036": (30, 30, 4), "e037": (27, 26, 2), "e039": (30, 30, 4), "e040": (26, 24, 2), "e041": (30, 30, 4)}
+            "e036": (30, 30, 4), "e037": (27, 26, 2), "e039": (30, 30, 4), "e040": (26, 24, 2), "e041": (30, 30, 4),
+            "e042": (28, 26, 4), "e043": None, "e044": (28, 27, 4)}
+# None: not yet measured (e043's features need the untrained copy's own arm, published after these arms were registered);
+# the registry test lists the missing ones, and no session runs an arm without its check
 
 
 def _side_check(arm: str, whose: str = "her") -> str:
+    if HUB_SIDE[arm] is None:
+        return ""
     neg, beyond, unseen = HUB_SIDE[arm]
     return (f"{neg} of {whose} 30 gloomy training phrases sit on the negative side and {beyond} beyond -0.25, and {unseen} "
             "of the 4 unseen gloomy phrases sit beyond -0.25).")
@@ -1640,10 +1665,10 @@ def _side_check(arm: str, whose: str = "her") -> str:
 
 def _hub_arm(n: int, name: str, title: str, source: str, reading: str, changed: str, question: str,
              neutral_sides: bool = True) -> "ConnectorArm":
-    tag = f"e0{n}"
-    return ConnectorArm(f"{tag}_{name}", title, source, 32 if source == "random" else 30, question=question, changed=changed,
+    tag, control = f"e0{n}", source.endswith("random")
+    return ConnectorArm(f"{tag}_{name}", title, source, 32 if control else 30, question=question, changed=changed,
                         axis=True, sides="relu", features=HUB_FEATURES[reading], checkpoint=HUB_TRUNK,
-                        reading=HUB_READINGS[reading], side_check=_side_check(tag, "its" if source == "random" else "her"),
+                        reading=HUB_READINGS[reading], side_check=_side_check(tag, "its" if control else "her"),
                         date=HUB_DATE, neutral_sides=neutral_sides)
 
 
@@ -1786,13 +1811,41 @@ CONNECTOR_ARMS = (
                      "read through the map as in e031; the same training randomness as e031 and e039",
              question="At block 20, does the hub sliders' recipe steer the image as e039's does? (e039's one-factor "
                       "comparison: the two differ only in the neutral phrases' inputs during training.)"),
+    # e039-e041 read NOT LEARNED: with the neutral phrases off both sides her strongly gloomy readings moved the pictures the
+    # gloomy way and the change tracked her reading, but the trained gloomy pair, which her reading of the phrase alone puts
+    # near neutral, stayed put. Session 6 reads each phrase in this model's caption form through her Qwen tokenizer arm (e045
+    # measured it: Qwen3's spelling read through it lines up with her own bytes), in e039's form: her reading through the arm,
+    # its control on an untrained copy with its own arm, and her plain reading in the same mount (the arm's one factor).
+    _hub_arm(42, "beatrix_qwen_arm_slider", "Beatrix's reading through her Qwen tokenizer arm as a two-sided slider", "qwen",
+             "frame/qwen3-arm/20",
+             changed="e039's slider (the neutral phrases off both sides in training) on a new reading: each phrase in this "
+                     "model's caption form, Qwen3's spelling of its tokens read through her Qwen tokenizer arm (mounted over "
+                     "the eight stage arms it was trained with), her state after block 20 at the full stop closing the "
+                     "caption; the same training randomness as e039",
+             question="Read through the arm that makes her read Qwen3's spelling as her own bytes, does Beatrix's reading "
+                      "of a phrase's mood steer the image both ways, for the phrases it trained on and for mood phrases it "
+                      "never saw?", neutral_sides=False),
+    _hub_arm(43, "beatrix_random_trunk_qwen_arm_slider", "Control: the same slider on an untrained Beatrix of the same "
+             "shape with its own Qwen tokenizer arm", "qwen_random", "frame/qwen3-arm/20",
+             changed="e042's slider on the features of a randomly initialised trunk of the same shape (seed 0) read through "
+                     "its own Qwen tokenizer arm (the same recipe, trained on that copy), at the same reading",
+             question="Does e042's held-out effect come from what Beatrix learned? (A control that must fail on the "
+                      "held-out phrases.)", neutral_sides=False),
+    _hub_arm(44, "beatrix_plain_mounted_slider", "Beatrix's plain reading in the same mount as a two-sided slider",
+             "plain", "frame/qwen3-arm/20",
+             changed="e042's slider with the Qwen tokenizer arm masked and the caption's own bytes read (the eight stage "
+                     "arms still mounted): her plain reading at the same block, site and caption form; the same training "
+                     "randomness as e042",
+             question="Does her reading of Qwen3's spelling through the arm steer the image as her plain reading of the "
+                      "caption's own bytes does? (e042's one-factor comparison: the two differ only in the arm and the "
+                      "byte form it serves.)", neutral_sides=False),
 )
 CONNECTOR_IDS = [a.id for a in CONNECTOR_ARMS]
 CONNECTOR_PAIRS = ((CONNECTOR_IDS[0], CONNECTOR_IDS[1]), (CONNECTOR_IDS[3], CONNECTOR_IDS[4]),
                    (CONNECTOR_IDS[5], CONNECTOR_IDS[6]), (CONNECTOR_IDS[7], CONNECTOR_IDS[8]),
                    (CONNECTOR_IDS[10], CONNECTOR_IDS[11]), (CONNECTOR_IDS[12], CONNECTOR_IDS[11]),
                    (CONNECTOR_IDS[13], CONNECTOR_IDS[14]), (CONNECTOR_IDS[15], CONNECTOR_IDS[16]),
-                   (CONNECTOR_IDS[17], CONNECTOR_IDS[18]))                                           # (Beatrix, untrained)
+                   (CONNECTOR_IDS[17], CONNECTOR_IDS[18]), (CONNECTOR_IDS[20], CONNECTOR_IDS[21]))   # (Beatrix, untrained)
 SLIDER_MAPS = {"one": "[a, n]", "relu": "[max(a, 0), max(-a, 0), n]", "exp": "[e^a, e^-a, n]"}
 CONNECTOR_FREE = CONNECTOR_IDS[2]
 CONNECTOR_FEATURES = "beatrix/mood_phrases_mini-beatrix-3_step212000.safetensors"   # in the data repo
@@ -1906,7 +1959,7 @@ def connector_cross_reads(reads: dict) -> dict:
     if free and free.get("trained_effect"):
         out["of_free_vector"] = {a: r["trained_effect"] / free["trained_effect"] for a, r in reads.items()
                                  if a != CONNECTOR_FREE}
-    hers = [a.id for a in CONNECTOR_ARMS if a.axis and a.source == "trained" and "heldout_down" in
+    hers = [a.id for a in CONNECTOR_ARMS if a.axis and a.source in ("trained", "qwen", "plain") and "heldout_down" in
             (reads.get(a.id) or {}).get("groups", {})]
     if len(hers) > 1:                                  # descriptive: her slider forms on the unseen gloomy phrases
         out["unseen_gloomy"] = {a: reads[a]["groups"]["heldout_down"]["mean"] for a in hers}
