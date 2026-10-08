@@ -1650,9 +1650,8 @@ HUB_READINGS = {
 # sit below 0 and below -0.25 on the slider's axis, and of the 4 unseen gloomy phrases how many below -0.25
 HUB_SIDE = {"e031": (30, 29, 4), "e032": (26, 24, 2), "e033": (30, 29, 4), "e034": (30, 28, 4), "e035": (26, 24, 3),
             "e036": (30, 30, 4), "e037": (27, 26, 2), "e039": (30, 30, 4), "e040": (26, 24, 2), "e041": (30, 30, 4),
-            "e042": (28, 26, 4), "e043": None, "e044": (28, 27, 4)}
-# None: not yet measured (e043's features need the untrained copy's own arm, published after these arms were registered);
-# the registry test lists the missing ones, and no session runs an arm without its check
+            "e042": (28, 26, 4), "e043": (21, 20, 0), "e044": (28, 27, 4)}
+# (None would mark a check not yet measured: the registry test refuses it)
 
 
 def _side_check(arm: str, whose: str = "her") -> str:

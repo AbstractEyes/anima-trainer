@@ -519,7 +519,7 @@ def test_connector_registry_and_rules():
     measured = [a for a in hub if ax.HUB_SIDE[a.id[:4]] is not None]
     assert all(a.checkpoint == ax.HUB_TRUNK and a.reading for a in hub)
     assert all(a.side_check.endswith(").") for a in measured) and not any(a.side_check for a in hub if a not in measured)
-    assert [k for k, v in ax.HUB_SIDE.items() if v is None] == ["e043"]   # its arm's features wait for the untrained arm
+    assert [k for k, v in ax.HUB_SIDE.items() if v is None] == []          # every arm's check measured before any run
     assert set(ax.HUB_SIDE) == {a.id[:4] for a in hub}                      # each arm's own trunk's side check, no spare
     # e030 is the hub read's folder (written by alephllm_diffusion.hubs): no experiment of this package may take it
     ids_here = {v for v in vars(ax).values() if isinstance(v, str) and v[:1] == "e" and v[1:4].isdigit() and v[4:5] == "_"}
