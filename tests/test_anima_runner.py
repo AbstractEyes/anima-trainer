@@ -528,7 +528,7 @@ def test_connector_registry_and_rules():
     for rid in (ax.HUB_READ_ID, ax.TRIANGULATION_ID, ax.ARM_READ_ID,    # e038 / e045 likewise: the reads' folders (triangulate)
                 ax.NANO_READ_ID, ax.NANO_RELAY_ID, ax.NANO_COMPARATOR_ID,   # e046-e049: the nano battery's folders
                 ax.NANO_RELAY_TRAINED_ID, ax.CP_TEST_ID, ax.CPS_TEST_ID,     # e050-e052: the counterpoint pairs
-                ax.CPG_TEST_ID, ax.CGR_TEST_ID):
+                ax.CPG_TEST_ID, ax.CGR_TEST_ID, ax.CGD_TEST_ID):
         assert {i for i in ids_here if i[:4] == rid[:4]} == {rid}
     assert all(a.features is None and not a.reading and not a.date for a in ax.CONNECTOR_ARMS[:10])
     assert {a.date for a in hub} == {"2026-10-07"}
@@ -2289,3 +2289,205 @@ def test_counterpoint_groups_end_to_end(runner, fake_hub, monkeypatch):
     assert {n for n in ax.cgr_plans()} <= kept and set(ax.cgr_refs().values()) <= kept
     assert s.run_counterpoint_groups()["status"] == "done"            # done already: skipped, nothing drawn again
     assert len(calls_mix) == 128
+
+
+def test_group_reader_design_is_the_registered_one():
+    """e054's descriptions: the wording rules hold (no leak, no crowded word), every count is balanced, every tier corner
+    sits on four characters, no trained-tier combination is a training one, the frame is e052's."""
+    import collections
+    assert ax.cgd_checks() == {"leaks": [], "crowded": []}
+    rows = ax.cgd_rows()
+    by = {s: [r for r in rows if r["split"] == s] for s in ("train", "trained", "unseen", "descriptive")}
+    assert [len(v) for v in by.values()] == [96, 32, 32, 7] and len({r["text"] for r in rows}) == 167
+    assert not {tuple(r["words"]) for r in by["trained"]} & {tuple(r["words"]) for r in by["train"]}
+    for s, uses in (("train", 6), ("trained", 2), ("unseen", 4)):
+        for i, k in enumerate(ax.CGD_PAIRS):
+            for side, m in ((1, "+"), (-1, "-")):
+                got = collections.Counter(r["words"][i] for r in by[s] if r["corner"][i] == side)
+                assert set(got) == set(ax.CGD_PHRASES[k][("unseen" if s == "unseen" else "train") + m])
+                assert set(got.values()) == {uses}
+    for s in ax.CGD_TIERS:
+        assert collections.Counter(r["cell"] for r in by[s]) == {c: 2 for c in range(16)}
+        for c in ax.CGR_CORNERS:
+            assert len({ax.attr_cells()[r["cell"]][0] for r in by[s] if tuple(r["corner"]) == c}) == 4
+    assert by["train"][0]["frame"] == ax.CPG_READ_FORM.format(w=by["train"][0]["text"])
+    assert by["descriptive"][0]["frame"] == ax.PREFIX + "1girl, solo, upper body."
+    assert ax.cgd_rows() == rows                                     # one fixed shuffle
+    readme = ax.render_group_readers_readme({"status": "running"}, {"model": "Anima"})
+    assert "fixed before the run" in readme and "DRIVES THE GROUP" in readme and "flaxen hair" in readme
+    for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery", "U2"):
+        assert word not in readme
+
+
+def test_group_reader_items():
+    """A reader's pictures: the plain prompt composed with one prompt per pair at the grid amount (a pair at 0 left out);
+    all three at 0 is the plain set's item and all three at +-1 e053's slider group, but for the name."""
+    rows = [r for r in ax.cgd_rows() if r["split"] == "unseen"]
+    cells = ax.attr_cells()
+
+    def strip(it):
+        return {k: v for k, v in it.items() if k != "name"}
+
+    zero = {r["id"]: [0.1, -0.12, 0.0] for r in rows}
+    for r, it in zip(rows, ax.cgd_items("unseen", zero)):
+        assert strip(it) == strip(ax.cp_items(None, "upper body", 2)[r["cell"]]) and it["name"].startswith(r["id"] + "_")
+    corner = {r["id"]: [float(x) for x in r["corner"]] for r in rows}
+    for r, it in zip(rows, ax.cgd_items("unseen", corner)):
+        assert strip(it) == strip(ax.cgr_items(tuple(r["corner"]), "sliders", 2)[r["cell"]])
+    odd = {r["id"]: [1.9, -0.2, 0.6] for r in rows}
+    for r, it in zip(rows, ax.cgd_items("unseen", odd)):
+        ci = cells[r["cell"]][0]
+        assert it["mix_weights"] == [1.5, 0.25, 0.5]
+        assert it["mix_prompts"] == [ax.cp_prompt(t, "upper body", ci, 2) for t in ("blonde hair", "frown", "red eyes")]
+        assert ("negative" in it) == (ci in ax.BED2_GUARDED)
+    assert ax.cgd_amounts([1.9, -0.2, 0.6, -0.124]) == [1.5, -0.25, 0.5, 0.0]
+    assert ax.cgd_set_name("beatrix_untrained", "unseen") == "cgd2_beatrix-untrained_unseen"
+    every = {r["id"]: [float(x) for x in r["corner"]] for r in ax.cgd_rows() if r["corner"]}
+    plans = ax.cgd_plans({r: every for r in ax.CGD_READERS}, readers=ax.CGD_READERS[:1])
+    assert list(plans) == ["cgd2_qwen_trained", "cgd2_qwen_unseen"] and len(plans["cgd2_qwen_unseen"]) == 32
+    assert set(ax.cgd_refs().values()) == set(ax.cgd_ref_plans())
+
+
+def _reader_amounts(flip: "str | None" = None, scale: float = 1.0, drag: float = 0.0, only: "str | None" = None):
+    """Made-up readings: every description read at its corner times `scale`; `flip` names a pair read backwards on its -
+    side; `drag` moves the hair reading with the eye colour's side; `only` keeps one pair (the rest at 0)."""
+    out = {}
+    for r in ax.cgd_rows():
+        c = r["corner"] or [0, 0, 0]
+        a = [scale * x for x in c]
+        if flip and c[ax.CGD_PAIRS.index(flip)] < 0:
+            a[ax.CGD_PAIRS.index(flip)] *= -1
+        a[0] += drag * c[2]
+        if only:
+            a = [x if k == only else 0.0 for k, x in zip(ax.CGD_PAIRS, a)]
+        out[r["id"]] = a
+    return out
+
+
+def test_group_reading_marks():
+    good = ax.cgd_read_marks(_reader_amounts())
+    assert good["train"]["total"] == 288 and good["tiers"]["unseen"]["OUTCOME"] == "READS THE GROUP"
+    assert good["tiers"]["trained"]["whole_descriptions"] == 32 and good["tiers"]["trained"]["overlapping"] == []
+    half = ax.cgd_read_marks(_reader_amounts(flip="expression"))
+    t = half["tiers"]["unseen"]
+    assert t["OUTCOME"] == "READS 2 OF 3" and not t["pairs"]["expression"]["read"] and half["train"]["expression"] == 48
+    assert t["pairs"]["expression"]["sides"]["+"]["OUTCOME"] == "READS IT"
+    assert t["pairs"]["expression"]["sides"]["-"]["OUTCOME"] != "READS IT" and t["whole_descriptions"] == 16
+    dragged = ax.cgd_read_marks(_reader_amounts(drag=0.5))["tiers"]["trained"]
+    assert dragged["overlapping"] == ["eye_colour on hair_colour"]
+    assert dragged["pairs"]["hair_colour"]["cross_talk"]["eye_colour"]["of_separation"] == pytest.approx(0.5)
+
+
+def _group_pictures(am: dict) -> dict:
+    """Made-up judge scores of a reader's pictures: plain + 7 x the grid amount on each pair."""
+    rows = ax.cgd_rows()
+    return {t: {k: [7.0 * ax.cgd_amounts(am[r["id"]])[i] + 0.01 * (r["cell"] % 3) for r in rows if r["split"] == t]
+                for i, k in enumerate(ax.CGD_PAIRS)} for t in ax.CGD_TIERS}
+
+
+def test_group_picture_marks():
+    """The picture marks on made-up scores (plain 0, the group at amount 1 moves each pair by 7 its way, a reader's
+    picture by 7 x its amount): a full reader drives the group most of the way, a half one part of the way; a control
+    that carries a pair takes that pair's credit from every reader."""
+    plain = {k: [0.01 * (x % 3) for x in range(16)] for k in ax.CGD_PAIRS}
+    corners = {ax.cgr_label(c): {k: [7.0 * c[i] + plain[k][x] for x in range(16)] for i, k in enumerate(ax.CGD_PAIRS)}
+               for c in ax.CGR_CORNERS}
+    am = {"qwen": _reader_amounts(), "beatrix": _reader_amounts(scale=0.5),
+          "beatrix_untrained": _reader_amounts(only="eye_colour"), "birth": _reader_amounts(scale=0.0)}
+    r = ax.cgd_reads({n: _group_pictures(a) for n, a in am.items()}, plain, corners, am)
+    u = r["unseen"]["readers"]
+    assert u["qwen"]["OUTCOME"] == "DRIVES THE GROUP" and u["qwen"]["whole_pictures"] == 32
+    for k in ax.CGD_PAIRS:
+        for m in "+-":
+            q, b = u["qwen"]["pairs"][k]["sides"][m], u["beatrix"]["pairs"][k]["sides"][m]
+            assert q["how_far"] == pytest.approx(1.0) and q["HOW_FAR"] == "most of the way"
+            assert b["how_far"] == pytest.approx(0.5) and b["HOW_FAR"] == "part of the way"
+    assert u["beatrix"]["OUTCOME"] == "DRIVES THE GROUP"
+    assert u["beatrix_untrained"]["OUTCOME"] == "DRIVES 1 OF 3" and u["beatrix_untrained"]["pairs_carried"] == ["eye_colour"]
+    assert u["birth"]["OUTCOME"] == "DRIVES NONE" and u["birth"]["whole_pictures"] == 0
+    assert r["unseen"]["controls_carrying"]["eye_colour"] == ["beatrix_untrained"]
+    assert u["qwen"]["credited"] == ["hair_colour", "expression"] and u["beatrix_untrained"]["credited"] == []
+
+
+def test_group_readers_end_to_end(runner, fake_hub, monkeypatch):
+    """The run draws the reference sets it lacks and every reader's two tier sets, copies a picture identical to one
+    already there (all amounts 0: the plain picture; all at +-1: e053's group; a second reader at the same amounts)
+    instead of drawing it, batches pictures by their number of mix prompts, keeps every set in the data repo and reads
+    the marks."""
+    from PIL import Image
+    s, repo, pipe, calls = runner
+    s.cfg.data_repo_id = "AbstractPhil/geolip-beatrix-anima-data"
+    tags = ax.cp_judge_tags(list(ax.CP_DEFAULT))
+    index = {t: i for i, t in enumerate(tags)}
+    batches, rendered = [], []
+
+    def amounts_of(prompts, weights):
+        a = [0.0, 0.0, 0.0]
+        for m, w in zip(prompts, weights):
+            for i, k in enumerate(ax.CGD_PAIRS):
+                head = m.split(", upper body")[0]
+                a[i] = w if ax.CP_PAIRS[k][0] in head else -w if ax.CP_PAIRS[k][1] in head else a[i]
+        return a
+
+    def render(prompts, seeds, mix_prompts=None, mix_weights=None, negative=None, **kw):
+        batches.append(None if mix_prompts is None else {len(m) for m in mix_prompts})
+        rendered.append(len(prompts))
+        out = []
+        for j, (p, sd) in enumerate(zip(prompts, seeds)):
+            a = (amounts_of(mix_prompts[j], mix_weights[j]) if mix_prompts is not None else
+                 amounts_of([p], [1.0]))
+            im = Image.new("RGB", (8, 8), tuple(int(round(128 + 80 * x)) for x in a))
+            im.putpixel((1, 0), (sd, 0, 0))
+            out.append(im)
+        return out
+
+    def probs(imgs):
+        rows = []
+        for im in imgs:
+            c, (sd, _, _) = im.getpixel((0, 0)), im.getpixel((1, 0))
+            v = np.full(len(tags), 0.5)
+            v[[index[r] for r in ax.CP_RATINGS]] = (0.9, 0.05, 0.05, 0.05)
+            v[[index[t] for t in ax.AGE_TAGS]] = 0.01
+            v[index[ax.FRAME_TAG]] = 0.01
+            for k, code in zip(ax.CGD_PAIRS, c):
+                z = 3.0 * (code - 128) / 80 + 0.01 * (sd % 7)
+                plus, minus = ax.CP_PAIRS[k][:2]
+                v[index[plus]], v[index[minus]] = 1 / (1 + np.exp(-z)), 1 / (1 + np.exp(z))
+            rows.append(v)
+        return np.array(rows)
+
+    monkeypatch.setattr(s, "_render", render)
+    monkeypatch.setattr(s, "_cp_judges", lambda k: (probs, index, list(tags), {t.replace(" ", "_"): 1000 for t in tags}))
+    monkeypatch.setattr(s, "_judge", lambda: None)
+    half = _reader_amounts(scale=0.5)
+    R = {"source": "made up", "amounts": {"qwen": _reader_amounts(), "beatrix": half, "nano": dict(half),
+                                          "stack": _reader_amounts(scale=1.5), "beatrix_untrained": _reader_amounts(scale=0.0),
+                                          "birth": _reader_amounts(only="eye_colour")}}
+    with pytest.raises(ValueError):
+        s.run_group_readers({"amounts": {"qwen": R["amounts"]["qwen"]}})
+    meta = s.run_group_readers(R)
+    r = meta["result"]
+    assert meta["status"] == "done"
+    plans = {**ax.cgd_ref_plans(), **ax.cgd_plans(R["amounts"])}
+    distinct = {json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True) for v in plans.values() for it in v}
+    total = 144 + 12 * 32                    # each distinct picture drawn once, every other one a copy
+    assert r["pictures"] == {"total": total, "drawn": len(distinct), "copied": total - len(distinct), "reused": 0}
+    assert sum(rendered) == len(distinct) < 144 + 3 * 64
+    assert all(b is None or len(b) == 1 for b in batches) and {1} in batches and {3} in batches
+    t = r["reads"]["unseen"]["readers"]
+    assert t["qwen"]["OUTCOME"] == "DRIVES THE GROUP" and t["stack"]["OUTCOME"] == "DRIVES THE GROUP"
+    assert t["beatrix"]["OUTCOME"] == "DRIVES THE GROUP" and t["nano"]["pairs"] == t["beatrix"]["pairs"]
+    assert t["beatrix"]["pairs"]["expression"]["sides"]["-"]["HOW_FAR"] == "part of the way"
+    assert t["beatrix_untrained"]["OUTCOME"] == "DRIVES NONE" and t["birth"]["OUTCOME"] == "DRIVES 1 OF 3"
+    assert r["reads"]["unseen"]["controls_carrying"]["eye_colour"] == ["birth"]
+    assert t["qwen"]["credited"] == ["hair_colour", "expression"]
+    base = f"experiments/{ax.CGD_TEST_ID}"
+    for f in ["meta.json", "README.md", "result.json", "readers.json", "tagger_probs.npz", "sheet_trained.jpg",
+              "sheet_unseen.jpg"]:
+        assert f"{base}/{f}" in repo.files_, f
+    readme = repo.files_[f"{base}/README.md"].decode()
+    assert "**DRIVES THE GROUP**" in readme and "**DRIVES 1 OF 3**" in readme and "The unseen tier" in readme
+    kept = {p.name.rsplit("-", 1)[0] for p in (fake_hub.d / "sets").iterdir()}
+    assert set(ax.cgd_plans(R["amounts"])) <= kept and set(ax.cgd_refs().values()) <= kept
+    n = len(batches)
+    assert s.run_group_readers(R)["status"] == "done" and len(batches) == n      # done already: nothing drawn again

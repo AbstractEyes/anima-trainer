@@ -222,6 +222,13 @@ cache → two-phase train):
   single-tag predictions added at every sampling step): does each attribute survive the group, how much of its
   single-tag move does it keep, and does one pull on another? The plain and single-tag pictures come from the
   data repo; the new group sets are kept there (`sets/cgr2_*`).
+- **`anima_colab_group_readers.ipynb`**
+  [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_group_readers.ipynb)
+  — e054 on **Anima**: text readers on the group. A trained text model (Beatrix, the nano bodies; Qwen3 as the
+  reference; untrained copies as the controls) reads ONE description of hair colour, expression and eye colour and
+  sets all three sliders from that single reading; one picture per description, judged on all three. Two tiers:
+  new combinations of the training wordings, and wordings never trained. The readings come from the data repo
+  (`beatrix/cgd_readers.json`); the reference pictures too; the readers' sets are kept there (`sets/cgd2_*`).
 
 ## Programmatic / sweeps
 

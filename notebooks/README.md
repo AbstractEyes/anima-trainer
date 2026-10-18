@@ -146,6 +146,29 @@ the runner's release tag, then `setup()` → `run_counterpoint_words()`.
   view; the other seven characters' pictures are the earlier sets', reused through `prefetch_first_bed()`). The readers' amounts come from a separate reading step
   (`readers.json`); the notebook never runs the text models.
 
+## `anima_colab_group_readers.ipynb`
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_group_readers.ipynb)
+
+**e054, text readers on the group** (`AnimaRunner.run_group_readers`), uploaded into
+`experiments/e054_anima_group_readers` of
+[AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). The bootstrap checks out
+the runner's release tag (v0.6.0), then `setup()` → `run_group_readers(<the readers file from the data repo>)`.
+
+- **The question:** can a trained text model read one description of three attributes and set every slider of the group
+  from that single reading, so the picture carries all three as described?
+- **The readers:** Qwen3's final state (the reference), Beatrix 3s block 20, the best nano tap and the four nano bodies
+  side by side (picked on the training descriptions alone), and two controls that must fail (Beatrix untrained, the
+  picked nano body at birth). The readings (per pair, a ridge regression of the side on the reader's state, trained on 96
+  descriptions) are made beforehand and stored in the data repo's `beatrix/cgd_readers.json`.
+- **The descriptions:** one wording per pair joined by commas in one of six orders; the trained tier (32 new
+  combinations of the training wordings) and the unseen tier (32 descriptions whose wordings share no word with any
+  training wording). One picture per description on its own cell: v(plain) + sum over the pairs of |a| (v(tag of a's
+  side) - v(plain)), a rounded to a quarter step; a pair at 0 left out; a picture identical to one already drawn copied.
+- **The rule (fixed before the run):** per reader, tier, pair and side, the 16 descriptions' pictures against their cells'
+  plain pictures: carried when at least 12 of 16 move the side's way, beyond 3 SE; a reader drives the group when all
+  three pairs are carried; the controls must drive none, and a pair a control carries is credited to no reader. Beside
+  it: how far each side moves as a share of the group at amount 1.
+
 ## `anima_colab_groups.ipynb`
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_groups.ipynb)
 

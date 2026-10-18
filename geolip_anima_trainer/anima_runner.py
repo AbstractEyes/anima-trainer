@@ -2036,12 +2036,17 @@ class AnimaRunner(_sr.SanaRunner):
         (root / "items.jsonl").write_text("".join(json.dumps(it) + "\n" for it in items), encoding="utf-8")
         gaps = set(_ts.missing_images(root, items))
         todo = [it for it in items if it["name"] in gaps]
+        twins: dict = {}                   # identical items (every field but the name) are drawn once (e054)
+        for it in todo:
+            twins.setdefault(json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True), []).append(it)
+        todo = [g[0] for g in twins.values()]
         if todo:
             self._assert_stock()
             groups: dict = {}
-            for it in todo:                                           # one negative prompt per batch (e052's age guard)
-                groups.setdefault(it.get("negative"), []).append(it)
-            for negative, group in groups.items():
+            for it in todo:            # one negative prompt (e052's age guard) and one kind of mix per batch (e054)
+                key = (it.get("negative"), "mix_prompt" in it, len(it.get("mix_prompts") or ()))
+                groups.setdefault(key, []).append(it)
+            for (negative, _, _), group in groups.items():
                 for i in range(0, len(group), self.cfg.gen_batch):
                     chunk = group[i:i + self.cfg.gen_batch]
                     kw = ({"mix_prompts": [c["mix_prompt"] for c in chunk], "mix_weights": [c["mix_weight"] for c in chunk]}
@@ -2052,15 +2057,16 @@ class AnimaRunner(_sr.SanaRunner):
                         kw["negative"] = negative
                     for it, img in zip(chunk, self._render([c["prompt"] for c in chunk], [c["seed"] for c in chunk],
                                                            **kw)):
-                        img.save(img_dir / f"{it['name']}.png")
-                        (img_dir / f"{it['name']}.txt").write_text(it["caption"], encoding="utf-8")
+                        for twin in twins[json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True)]:
+                            img.save(img_dir / f"{twin['name']}.png")
+                            (img_dir / f"{twin['name']}.txt").write_text(twin["caption"], encoding="utf-8")
                     if eta is not None:
                         eta.add(len(chunk))
         if todo or not (root / "sheet.jpg").is_file():
             from PIL import Image
             ims = [Image.open(img_dir / f"{it['name']}.png") for it in items]
             _grid([ims[r:r + 8] for r in range(0, len(ims), 8)], root / "sheet.jpg", tile=192)
-        return len(todo)
+        return len(todo)                   # the pictures drawn (a twin's copy is not counted)
 
     def _cp_push(self, name: str, items: list[dict]) -> "str | None":
         """A complete set the data repo lacks, uploaded for later runs (a failure only warns). Returns its folder there."""
@@ -2654,6 +2660,181 @@ class AnimaRunner(_sr.SanaRunner):
                 "cells": [{"character": ax.CHARACTERS_BED2[ci][0], "seed": sd,
                            "scores": {n: {b: res[n]["scores"][b][j] for b in judged} for n in plans}}
                           for j, (ci, sd) in enumerate(ax.attr_cells())]}
+
+    # ---- e054: readers on the group (one description read, the group's three sliders set at once) ----------------------
+    def run_group_readers(self, readers: "str | Path | dict", *, force: bool = False) -> dict:
+        """e054 into its own folder of cfg.repo_id: text readers read one description of hair colour, expression and eye
+        colour and set the group's three sliders from that one reading (e053's composed sliders at the reader's amounts),
+        one picture per description of the trained and the unseen tier, read against the plain prompt's pictures and
+        e053's group at amount 1 (downloaded from cfg.data_repo_id or found on this runtime, drawn only when absent).
+        readers = readers.json from the reading step ({"amounts": {reader: {description id: [reading per pair]}},
+        "marks": ..., "picks": ..., "source": ...}) or its path. A picture identical to one already drawn (the plain
+        prompt, e053's group, another reader's) is copied, not drawn again. Every new set is kept in the data repo.
+        Skipped when the repo lists it as done (force=True reruns the reads; the sets come back from the data repo)."""
+        R = readers if isinstance(readers, dict) else json.loads(Path(readers).read_text(encoding="utf-8"))
+        ids = [r["id"] for r in ax.cgd_rows() if r["split"] in ax.CGD_TIERS]
+        lacking = [n for n in ax.CGD_READERS if any(i not in R.get("amounts", {}).get(n, {}) for i in ids)]
+        if lacking:
+            raise ValueError(f"the readers file has no amounts for {lacking} on every tier description")
+        self._need_model()
+        _drop_torchao()
+        repo = self._experiments_repo()
+        metas = repo.metas()
+        try:
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        eid = ax.CGD_TEST_ID
+        prev = metas.get(eid, {})
+        if prev.get("status") == "done" and not force:
+            print(f"[{self.TAG}] {eid} is done already (force=True reruns it)", flush=True)
+            return prev
+        base = f"experiments/{eid}"
+        recipe = self._cp_recipe()
+        recipe["group"] = ", ".join(f"{k.replace('_', ' ')} ({ax.CP_PAIRS[k][0]} / {ax.CP_PAIRS[k][1]})" for k in ax.CGD_PAIRS)
+        recipe["sliders"] = ("v(plain) + sum over the pairs of |a| (v(the tag of a's side) - v(plain)) on the conditional "
+                             "branch at every step, a = the reader's reading rounded to a quarter step and clipped to "
+                             "[-1.5, 1.5] (a pair at 0 left out); the negative branch and the guidance scale unchanged")
+        recipe["characters"] = (f"the updated characters (the fourth: {ax.BED2_FOURTH[0]} / {ax.BED2_FOURTH[1]}, its "
+                                f"pictures with \"{ax.AGE_GUARD}\" added to the negative prompt)")
+        recipe["readers"] = R.get("source", "readers.json")
+        meta = {"id": eid, "title": ax.CGD_TEST_TITLE, "date": ax.CGD_DATE, "kind": "group_readers", "status": "running",
+                "pairs": list(ax.CGD_PAIRS), "recipe": recipe}
+        repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                     f"{base}/README.md": ax.render_group_readers_readme(meta, recipe)}, f"{eid}: started (README)")
+        out_dir = Path(self._need("data_root")) / "experiments" / eid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "readers.json").write_text(json.dumps(R, indent=1), encoding="utf-8")
+        t0 = time.time()
+        try:
+            result = self._group_readers(R, out_dir)
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                                            f"{base}/README.md": ax.render_group_readers_readme(meta, recipe)},
+                                           f"{eid}: failed"))
+            raise
+        reads = result["reads"]
+        summary = "; ".join(f"{t} tier: " + ", ".join(f"{r} {v['OUTCOME'].lower()}" for r, v in reads[t]["readers"].items())
+                            for t in ax.CGD_TIERS)
+        meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
+                    seconds=round(time.time() - t0), finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
+        files = {f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_group_readers_readme(meta, recipe),
+                 f"{base}/result.json": out_dir / "result.json", f"{base}/readers.json": out_dir / "readers.json",
+                 f"{base}/tagger_probs.npz": out_dir / "tagger_probs.npz"}
+        for f in sorted(out_dir.glob("sheet_*.jpg")):
+            files[f"{base}/{f.name}"] = f
+        repo.commit(files, f"{eid}: result")
+        metas[eid] = meta
+        self._safe(lambda: self._publish_index(repo, metas))
+        print(f"[{self.TAG}] {eid} done in {_sr._hms(meta['seconds'])}", flush=True)
+        for t in ax.CGD_TIERS:
+            for r, v in reads[t]["readers"].items():
+                print(f"[{self.TAG}]   {t:8s} {r:18s} {v['OUTCOME']:16s} "
+                      + "  ".join(f"{k} " + "/".join(f"{v['pairs'][k]['sides'][m]['frac_pos' if m == '+' else 'frac_neg']:.2f}"
+                                                     for m in "+-") for k in ax.CGD_PAIRS)
+                      + f"  all three moved {v['whole_pictures']}/{v['of']}", flush=True)
+        return meta
+
+    def _group_readers(self, R: dict, out_dir: Path) -> dict:
+        import shutil
+
+        import numpy as np
+        from PIL import Image, ImageDraw
+        judged = list(ax.CP_DEFAULT)
+        probs_fn, index, names, counts = self._cp_judges(judged)        # both judges before any picture
+        self._judge()
+        defs = {k: ax.CP_PAIRS[k][:2] for k in judged}
+        amounts = {n: R["amounts"][n] for n in ax.CGD_READERS}
+        refs = ax.cgd_refs()
+        readers = ax.cgd_plans(amounts)
+        plans = {**ax.cgd_ref_plans(), **readers}
+        pulled = {n for n, items in plans.items() if self._cp_pull(n, items)}
+
+        def sig(it):                                                   # a picture's every input but its name
+            return json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True)
+
+        have: dict = {}
+
+        def register(n):
+            img = self._cp_root(n) / "images"
+            for it in plans[n]:
+                if (img / f"{it['name']}.png").is_file() and (img / f"{it['name']}.txt").is_file():
+                    have.setdefault(sig(it), img / f"{it['name']}.png")
+
+        def fill(n):
+            img = self._cp_root(n) / "images"
+            got = 0
+            for it in plans[n]:
+                src, dst = have.get(sig(it)), img / f"{it['name']}.png"
+                if src is not None and not dst.is_file():
+                    img.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(src, dst)
+                    (img / f"{it['name']}.txt").write_text(it["caption"], encoding="utf-8")
+                    got += 1
+            return got
+
+        for n in plans:
+            register(n)
+        todo = set()
+        for n, items in plans.items():
+            gaps = set(_ts.missing_images(self._cp_root(n), items))
+            todo |= {sig(it) for it in items if it["name"] in gaps and sig(it) not in have}
+        need = len(todo)
+        total = sum(len(items) for items in plans.values())
+        print(f"[{self.TAG}] e054: {len(plans)} sets ({len(readers)} reader sets of "
+              f"{ax.CGD_SPLITS['trained'] * len(ax.CGR_CORNERS)} descriptions, {len(plans) - len(readers)} reference "
+              f"sets) = {total} pictures; {len(pulled)} sets from the "
+              f"data repo; {need} distinct pictures to draw (the rest copied or already here; a picture draws up to "
+              f"{len(ax.CGD_PAIRS) + 2} passes a step)", flush=True)
+        eta = _sr._Eta(self.TAG, "e054 drawing", need) if need else None
+        res, copied = {}, {}
+        for n, items in plans.items():
+            got = fill(n) if n in readers else 0
+            gaps = len(_ts.missing_images(self._cp_root(n), items))
+            res[n] = self._cp_pass(n, items, eta, (probs_fn, index), defs)
+            copied[n] = got + gaps - res[n]["drawn"]               # copied before the pass, or a twin inside the set
+            register(n)
+            d = res[n]["drawn"]
+            res[n]["from"] = ("drawn" if d == len(items) else
+                              f"{d} drawn, {copied[n]} copied" if d or copied[n] else
+                              "data repo" if n in pulled else "this runtime")
+            print(f"[{self.TAG}] e054 {n} ({res[n]['from']}; highest age read {max(res[n]['age']):.2f})", flush=True)
+        self._assert_stock()
+        plain = res[refs["plain"]]["scores"]
+        corners = {lab: res[n]["scores"] for lab, n in refs.items() if lab != "plain"}
+        scores = {r: {t: res[ax.cgd_set_name(r, t)]["scores"] for t in ax.CGD_TIERS} for r in ax.CGD_READERS}
+        reads = ax.cgd_reads(scores, plain, corners, amounts)
+
+        def tile(n, i):
+            if i in res[n]["withheld"]:
+                im = Image.new("RGB", (256, 256), (128, 128, 128))
+                ImageDraw.Draw(im).text((88, 120), "withheld", fill=(255, 255, 255))
+                return im
+            return Image.open(self._cp_root(n) / "images" / f"{plans[n][i]['name']}.png").convert("RGB")
+
+        rows = ax.cgd_rows()
+        for t in ax.CGD_TIERS:
+            trows = [r for r in rows if r["split"] == t]
+            firsts = list(range(0, len(trows), ax.CGD_SPLITS[t]))      # the first description of each corner
+            grid = [[tile(refs["plain"], trows[j]["cell"]) for j in firsts],
+                    [tile(refs[ax.cgr_label(tuple(trows[j]["corner"]))], trows[j]["cell"]) for j in firsts]]
+            grid += [[tile(ax.cgd_set_name(r, t), j) for j in firsts] for r in ax.CGD_READERS]
+            _grid(grid, out_dir / f"sheet_{t}.jpg", tile=192)
+        np.savez_compressed(out_dir / "tagger_probs.npz", tags=np.array(names), **{n: res[n]["probs"] for n in readers})
+        drawn = sum(res[n]["drawn"] for n in plans)
+        return {"reads": reads, "reading": R.get("marks", {}), "picks": R.get("picks", {}),
+                "amounts": {r: {t: [ax.cgd_amounts(amounts[r][x["id"]]) for x in rows if x["split"] == t]
+                                for t in ax.CGD_TIERS} for r in ax.CGD_READERS},
+                "pictures": {"total": total, "drawn": drawn, "copied": sum(copied.values()),
+                             "reused": total - drawn - sum(copied.values())},
+                "sets": {n: {"from": res[n]["from"], "data_repo_folder": res[n]["kept"],
+                             "ratings": {r: res[n]["ratings"].count(r) for r in ax.CP_RATINGS},
+                             "max_age": float(max(res[n]["age"]))} for n in plans},
+                "withheld": {n: [plans[n][i]["name"] for i in r["withheld"]] for n, r in res.items() if r["withheld"]},
+                "cells": {n: {"names": [it["name"] for it in plans[n]],
+                              "scores": {b: res[n]["scores"][b] for b in judged}} for n in plans}}
 
     # ---- e013-e015: Beatrix as a second conditioning source (a learned push after the adapter) ----------------
     def run_beatrix_connectors(self, arms: "list[str] | None" = None, *, force: bool = False) -> dict:

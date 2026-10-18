@@ -3130,3 +3130,375 @@ def render_groups_readme(meta: dict, recipe: dict) -> str:
             "set).",
             "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
     return "\n".join(out)
+
+
+# ---- e054: readers on the group (one description read, the group's three sliders set at once) --------------------------
+CGD_TEST_ID = "e054_anima_group_readers"
+CGD_TEST_TITLE = ("The stock model: text readers read one description and set all three sliders of the group at once "
+                  "(Beatrix, the nano bodies; Qwen3 as the reference)")
+CGD_DATE = "2026-10-18"
+CGD_PAIRS = CGR_PAIRS                       # hair colour, expression, eye colour: e053's group
+CGD_BED = 2                                 # the updated characters
+CGD_FRAMING = "upper body"
+CGD_READ_FORM = CPG_READ_FORM               # a description is read in e052's frame, at its closing full stop
+CGD_PLAIN_FRAME = PREFIX + "1girl, solo, upper body."       # the frame with no wording (descriptive)
+CGD_SPLITS = {"train": 12, "trained": 4, "unseen": 4}       # descriptions per corner
+CGD_TIERS = ("trained", "unseen")           # trained: new combinations of training wordings; unseen: wordings never trained
+CGD_ORDERS = ((0, 1, 2), (1, 2, 0), (2, 0, 1), (0, 2, 1), (2, 1, 0), (1, 0, 2))   # the order the three wordings are written in
+CGD_SHARE_CAP = 2                           # of a side's 8 training wordings, at most this many share any one word
+CGD_SEED = 54
+CGD_READERS = ("qwen", "beatrix", "nano", "stack", "beatrix_untrained", "birth")   # the readers that get pictures
+CGD_CONTROLS = ("beatrix_untrained", "birth")
+CGD_FAR, CGD_PART = 0.75, 0.5               # how far a side moves, as a share of the group's move at amount 1
+CGD_PHRASES = {                             # 8 training wordings a side, spread over many words; 4 unseen a side
+    "hair_colour": {
+        "train+": tuple(w + _HAIR for w in ("blonde", "light blonde", "golden", "bright golden", "yellow", "pale yellow",
+                                            "platinum", "champagne")),
+        "train-": tuple(w + _HAIR for w in ("black", "jet black", "dark", "very dark", "raven", "ebony", "inky",
+                                            "charcoal")),
+        "unseen+": CPG_PHRASES["hair_colour"]["unseen+"],      # e052's unseen wordings, read again under this training
+        "unseen-": CPG_PHRASES["hair_colour"]["unseen-"]},
+    "expression": {
+        "train+": ("a smile", "a warm smile", "smiling", "smiling sweetly", "grinning", "a cheerful grin", "beaming",
+                   "laughing"),
+        "train-": ("a frown", "a deep frown", "frowning", "frowning angrily", "scowling", "a fierce scowl", "glaring",
+                   "glowering"),
+        "unseen+": CPG_PHRASES["expression"]["unseen+"],
+        "unseen-": CPG_PHRASES["expression"]["unseen-"]},
+    "eye_colour": {
+        "train+": ("red eyes", "blood-red eyes", "crimson eyes", "scarlet eyes", "ruby eyes", "garnet eyes",
+                   "vermilion eyes", "burgundy eyes"),
+        "train-": ("blue eyes", "sky-blue eyes", "azure eyes", "sapphire eyes", "navy eyes", "cerulean eyes",
+                   "cobalt eyes", "lapis eyes"),
+        "unseen+": ("carmine eyes", "cinnabar eyes", "claret eyes", "cherry eyes"),
+        "unseen-": ("cornflower eyes", "ultramarine eyes", "indigo eyes", "denim eyes")},
+}
+CGD_REFERENCES = CPG_REFERENCES
+
+
+def cgd_checks() -> dict:
+    """The wording rules fixed before any read: 'leaks' = unseen wordings sharing a word with any training wording of any
+    pair (none may); 'crowded' = (pair, side, word, count) for a word in more than CGD_SHARE_CAP of a side's training
+    wordings (none may), so no single word gives a side away."""
+    train_words: set = set()
+    for P in CGD_PHRASES.values():
+        for w in P["train+"] + P["train-"]:
+            train_words |= cpg_words(w)
+    leaks = [w for P in CGD_PHRASES.values() for w in P["unseen+"] + P["unseen-"] if cpg_words(w) & train_words]
+    crowded = []
+    for k, P in CGD_PHRASES.items():
+        for side in ("train+", "train-"):
+            counts: dict = {}
+            for w in P[side]:
+                for x in cpg_words(w):
+                    counts[x] = counts.get(x, 0) + 1
+            crowded += [(k, side, x, n) for x, n in sorted(counts.items()) if n > CGD_SHARE_CAP]
+    return {"leaks": leaks, "crowded": crowded}
+
+
+def _cgd_cycle(words, n: int, seed: int) -> list:
+    """n wordings as whole shuffled passes over `words` (each wording n / len(words) times when that divides)."""
+    import random
+    out: list = []
+    p = 0
+    while len(out) < n:
+        w = list(words)
+        random.Random(seed * 1000 + p).shuffle(w)
+        out += w
+        p += 1
+    return out[:n]
+
+
+def _cgd_split(split: str, seed: int) -> list[dict]:
+    n = CGD_SPLITS[split]
+    lists = "unseen" if split == "unseen" else "train"
+    pools = {}
+    for i, k in enumerate(CGD_PAIRS):
+        for s, m in ((1, "+"), (-1, "-")):
+            pools[(k, s)] = _cgd_cycle(CGD_PHRASES[k][lists + m], n * len(CGR_CORNERS) // 2, seed + 10 * i + (s > 0))
+    rows = []
+    for ci, c in enumerate(CGR_CORNERS):
+        for j in range(n):
+            words = [pools[(k, s)].pop(0) for k, s in zip(CGD_PAIRS, c)]
+            order = CGD_ORDERS[(ci * n + j) % len(CGD_ORDERS)]
+            text = ", ".join(words[i] for i in order)
+            cell = None if split == "train" else 2 * ((ci + 2 * j) % len(CHARACTERS_BED2)) + j % len(ATTR_SEEDS)
+            rows.append({"id": f"{split}{len(rows):02d}", "split": split, "corner": list(c), "words": words,
+                         "order": list(order), "text": text, "frame": CGD_READ_FORM.format(w=text), "cell": cell})
+    return rows
+
+
+def cgd_rows() -> list[dict]:
+    """Every description the readers read, in a fixed order: the training descriptions (12 a corner, every training wording
+    6 times, every writing order twice a corner), the trained tier (4 a corner: new combinations of the training
+    wordings), the unseen tier (4 a corner: the unseen wordings), then the descriptive rows (the frame with no wording; each
+    training side's first wording alone). Each row: {id, split, corner (+1 / -1 per pair), words (one per pair, in the
+    group's order), order (the order they are written in), text, frame, cell (a tier row's picture cell, an index into
+    attr_cells())}. The shuffle is the first from CGD_SEED at which no training description repeats, no tier description
+    repeats and no trained-tier combination is a training one."""
+    for attempt in range(1000):
+        seed = CGD_SEED + 1000 * attempt
+        train, trained, unseen = (_cgd_split(s, seed + 100 * i) for i, s in enumerate(("train", "trained", "unseen")))
+        tr, tt, tu = ([tuple(r["words"]) for r in x] for x in (train, trained, unseen))
+        if len(set(tr)) == len(tr) and len(set(tt)) == len(tt) and len(set(tu)) == len(tu) and not set(tt) & set(tr):
+            break
+    else:  # pragma: no cover - the search succeeds within the first few seeds
+        raise RuntimeError("no shuffle met the rules")
+    desc = [{"id": "desc00", "split": "descriptive", "corner": None, "words": None, "order": None, "text": "",
+             "frame": CGD_PLAIN_FRAME, "cell": None}]
+    for k in CGD_PAIRS:
+        for s, m in ((1, "+"), (-1, "-")):
+            w = CGD_PHRASES[k]["train" + m][0]
+            desc.append({"id": f"desc{len(desc):02d}", "split": "descriptive", "corner": None, "words": None,
+                         "order": None, "single": [k, s], "text": w, "frame": CGD_READ_FORM.format(w=w), "cell": None})
+    return train + trained + unseen + desc
+
+
+def cgd_amounts(a) -> list[float]:
+    """A reader's three readings on the picture grid (e052's: quarter steps, clipped to the range the slider was measured
+    on)."""
+    return [cpg_grid(x) for x in a]
+
+
+def cgd_set_name(reader: str, tier: str, bed: int = CGD_BED) -> str:
+    """'cgd2_beatrix_unseen'."""
+    return f"cgd{'' if bed == 1 else bed}_{cp_slug(reader)}_{tier}"
+
+
+def cgd_items(tier: str, amounts: dict, bed: int = CGD_BED) -> list[dict]:
+    """One reader's pictures for one tier in the data repo's set format: per description of the tier, its cell's plain
+    prompt composed with one prompt per pair whose grid amount is not 0 (the tag of the amount's side at |amount|, in the
+    group's order); a description whose three grid amounts are 0 is the plain prompt itself, and one at amount 1 on every
+    pair is e053's slider group. Captioned with the plain prompt. amounts = {row id: [reading per pair]}."""
+    cells = attr_cells()
+    out = []
+    for r in cgd_rows():
+        if r["split"] != tier:
+            continue
+        ci, sd = cells[r["cell"]]
+        plain = cp_prompt(None, CGD_FRAMING, ci, bed)
+        it = {"name": f"{r['id']}_{ci:02d}_{sd}", "seed": sd, "caption": plain, "prompt": plain}
+        mix = [(cp_prompt(CP_PAIRS[k][0] if a > 0 else CP_PAIRS[k][1], CGD_FRAMING, ci, bed), abs(a))
+               for k, a in zip(CGD_PAIRS, cgd_amounts(amounts[r["id"]])) if a]
+        if mix:
+            it.update(mix_prompts=[m for m, _ in mix], mix_weights=[w for _, w in mix])
+        out.append(cp_guard(it, ci, bed))
+    return out
+
+
+def cgd_plans(amounts: dict, readers=None, bed: int = CGD_BED) -> dict:
+    """{set name: items} of the readers' sets in drawing order (per reader: the trained tier, then the unseen tier).
+    amounts = {reader: {row id: [reading per pair]}}."""
+    return {cgd_set_name(r, t, bed): cgd_items(t, amounts[r], bed) for r in (readers or CGD_READERS) for t in CGD_TIERS}
+
+
+def cgd_refs(bed: int = CGD_BED) -> dict:
+    """The sets the readers' pictures are read against: {'plain': the plain prompt's set, '<corner label>': e053's slider
+    group at that corner (every pair at amount 1)}."""
+    return {"plain": cp_set_name(None, CGD_FRAMING, bed), **{cgr_label(c): cgr_set_name(c, "sliders", bed)
+                                                             for c in CGR_CORNERS}}
+
+
+def cgd_ref_plans(bed: int = CGD_BED) -> dict:
+    refs = cgd_refs(bed)
+    return {refs["plain"]: cp_items(None, CGD_FRAMING, bed),
+            **{cgr_set_name(c, "sliders", bed): cgr_items(c, "sliders", bed) for c in CGR_CORNERS}}
+
+
+def cgd_read_marks(amounts: dict) -> dict:
+    """The reading marks (no pictures) of one reader. amounts = {row id: [reading per pair]}, a training row read left out.
+    'train': per pair the training descriptions read on their side (of 96) and the total (of 288): the picks' statistic,
+    blind to the tiers. Per tier and pair: per side the 16 readings under the words rule in the side's direction (READS
+    IT), the separation (the + side's mean reading minus the - side's); the pair READ when both sides are, the group when
+    all three are; the descriptions with every sign right (of 32); per other pair the reading cross-talk (the pair's mean
+    reading with the other pair at + minus at -, over the pair's separation; beyond CP_OVERLAP an overlap)."""
+    import numpy as np
+    rows = cgd_rows()
+    tr = [r for r in rows if r["split"] == "train"]
+    out: dict = {"train": {k: int(sum(1 for r in tr if np.sign(amounts[r["id"]][i]) == r["corner"][i]))
+                           for i, k in enumerate(CGD_PAIRS)}, "tiers": {}}
+    out["train"]["total"] = sum(out["train"][k] for k in CGD_PAIRS)
+    for tier in CGD_TIERS:
+        trows = [r for r in rows if r["split"] == tier]
+        A = np.array([amounts[r["id"]] for r in trows], dtype=float)
+        C = np.array([r["corner"] for r in trows], dtype=float)
+        pairs = {}
+        for i, k in enumerate(CGD_PAIRS):
+            sides = {m: flavor_outcome(list(A[C[:, i] == s, i]), s, label="READS IT") for s, m in ((1, "+"), (-1, "-"))}
+            sep = float(A[C[:, i] == 1, i].mean() - A[C[:, i] == -1, i].mean())
+            cross = {}
+            for j, o in enumerate(CGD_PAIRS):
+                if j != i:
+                    v = float(A[C[:, j] == 1, i].mean() - A[C[:, j] == -1, i].mean()) / sep if sep else 0.0
+                    cross[o] = {"of_separation": v, "OVERLAP": abs(v) > CP_OVERLAP}
+            pairs[k] = {"sides": sides, "separation": sep, "cross_talk": cross,
+                        "read": all(v["OUTCOME"] == "READS IT" for v in sides.values())}
+        n = sum(v["read"] for v in pairs.values())
+        whole = int(sum(all(np.sign(A[j, i]) == C[j, i] for i in range(len(CGD_PAIRS))) for j in range(len(trows))))
+        out["tiers"][tier] = {"pairs": pairs, "whole_descriptions": whole, "of": len(trows),
+                              "overlapping": [f"{o} on {k}" for k, v in pairs.items() for o, x in v["cross_talk"].items()
+                                              if x["OVERLAP"]],
+                              "OUTCOME": ("READS THE GROUP" if n == len(CGD_PAIRS) else
+                                          f"READS {n} OF {len(CGD_PAIRS)}" if n else "READS NONE")}
+    return out
+
+
+def cgd_reads(scores: dict, plain: dict, corners: dict, amounts: dict) -> dict:
+    """The picture marks fixed before the run. scores = {reader: {tier: {pair: [score per picture, in the tier's
+    description order]}}}; plain = {pair: [score per cell]} (the plain prompt's set); corners = {corner label: {pair:
+    [score per cell]}} (e053's slider group at amount 1); amounts = {reader: {row id: [reading per pair]}}. Per reader,
+    tier, pair and side: each description's picture against its cell's plain picture, the 16 of the side under the words
+    rule in the side's direction (CARRIES IT); the pair is carried when both sides are; the reader DRIVES THE GROUP when
+    all three are. Beside it: HOW FAR (the side's summed move over the summed move of the group at amount 1 on the same
+    cells: at least CGD_FAR most of the way, under CGD_PART little, else part of the way), the pictures with every pair
+    moved its way (of 32) and the grid amounts. The controls must drive no pair; a pair a control carries in a tier is
+    credited to no reader there."""
+    import numpy as np
+    rows = cgd_rows()
+    out: dict = {}
+    for tier in CGD_TIERS:
+        trows = [r for r in rows if r["split"] == tier]
+        per = {}
+        for reader, by_tier in scores.items():
+            S = by_tier[tier]
+            pairs, moved = {}, [True] * len(trows)
+            for i, k in enumerate(CGD_PAIRS):
+                d = [float(S[k][j]) - float(plain[k][r["cell"]]) for j, r in enumerate(trows)]
+                full = [float(corners[cgr_label(tuple(r["corner"]))][k][r["cell"]]) - float(plain[k][r["cell"]])
+                        for r in trows]
+                for j, r in enumerate(trows):
+                    moved[j] = moved[j] and d[j] * r["corner"][i] > 0
+                sides = {}
+                for s, m in ((1, "+"), (-1, "-")):
+                    idx = [j for j, r in enumerate(trows) if r["corner"][i] == s]
+                    res = flavor_outcome([d[j] for j in idx], s, label="CARRIES IT")
+                    den = sum(full[j] for j in idx)
+                    far = sum(d[j] for j in idx) / den if den else 0.0
+                    grid = [cgd_amounts(amounts[reader][trows[j]["id"]])[i] for j in idx]
+                    sides[m] = {**res, "how_far": far, "mean_amount": float(np.mean(grid)), "amounts": grid,
+                                "HOW_FAR": ("most of the way" if far >= CGD_FAR else "little" if far < CGD_PART
+                                            else "part of the way")}
+                pairs[k] = {"sides": sides, "carried": all(v["OUTCOME"] == "CARRIES IT" for v in sides.values())}
+            n = sum(v["carried"] for v in pairs.values())
+            per[reader] = {"pairs": pairs, "pairs_carried": [k for k in CGD_PAIRS if pairs[k]["carried"]],
+                           "whole_pictures": int(sum(moved)), "of": len(trows),
+                           "OUTCOME": ("DRIVES THE GROUP" if n == len(CGD_PAIRS) else
+                                       f"DRIVES {n} OF {len(CGD_PAIRS)}" if n else "DRIVES NONE")}
+        controls = {k: [r for r in CGD_CONTROLS if r in per and per[r]["pairs"][k]["carried"]] for k in CGD_PAIRS}
+        for reader, v in per.items():
+            v["credited"] = [] if reader in CGD_CONTROLS else [k for k in v["pairs_carried"] if not controls[k]]
+        out[tier] = {"readers": per, "controls_carrying": controls}
+    return out
+
+
+CGD_NAMES = {"qwen": "Qwen3 0.6B, final state (Anima's own text encoder: the reference)",
+             "beatrix": "Beatrix 3s, block 20",
+             "nano": "the best nano tap (one body, one version, one block; picked on the training descriptions)",
+             "stack": "the four nano bodies side by side (one version, one block; picked on the training descriptions)",
+             "beatrix_untrained": "Beatrix's architecture untrained (a control that must fail)",
+             "birth": "the picked nano body at birth, the same block (a control that must fail)"}
+
+
+def render_group_readers_readme(meta: dict, recipe: dict) -> str:
+    """e054's README: why, the design and the rule fixed before the run, and the result when done."""
+    res = meta.get("result") or {}
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    refs = "\n".join(f"- {t}: {u}" for t, u in CGD_REFERENCES)
+    rows = cgd_rows()
+    words = "\n".join(f"| {k.replace('_', ' ')} | {s} | {', '.join(CGD_PHRASES[k]['train' + s])} | "
+                      f"{', '.join(CGD_PHRASES[k]['unseen' + s])} |" for k in CGD_PAIRS for s in "+-")
+    ex = {t: next(r["text"] for r in rows if r["split"] == t) for t in ("train", "trained", "unseen")}
+    readers = "\n".join(f"| {r} | {n} |" for r, n in CGD_NAMES.items())
+    out = [f"# {CGD_TEST_ID}: {CGD_TEST_TITLE}", "",
+           f"Date: {CGD_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Why",
+           f"{CGR_TEST_ID} showed that three attribute sliders (hair colour, expression, eye colour) compose in one "
+           f"picture without pulling on each other, and {CPG_TEST_ID} let text readers set one slider at a time from a "
+           "single wording. A person describes a character in one go, so the question here is systemic: can a trained "
+           "text model read one description and set every slider of the group from that single reading, so that the "
+           "picture carries all three attributes as described? The readers are Beatrix (a byte-level language model) "
+           "and the nano bodies (small byte-level language models), with Qwen3 (Anima's own text encoder) as the "
+           "reference and untrained copies as the controls that must fail.", "",
+           "## Design",
+           "- **The group**: hair colour (blonde hair / black hair), expression (smile / frown), eye colour (red eyes / "
+           f"blue eyes), on the sliders of {CPS_TEST_ID} composed as in {CGR_TEST_ID}.",
+           "- **Descriptions**: one wording per pair, joined with commas in one of six orders, read in the frame "
+           f"`{CGD_READ_FORM}` (the reader's state at the closing full stop). Every side of every pair (8 corners). "
+           f"Training: {CGD_SPLITS['train']} a corner (each training wording 6 times), for example `{ex['train']}`. "
+           f"The trained tier: {CGD_SPLITS['trained']} a corner, new combinations of the training wordings (`"
+           f"{ex['trained']}`). The unseen tier: {CGD_SPLITS['unseen']} a corner, wordings that share no word with any "
+           f"training wording (`{ex['unseen']}`; the hair and expression ones are {CPG_TEST_ID}'s).", "",
+           "| pair | side | training wordings | unseen wordings |", "|---|---|---|---|", words, "",
+           f"- No word appears in more than {CGD_SHARE_CAP} of a side's 8 training wordings, so no single word gives a side "
+           f"away (the lesson of {CPG_TEST_ID}, whose training wordings mostly shared one word a side).",
+           "- **The reading** (one state per description for all three sliders): per pair, the ridge regression of the "
+           "side (+1 / -1) on the state, its features standardized over the 96 training descriptions (a regularized linear "
+           "discriminant: it discounts what varies with the other pairs' wordings and the word order); the strength per "
+           "reader chosen by how many training descriptions it reads on their side when each is left out; a training "
+           "description is read with itself left out. The training sides sit near -1 and +1. The amount on the picture is "
+           "the reading rounded to a quarter step and clipped to [-1.5, 1.5]. A first reading, the plain difference of the "
+           "two sides' means (the earlier single-wording form), read its own training descriptions near chance in this "
+           "design; its marks are kept in `readers.json`.",
+           "- **The pictures**: one per tier description, on its own cell (the 16 cells of the updated characters, two "
+           "descriptions of each tier a cell): v = v(plain) + sum over the pairs of |a| (v(the tag of a's side) - "
+           "v(plain)) on the conditional branch at every step; the negative branch and the guidance scale unchanged.",
+           "- **The readers**:", "", "| reader | what it is |", "|---|---|", readers, "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The judge",
+           f"The [WD EVA02-Large tagger v3](https://huggingface.co/{TAGGER}) on the pixels: a pair's score is the log-odds of "
+           "its + tag minus those of its - tag. Every picture is screened: rated questionable or explicit, or read as "
+           f"{', '.join(AGE_TAGS)} above {AGE_BAR}, it is withheld (off the sheets, its set out of the data repo).", "",
+           "## The rule (fixed before the run)",
+           "**CARRIES** (per reader, tier, pair and side): each description's picture against its cell's plain picture; "
+           "the 16 descriptions of the side carry it when the mean moves that way, at least 12 of the 16 move that way and "
+           "the mean is beyond 3 standard errors. A pair is carried when both sides are; a reader **DRIVES THE GROUP** "
+           "in a tier when all three pairs are carried. The controls must drive no pair; a pair a control carries in a "
+           "tier is credited to no reader there. Beside it: **HOW FAR** (a side's summed move over the move of the group "
+           f"at amount 1 on the same cells: at least {CGD_FAR} most of the way, under {CGD_PART} little), the pictures "
+           "with all three pairs moved their way, and the readings themselves (the same words rule on the 16 readings "
+           "of a side, the separation, and the cross-talk: one pair's side moving another pair's reading by more than "
+           f"{CP_OVERLAP:.2f} of that pair's separation).", ""]
+    if meta.get("status") == "done":
+        r = res.get("reads") or {}
+        out += ["## Result", meta.get("summary", ""), ""]
+        for tier in CGD_TIERS:
+            per = (r.get(tier) or {}).get("readers") or {}
+            if not per:
+                continue
+            out += [f"### The {tier} tier", "",
+                    "| reader | verdict | " + " | ".join(f"{k.replace('_', ' ')} + / -" for k in CGD_PAIRS)
+                    + " | all three moved | credited |",
+                    "|---|---|" + "---|" * len(CGD_PAIRS) + "---|---|"]
+            for name, v in per.items():
+                cells = []
+                for k in CGD_PAIRS:
+                    sd = v["pairs"][k]["sides"]
+                    cells.append(" / ".join(f"{sd[m]['OUTCOME'].lower()} ({sd[m]['how_far']:.2f})" for m in "+-"))
+                out.append(f"| {name} | **{v['OUTCOME']}** | " + " | ".join(cells)
+                           + f" | {v['whole_pictures']} of {v['of']} | {', '.join(v['credited']) or 'none'} |")
+            out += ["", "Each cell: the side's verdict and, in brackets, how far it moved as a share of the group at "
+                    "amount 1.", ""]
+        held = res.get("withheld") or {}
+        out += [("No picture was withheld." if not held else
+                 "Withheld (off the sheets, the set out of the data repo): "
+                 + "; ".join(f"{n}: {', '.join(v)}" for n, v in held.items()) + "."), ""]
+        pics = res.get("pictures") or {}
+        if pics:
+            out += [f"Pictures: {pics.get('total')} read, {pics.get('drawn')} drawn in this run, {pics.get('reused')} "
+                    "reused.", ""]
+        out += ["Sheets (`sheet_<tier>.jpg`): one column per corner (the first description of each corner, on its own "
+                "character at the first seed); rows: the plain prompt, the group at amount 1, then the readers in the "
+                "order of the table above.", ""]
+        out += [f"![{t}](sheet_{t}.jpg)" for t in CGD_TIERS] + [""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    else:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files",
+            "- `readers.json`: every description, every reader's readings and the reading marks (and the first reading's), "
+            "which tap each reader is, the strength chosen, every nano version's best block.",
+            "- `result.json`: every picture's score on every judged pair, the marks, where each set came from.",
+            "- `tagger_probs.npz`: every drawn picture's probability for each of the judge's tags (float16, one array per "
+            "set).",
+            "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
+    return "\n".join(out)
