@@ -2428,3 +2428,181 @@ def render_counterpoint_readme(meta: dict, recipe: dict) -> str:
             "rows in cell order; `tags` names the columns), so another tag can be read without the pictures.",
             "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
     return "\n".join(out)
+
+
+# ---- e051: the counterpoint sliders, stage R (a slider between a pair's tags by the model's own predictions) -----------
+CPS_TEST_ID = "e051_anima_counterpoint_sliders"
+CPS_TEST_TITLE = "The stock model: a slider between each pair's tags, by the model's own predictions (no reader yet)"
+CPS_DATE = "2026-10-18"
+CPS_PAIRS = ("hair_colour", "expression", "eye_openness", "body_size")   # e050's handles to the sliders + body size
+CPS_ONE_WAY = ("body_size",)        # e050: skinny did not move its judge, so this slider runs from the plain prompt to plump
+CPS_AMOUNTS = (-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5)
+CPS_PARITY_CELLS = 2                # the slider at +1 drawn on the first cells beside the tag's own pictures
+CPS_REFERENCES = ATTR_REFERENCES + (
+    ("Liu, Li, Du, Torralba, Tenenbaum, \"Compositional Visual Generation with Composable Diffusion Models\" (ECCV 2022)",
+     "https://arxiv.org/abs/2206.01714"),)
+
+
+def cps_pairs(keys=None) -> list[str]:
+    """A slider run's pairs (default CPS_PAIRS), checked against the counterpoint pairs."""
+    keys = cp_pairs(CPS_PAIRS if keys is None else keys)
+    return keys
+
+
+def cps_one_way(key: str) -> bool:
+    return key in CPS_ONE_WAY or CP_PAIRS[key][1] is None
+
+
+def cps_amounts(key: str) -> tuple:
+    """A pair's amounts: both ways, or from the plain prompt toward the + tag only."""
+    return tuple(a for a in CPS_AMOUNTS if a >= 0) if cps_one_way(key) else CPS_AMOUNTS
+
+
+def cps_side_tag(key: str, amount: float) -> "str | None":
+    plus, minus, _ = CP_PAIRS[key]
+    return None if amount == 0 else plus if amount > 0 else minus
+
+
+def cps_cached(key: str, amount: float) -> "str | None":
+    """The counterpoint set an amount of 0 or +-1 is (the plain prompt, the tag itself); None for one the slider draws."""
+    return cp_set_name(cps_side_tag(key, amount), CP_PAIRS[key][2]) if amount in (-1.0, 0.0, 1.0) else None
+
+
+def cps_set_name(key: str, amount: float) -> str:
+    """A drawn slider set's name: the side's tag, the framing and the amount (x0.5 half way to the tag, x1.5 past it)."""
+    return f"cps_{cp_slug(cps_side_tag(key, amount))}_{cp_slug(CP_PAIRS[key][2])}_x{abs(amount):g}"
+
+
+def cps_items(key: str, amount: float, cells=None) -> list[dict]:
+    """A slider set in the data repo's set format: per cell the plain prompt (also its caption), the side's tag prompt
+    and the amount: the conditional prediction moved from the plain prompt's toward the tag prompt's by it."""
+    tag, f = cps_side_tag(key, amount), CP_PAIRS[key][2]
+    return [{"name": f"{ci:02d}_{sd}", "seed": sd, "prompt": cp_prompt(None, f, ci), "caption": cp_prompt(None, f, ci),
+             "mix_prompt": cp_prompt(tag, f, ci), "mix_weight": abs(amount)}
+            for ci, sd in (attr_cells() if cells is None else cells)]
+
+
+def cps_sets(keys: list[str]) -> dict:
+    """{set name: (pair, amount)} the slider draws, in drawing order (0 and +-1 come from the counterpoint sets)."""
+    return {cps_set_name(k, a): (k, a) for k in keys for a in cps_amounts(k) if cps_cached(k, a) is None}
+
+
+def cps_reads(scores: dict, spans: dict, keys: list[str]) -> dict:
+    """The registered reads. scores = {pair: {amount: {judged pair: [score per cell]}}} over every amount of the pair
+    (0 and +-1 included); spans = {judged pair: its counterpoint span}. Per pair: THE DIAL (the per-cell slope of its own
+    score on the amount, under the words rule), THE MIDDLE per side (at half the amount the score lies between the plain
+    prompt's and the tag's in >= 75% of the cells: GRADED, else A SWITCH), PAST THE TAG per side (1.5 against 1;
+    descriptive), the slider's cross-talk (its mean slope on every judged pair's score over that pair's span, beside its
+    own; an overlap above a third of its own) and the verdict."""
+    import numpy as np
+    out: dict = {}
+    for a in keys:
+        am = sorted(scores[a])
+        own = {x: scores[a][x][a] for x in am}
+        dial = flavor_outcome(cell_slopes(own), 1, label="A DIAL")
+        middle, beyond = {}, {}
+        for side, mark in ((1, "+"), (-1, "-")):
+            if side * 1.0 not in own:
+                continue
+            lo, hi, half = (np.asarray(own[x], dtype=float) for x in (0.0, side * 1.0, side * 0.5))
+            between = float(np.mean((half - lo) * (hi - half) > 0))          # strictly inside: an end is a switch
+            span = float(np.mean(hi - lo))
+            middle[mark] = {"between": between, "share": float(np.mean(half - lo)) / span if span else 0.0,
+                            "OUTCOME": "GRADED" if between >= 0.75 else "A SWITCH"}
+            if side * 1.5 in own:
+                beyond[mark] = flavor_outcome(list(np.asarray(own[side * 1.5], dtype=float) - hi), side,
+                                              label="PAST THE TAG")
+        judged = list(scores[a][am[0]])
+        cross = {b: (float(np.mean(cell_slopes({x: scores[a][x][b] for x in am}))) / spans[b] if spans.get(b) else 0.0)
+                 for b in judged}
+        reach = cross.get(a, 0.0)
+        over = [b for b in judged if b != a and reach and abs(cross[b]) > CP_OVERLAP * abs(reach)]
+        graded = bool(middle) and all(m["OUTCOME"] == "GRADED" for m in middle.values())
+        verdict = ("NO DIAL" if dial["OUTCOME"] != "A DIAL" else "A SWITCH" if not graded
+                   else "A SLIDER WITH CROSS-TALK" if over else "A SLIDER")
+        out[a] = {"amounts": am, "means": {f"{x:+g}": float(np.mean(own[x])) for x in am}, "dial": dial,
+                  "middle": middle, "beyond": beyond, "cross_talk": cross, "reach": reach, "overlapping": over,
+                  "OUTCOME": verdict}
+    return out
+
+
+def render_slider_readme(meta: dict, recipe: dict) -> str:
+    """e051's README: why, the design and the rule fixed before the run, and the result when done."""
+    keys = meta.get("pairs") or list(CPS_PAIRS)
+    res = meta.get("result") or {}
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    rows = "\n".join(f"| {k} | {CP_PAIRS[k][0]} | {'(one way: the plain prompt)' if cps_one_way(k) else CP_PAIRS[k][1]} | "
+                     f"{CP_PAIRS[k][2]} | {', '.join(f'{x:+g}' for x in cps_amounts(k))} |" for k in keys)
+    n_sets = len(cps_sets(keys))
+    refs = "\n".join(f"- {t}: {u}" for t, u in CPS_REFERENCES)
+    out = [f"# {CPS_TEST_ID}: {CPS_TEST_TITLE}", "",
+           f"Date: {CPS_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Why",
+           f"{CP_TEST_ID} found booru tag pairs that move their own attribute in every picture. A slider needs more than two "
+           "ends: the amount has to set how far the picture goes. This experiment builds the slider from the model's own "
+           "predictions, before any text reader sets the amount: at every sampling step the prediction for the plain "
+           "prompt moves toward the prediction for the tag's prompt by the amount (1 is the tag's own picture, 0 the plain "
+           "prompt's, past 1 it goes further). Composing predictions this way is the idea of composable diffusion and "
+           "semantic guidance; here it is tested as a dial on one attribute at a time.", "",
+           "## Design",
+           "- **The slider**: v(amount) = v(plain) + |amount| (v(tag of the amount's side) - v(plain)), on the conditional "
+           "branch at every step; the negative prompt's branch and the guidance scale unchanged.",
+           f"- **Cells**: the 16 of {CP_TEST_ID} (eight adult-coded characters x seeds {', '.join(map(str, ATTR_SEEDS))}).",
+           "- **Pairs and amounts**:", "", "| pair | + tag | - tag | framing | amounts |", "|---|---|---|---|---|", rows, "",
+           f"- **Kept and reused**: the amounts 0 and +-1 are {CP_TEST_ID}'s own pictures, downloaded from the data repo (at "
+           "1 the slider is the tag's own prediction, so those pictures are not drawn again; the first "
+           f"{CPS_PARITY_CELLS} cells of each pair are drawn once at +1 through the slider to show it). The new amounts are "
+           f"{n_sets} sets x 16 = {16 * n_sets} pictures, each kept in the data repo as soon as it is drawn.", "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The judge",
+           f"The [WD EVA02-Large tagger v3](https://huggingface.co/{TAGGER}) on the pixels: a pair's score is the log-odds of "
+           "its + tag minus those of its - tag (the + tag alone for a one-way pair). Every judged pair's score is read on "
+           "every picture, so each slider's pull on the other attributes shows. Content kept: the CLIP ViT-L/14 cosine to the "
+           "plain prompt's picture of the same cell. The tagger's ratings screen every picture as in the counterpoint pairs.", "",
+           "## The rule (fixed before the run)",
+           "**THE DIAL**: per cell, the least-squares slope of the pair's own score on the amount; A DIAL when the mean slope "
+           "is positive, at least 75% of the cells slope that way and the mean is beyond 3 standard errors. **THE MIDDLE** "
+           "(per side): at half the amount the score lies between the plain prompt's and the tag's in at least 75% of the "
+           "cells: GRADED; else A SWITCH (the picture jumps between the ends). **PAST THE TAG** (per side, descriptive): 1.5 "
+           "against 1 under the words rule. **CROSS-TALK**: the slider's mean slope on every other judged pair's score over "
+           "that pair's span, beside its own; an overlap when above a third of its own. Verdict: **A SLIDER** (a dial, graded "
+           "on every side, no overlap), **A SLIDER WITH CROSS-TALK**, **A SWITCH** (a dial, not graded), **NO DIAL**. The "
+           "pairs that are sliders go on to the readers' stage (a text reader setting the amount).", ""]
+    if meta.get("status") == "done":
+        r = res["pairs"]
+        out += ["## Result", meta.get("summary", ""), "",
+                "| pair | mean score by amount | slope (dial) | middle (+ / -) | past the tag (+ / -) | worst cross-talk | verdict |",
+                "|---|---|---|---|---|---|---|"]
+        for k, v in r.items():
+            means = ", ".join(f"{x} {m:+.1f}" for x, m in v["means"].items())
+            mid = " / ".join(f"{s} {m['between']:.0%} ({m['OUTCOME'].lower()})" for s, m in v["middle"].items())
+            past = " / ".join(f"{s} {b['mean']:+.2f} ({b['OUTCOME'].lower()})" for s, b in v["beyond"].items())
+            others = [(abs(c) / abs(v["reach"]) if v["reach"] else 0.0, b) for b, c in v["cross_talk"].items() if b != k]
+            worst = max(others) if others else (0.0, "")
+            out.append(f"| {k} | {means} | {v['dial']['mean']:+.2f} +- {v['dial']['se']:.2f} ({v['dial']['OUTCOME']}) | "
+                       f"{mid} | {past} | {worst[0]:.2f} of its own ({worst[1]}) | **{v['OUTCOME']}** |")
+        par = res.get("parity") or {}
+        if par:
+            out += ["", "The slider at +1 against the tag's own pictures (first cells, drawn through the slider): "
+                        + "; ".join(f"{k}: mean pixel difference {p['pixel_diff']:.2f} of 255, score difference "
+                                    f"{p['score_diff']:+.2f}" for k, p in par.items()) + "."]
+        held = res.get("withheld") or {}
+        out += ["", ("The judge rated no picture questionable or explicit." if not held else
+                     "Withheld (rated questionable or explicit; off the sheets, the set out of the data repo): "
+                     + "; ".join(f"{n}: {', '.join(v)}" for n, v in held.items()) + ".")]
+        pics = res.get("pictures") or {}
+        if pics:
+            out += ["", f"Pictures: {pics.get('total')} read, {pics.get('drawn')} drawn in this run, {pics.get('reused')} "
+                        "reused from the data repo or this runtime."]
+        out += ["", "Sheets (`sheet_<pair>.jpg`): the eight characters at the first seed; columns: the amounts in order.", ""]
+        out += [f"![{k}](sheet_{k}.jpg)" for k in r] + [""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    else:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files",
+            "- `result.json`: every cell's scores at every amount on every judged pair, the reads, the parity read, where "
+            "each set came from and where it is kept.",
+            "- `tagger_probs.npz`: every drawn picture's probability for each of the judge's tags (float16, one array per set).",
+            "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
+    return "\n".join(out)

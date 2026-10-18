@@ -131,3 +131,9 @@ the runner's release tag, then `setup()` → `run_counterpoint_words()`.
   training-set format of `training_sets.py`, captioned with the plain prompt) and comes back instead of being drawn
   again. The tagger's ratings screen every picture: a set with a picture rated questionable or explicit stays local and
   off the sheets.
+- **Step 4, the sliders (e051, `run_counterpoint_sliders`):** for the pairs that passed (hair colour, expression, eye
+  openness; body size one way toward plump) a slider from the model's own predictions, v(plain) + amount (v(tag) -
+  v(plain)) at every sampling step (`AnimaPipe.generate(mix_prompts=, mix_weights=)`); amounts -1.5 to +1.5, the
+  amounts 0 and +-1 being step 3's own pictures from the data repo, so only 224 new pictures are drawn (kept as
+  `sets/cps_*`). Read: the slope as a dial, the half amount between the ends (graded) or not (a switch), past the tag,
+  and the pull on the other attributes. The launch point is v0.3.0.

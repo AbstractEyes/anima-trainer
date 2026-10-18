@@ -527,7 +527,7 @@ def test_connector_registry_and_rules():
     assert ax.HUB_READ_ID in ax.HUB_READ
     for rid in (ax.HUB_READ_ID, ax.TRIANGULATION_ID, ax.ARM_READ_ID,    # e038 / e045 likewise: the reads' folders (triangulate)
                 ax.NANO_READ_ID, ax.NANO_RELAY_ID, ax.NANO_COMPARATOR_ID,   # e046-e049: the nano battery's folders
-                ax.NANO_RELAY_TRAINED_ID, ax.CP_TEST_ID):   # e050: the counterpoint pairs
+                ax.NANO_RELAY_TRAINED_ID, ax.CP_TEST_ID, ax.CPS_TEST_ID):   # e050-e051: the counterpoint pairs
         assert {i for i in ids_here if i[:4] == rid[:4]} == {rid}
     assert all(a.features is None and not a.reading and not a.date for a in ax.CONNECTOR_ARMS[:10])
     assert {a.date for a in hub} == {"2026-10-07"}
@@ -1859,3 +1859,125 @@ def test_counterpoint_words_end_to_end(runner, fake_hub, tmp_path, monkeypatch, 
     assert meta["result"]["pictures"] == {"total": 192, "drawn": 16, "reused": 176}
     assert meta["result"]["sets"]["cp_blonde-hair_upper-body"]["from"] == "data repo"
     assert len(fake_hub.commits) == 11
+
+
+# ---- e051: the counterpoint sliders ---------------------------------------------------------------------------
+def test_slider_sets_are_the_registered_design():
+    keys = ax.cps_pairs()
+    assert keys == ["hair_colour", "expression", "eye_openness", "body_size"]
+    assert ax.cps_amounts("hair_colour") == (-1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5)
+    assert ax.cps_amounts("body_size") == (0.0, 0.5, 1.0, 1.5) and ax.cps_amounts("age") == (0.0, 0.5, 1.0, 1.5)
+    sets = ax.cps_sets(keys)
+    assert len(sets) == 14 and sets["cps_black-hair_upper-body_x1.5"] == ("hair_colour", -1.5)
+    assert sets["cps_plump_full-body_x0.5"] == ("body_size", 0.5) and not any("skinny" in n for n in sets)
+    assert [ax.cps_cached("hair_colour", a) for a in (-1.0, 0.0, 1.0)] == [
+        "cp_black-hair_upper-body", "cp_plain_upper-body", "cp_blonde-hair_upper-body"]
+    assert ax.cps_cached("hair_colour", 0.5) is None
+    it = ax.cps_items("eye_openness", -0.5)[0]
+    assert it["prompt"] == it["caption"] == ax.cp_prompt(None, "upper body", 0) and it["mix_weight"] == 0.5
+    assert it["mix_prompt"] == ax.cp_prompt("half-closed eyes", "upper body", 0)
+    readme = ax.render_slider_readme({"status": "running", "pairs": keys}, {"model": "Anima"})
+    assert "fixed before the run" in readme and "2206.01714" in readme and "14 sets x 16 = 224 pictures" in readme
+    for word in ("S-1", "Phil", "docket", "canon/"):
+        assert word not in readme
+
+
+def test_slider_reads_dial_middle_and_cross_talk():
+    keys = ["hair_colour", "expression", "body_size"]
+    judged = keys + ["eye_colour"]
+    noise = [0.1 * (i % 5) for i in range(16)]
+
+    def at(key, a):                                   # the own score at amount a: graded, a switch, one way
+        if key == "expression":
+            return 0.0 if abs(a) < 0.75 else 4.0 * (1 if a > 0 else -1)
+        return 4.0 * a
+
+    scores = {k: {a: {b: [(at(k, a) if b == k else (1.5 * a if (k, b) == ("hair_colour", "eye_colour") else 0.0))
+                          + noise[i] for i in range(16)] for b in judged} for a in ax.cps_amounts(k)} for k in keys}
+    spans = {"hair_colour": 8.0, "expression": 8.0, "body_size": 4.0, "eye_colour": 8.0}
+    r = ax.cps_reads(scores, spans, keys)
+    assert {k: v["OUTCOME"] for k, v in r.items()} == {
+        "hair_colour": "A SLIDER WITH CROSS-TALK", "expression": "A SWITCH", "body_size": "A SLIDER"}
+    assert r["hair_colour"]["middle"]["+"]["share"] == pytest.approx(0.5) and r["hair_colour"]["middle"]["-"]["between"] == 1.0
+    assert r["expression"]["middle"]["+"]["between"] == 0.0 and r["expression"]["dial"]["OUTCOME"] == "A DIAL"
+    assert r["hair_colour"]["overlapping"] == ["eye_colour"] and r["hair_colour"]["reach"] == pytest.approx(0.5)
+    assert list(r["body_size"]["middle"]) == ["+"] and r["body_size"]["beyond"]["+"]["OUTCOME"] == "PAST THE TAG"
+
+
+def test_counterpoint_sliders_end_to_end(runner, fake_hub, tmp_path, monkeypatch, capsys):
+    """A fake renderer writes the tag, the slider's amount, the seed and the character into the pixels; a fake tagger
+    reads them back: hair colour and body size grade with the amount, expression jumps at the half way mark, the wide
+    eyes pull the expression score down. The counterpoint run first fills the data repo; the slider run reuses its
+    pictures, draws only its own amounts and keeps them; a fresh runtime draws nothing but the parity check."""
+    from PIL import Image
+    s, repo, pipe, calls = runner
+    s.cfg.data_repo_id = "AbstractPhil/geolip-beatrix-anima-data"
+    tags = ax.cp_judge_tags(list(ax.CP_DEFAULT))
+    cp_tags = [t for k in ax.CP_PAIRS for t in ax.CP_PAIRS[k][:2] if t]
+    index = {t: i for i, t in enumerate(tags)}
+    drawn = []
+
+    def tag_of(p):
+        part = p.split(", ")[6]
+        return part if part in cp_tags else None
+
+    def render(prompts, seeds, mix_prompts=None, mix_weights=None, **kw):
+        out = []
+        for j, (p, sd) in enumerate(zip(prompts, seeds)):
+            tag, w = (tag_of(mix_prompts[j]), float(mix_weights[j])) if mix_prompts else (tag_of(p), 1.0)
+            ci = next(i for i, (o, _) in enumerate(ax.CHARACTERS) if o in p)
+            im = Image.new("RGB", (8, 8), (cp_tags.index(tag) + 1 if tag else 0, sd, ci))
+            im.putpixel((1, 0), (int(round(100 * w)) if tag else 0, 0, 0))
+            out.append(im)
+            drawn.append(p)
+        return out
+
+    def probs(imgs):
+        rows = []
+        for im in imgs:
+            tid, sd, ci = im.getpixel((0, 0))
+            w = im.getpixel((1, 0))[0] / 100
+            v = np.full(len(tags), 0.5)
+            v[[index[r] for r in ax.CP_RATINGS]] = (0.9, 0.05, 0.05, 0.05)
+            tag = cp_tags[tid - 1] if tid else None
+            if tag:
+                pair = next(k for k in ax.CP_DEFAULT if tag in ax.CP_PAIRS[k][:2])
+                other = [t for t in ax.CP_PAIRS[pair][:2] if t != tag][0]
+                z = (1.0 if w >= 0.75 else 0.0) if pair == "expression" else w
+                v[index[tag]], v[index[other]] = 1 / (1 + np.exp(-3 * z)), 1 / (1 + np.exp(3 * z))
+                if tag == "wide-eyed":
+                    v[index["frown"]] = 1 / (1 + np.exp(-6 * w))
+            rows.append(v)
+        return np.array(rows)
+
+    monkeypatch.setattr(s, "_render", render)
+    monkeypatch.setattr(s, "_cp_judges", lambda k: (probs, index, list(tags), {t.replace(" ", "_"): 1000 for t in tags}))
+    monkeypatch.setattr(s, "_judge", lambda: None)
+    s.run_counterpoint_words()
+    assert len(drawn) == 192 and len(fake_hub.commits) == 12
+    meta = s.run_counterpoint_sliders()
+    r = meta["result"]
+    assert meta["status"] == "done" and meta["kind"] == "counterpoint_sliders"
+    assert len(drawn) == 192 + 224 + 8 and len(fake_hub.commits) == 12 + 14
+    assert r["pictures"] == {"total": 416, "drawn": 224, "reused": 192, "parity": 8}
+    assert {k: v["OUTCOME"] for k, v in r["pairs"].items()} == {
+        "hair_colour": "A SLIDER", "expression": "A SWITCH", "eye_openness": "A SLIDER WITH CROSS-TALK",
+        "body_size": "A SLIDER"}
+    assert r["pairs"]["eye_openness"]["overlapping"] == ["expression"]
+    assert all(p["pixel_diff"] == 0.0 and p["score_diff"] == 0.0 for p in r["parity"].values())
+    assert r["pairs"]["body_size"]["amounts"] == [0.0, 0.5, 1.0, 1.5]
+    assert r["sets"]["cps_plump_full-body_x0.5"]["from"] == "drawn" and r["sets"]["cp_plain_upper-body"]["from"] == "this runtime"
+    base = f"experiments/{ax.CPS_TEST_ID}"
+    for f in ["meta.json", "README.md", "result.json", "tagger_probs.npz"] + [f"sheet_{k}.jpg" for k in ax.CPS_PAIRS]:
+        assert f"{base}/{f}" in repo.files_
+    readme = repo.files_[f"{base}/README.md"].decode()
+    assert "**A SLIDER**" in readme and "**A SWITCH**" in readme and "mean pixel difference 0.00" in readme
+    assert len(json.loads(repo.files_[f"{base}/result.json"])["cells"]) == 16
+    assert s.run_counterpoint_sliders()["status"] == "done" and len(drawn) == 424    # done already: skipped
+
+    s.state["data_root"] = str(tmp_path / "data3")                  # a fresh runtime: everything from the data repo
+    capsys.readouterr()
+    meta = s.run_counterpoint_sliders(force=True)
+    out = capsys.readouterr().out
+    assert "416 already drawn (26 sets from AbstractPhil/geolip-beatrix-anima-data), 0 to draw" in out
+    assert len(drawn) == 424 + 8 and meta["result"]["pictures"]["drawn"] == 0 and len(fake_hub.commits) == 26

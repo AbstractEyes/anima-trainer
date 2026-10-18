@@ -208,7 +208,8 @@ cache → two-phase train):
   [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_counterpoint.ipynb)
   — e050 on **Anima**: booru counterpoint pairs (hair colour, eye colour, body size, expression, eye
   openness; more on request) drawn on the stock model and judged by an anime tagger: does each tag move its
-  own attribute, and what else does it move? Every drawn set is kept in
+  own attribute, and what else does it move? Then e051: a slider between each pair's tags from the model's
+  own predictions. Every drawn set is kept in
   [AbstractPhil/geolip-beatrix-anima-data](https://huggingface.co/datasets/AbstractPhil/geolip-beatrix-anima-data)
   and reused instead of drawn again.
 
