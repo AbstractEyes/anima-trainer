@@ -108,3 +108,26 @@ step prints the job's size, then done / total, time spent and time left.
   uploaded once drawn, downloaded by a fresh runtime when drawn with the same settings (`training_sets.py`).
 
 Anima's weights are under the CircleStone Labs Non-Commercial License; LoRAs trained on it share it.
+
+## `anima_colab_counterpoint.ipynb`
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_counterpoint.ipynb)
+
+**e050, booru counterpoint pairs on Anima** (`AnimaRunner.run_counterpoint_words`), uploaded into
+`experiments/e050_anima_counterpoint_words` of
+[AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). The bootstrap checks out
+the runner's release tag, then `setup()` → `run_counterpoint_words()`.
+
+- **The question:** Anima learned from Danbooru-tagged pictures, so its tags are its handles. A counterpoint pair is two
+  tags from one slot (two hair colours, two eye colours, two body sizes). Does each tag move its own attribute against
+  the plain prompt, and does a pair's words move the other pairs' attributes?
+- **Default pairs:** hair colour (blonde / black hair), eye colour (red / blue eyes), body size (plump / skinny, full
+  body), expression (smile / frown), eye openness (wide-eyed / half-closed eyes); `anima_experiments.CP_PAIRS` holds more
+  (hair length, eye shape, figure scale, second colour pairs, monochrome, mature female, chibi).
+- **Design:** e012's eight adult-coded characters x seeds 11, 22; the plain prompt at each framing in use, each + tag,
+  each - tag: 12 sets x 16 = 192 pictures for the defaults. Judge: the WD EVA02-Large tagger v3 (log-odds of the + tag
+  minus the - tag); content kept by CLIP ViT-L/14; the rule as e012's words rule, plus the overlap rule (a pair's words
+  moving another pair's score by more than a third of that pair's span).
+- **Kept and reused:** every set uploads to the data repo as soon as it is drawn (`sets/cp_<tag>_<framing>-<key>/`, the
+  training-set format of `training_sets.py`, captioned with the plain prompt) and comes back instead of being drawn
+  again. The tagger's ratings screen every picture: a set with a picture rated questionable or explicit stays local and
+  off the sheets.

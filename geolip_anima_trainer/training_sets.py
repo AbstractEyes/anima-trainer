@@ -161,6 +161,10 @@ def upload_local_sets(runner, repo_id: str = DATA_REPO, *, token: "str | None" =
         print(f"[sets] no training sets under {base}", flush=True)
     out: dict = {}
     for d in sets:
+        if (d / "withheld.json").is_file():           # the content screen kept it off the public repo (anima_runner e050)
+            print(f"[sets] {d.name}: withheld by the content screen; not uploaded", flush=True)
+            out[d.name] = "withheld"
+            continue
         items = read_items(d)
         gaps = missing_images(d, items)
         if gaps:

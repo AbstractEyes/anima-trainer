@@ -69,8 +69,11 @@ def ensure_repo(repo: str | None = None, *, url: str = REPO_URL, pull: bool = Tr
     repo = repo or repo_root()
     if not os.path.isfile(f"{repo}/pyproject.toml"):
         _sh(f'git clone "{url}" "{repo}"')
-    elif pull:
+    elif pull and subprocess.run(["git", "-C", repo, "symbolic-ref", "-q", "HEAD"],
+                                 capture_output=True).returncode == 0:
         _sh(f'cd "{repo}" && git pull --ff-only', check=False)  # stay on the latest logic; never fatal
+    elif pull:
+        print(f"[anima_colab] {repo} is checked out at a fixed release (no branch): not pulled", flush=True)
     dp = dp_dir(repo, dp_url)
     if not os.path.isfile(f"{dp}/train.py"):
         _sh(f'git clone --recurse-submodules "{dp_url}" "{dp}"')

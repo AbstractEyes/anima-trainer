@@ -13,6 +13,7 @@ handful of `a.<step>()` calls and all logic lives here.
     a.run_word_split()         # e026: single words, whole T5 tokens against shattered ones
     a.run_slot_pair()          # e027: a word-sized push at one word's position: its query side, its source side, both
     a.run_attribute_screen()   # e012: attribute words, attribute sliders after the adapter, their cross-talk
+    a.run_counterpoint_words() # e050: booru counterpoint pairs (the tags, their cross-talk); sets kept in the data repo
     a.run_sequence()           # e002..: the LoRA arms (anima_experiments.SEQUENCE)
     a.run_beatrix_connectors() # e013-e025: a push from Beatrix's phrase features (+ an untrained trunk, a free vector)
 
@@ -1897,6 +1898,254 @@ class AnimaRunner(_sr.SanaRunner):
                 "cells": [{"character": ax.CHARACTERS[ci][0], "seed": sd,
                            **{k: {a: judge[k][a][n] for a in judge[k]} for k in judge}}
                           for n, (ci, sd) in enumerate(cells)]}
+
+
+    # ---- e050: booru counterpoint pairs (every set kept in the data repo) ---------------------------------------
+    def run_counterpoint_words(self, pairs: "list[str] | None" = None, *, force: bool = False) -> dict:
+        """e050 into its own folder of cfg.repo_id: booru counterpoint pairs on the stock model, each tag against the
+        plain prompt and each pair's tags on every other pair's score, judged by an anime image tagger. Every set is kept
+        in cfg.data_repo_id once drawn, and a later run downloads it instead of drawing it again. pairs: keys of
+        ax.CP_PAIRS (default ax.CP_DEFAULT). Skipped when the repo lists it as done for the same pairs (force=True reruns
+        the reads; the sets come back from the data repo)."""
+        keys = ax.cp_pairs(pairs)
+        self._need_model()
+        _drop_torchao()
+        repo = self._experiments_repo()
+        metas = repo.metas()
+        try:
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        eid = ax.CP_TEST_ID
+        prev = metas.get(eid, {})
+        if prev.get("status") == "done" and prev.get("pairs") == keys and not force:
+            print(f"[{self.TAG}] {eid} is done already for these pairs (force=True reruns it)", flush=True)
+            return prev
+        base = f"experiments/{eid}"
+        recipe = self._cp_recipe()
+        meta = {"id": eid, "title": ax.CP_TEST_TITLE, "date": ax.CP_DATE, "kind": "counterpoint_words",
+                "status": "running", "pairs": keys, "recipe": recipe}
+        repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                     f"{base}/README.md": ax.render_counterpoint_readme(meta, recipe)}, f"{eid}: started (README)")
+        out_dir = Path(self._need("data_root")) / "experiments" / eid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        try:
+            result = self._counterpoint_words(keys, out_dir)
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                                            f"{base}/README.md": ax.render_counterpoint_readme(meta, recipe)},
+                                           f"{eid}: failed"))
+            raise
+        summary = "; ".join(f"{a} {v['OUTCOME']}" + (" (to the sliders)" if v["to_sliders"] else "")
+                            for a, v in result["pairs"].items())
+        meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
+                    seconds=round(time.time() - t0),
+                    finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
+        files = {f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_counterpoint_readme(meta, recipe),
+                 f"{base}/result.json": out_dir / "result.json", f"{base}/tagger_probs.npz": out_dir / "tagger_probs.npz"}
+        for f in sorted(out_dir.glob("sheet_*.jpg")):
+            files[f"{base}/{f.name}"] = f
+        repo.commit(files, f"{eid}: result")
+        metas[eid] = meta
+        self._safe(lambda: self._publish_index(repo, metas))
+        print(f"[{self.TAG}] {eid} done in {_sr._hms(meta['seconds'])}", flush=True)
+        for a, v in result["pairs"].items():
+            dn = v.get("words_down")
+            print(f"[{self.TAG}]   {a:14s} + {v['words_up']['mean']:+6.2f} ({v['words_up']['OUTCOME']})"
+                  + (f" | - {dn['mean']:+6.2f} ({dn['OUTCOME']})" if dn else "")
+                  + f" | {v['OUTCOME']}" + (" -> to the sliders" if v["to_sliders"] else "")
+                  + (f" | overlaps {', '.join(v['overlapping'])}" if v["overlapping"] else ""), flush=True)
+        return meta
+
+    def _cp_recipe(self) -> dict:
+        r = {k: v for k, v in self._attr_recipe().items() if k != "slider site"}
+        r["prompts"] = ("the model card's quality prefix + 1girl, solo, <tag>, <framing>, <outfit>, <setting>; the card's "
+                        "negative prompt")
+        r["batch"] = f"{self.cfg.gen_batch} pictures per batch (part of each set's key in the data repo)"
+        r["judge"] = ("WD EVA02-Large tagger v3 (log-odds; its ratings screen the sheets and the data repo); content kept "
+                      "by CLIP ViT-L/14")
+        repo = getattr(self.cfg, "data_repo_id", None)
+        r["sets kept in"] = (f"https://huggingface.co/datasets/{repo} (sets/cp_*)" if repo else
+                             "this runtime only (no data repo set)")
+        return r
+
+    def _cp_root(self, name: str) -> Path:
+        return Path(self._need("data_root")) / "datasets" / name
+
+    def _cp_pull(self, name: str, items: list[dict]) -> bool:
+        """A set this runtime lacks, downloaded from cfg.data_repo_id when one was drawn with exactly these settings and
+        items (anything else, or any failure, falls back to drawing it)."""
+        repo = getattr(self.cfg, "data_repo_id", None)
+        root = self._cp_root(name)
+        if not repo or not _ts.missing_images(root, items):
+            return False
+        try:
+            return _ts.download_set(self.state.get("hf_token"), repo, root, _ts.render_spec_of(self), items)
+        except Exception as e:  # noqa: BLE001
+            print(f"[{self.TAG}] set {name}: download failed ({type(e).__name__}: {str(e)[:120]}); drawing it", flush=True)
+            return False
+
+    def _cp_draw(self, name: str, items: list[dict], eta: "_sr._Eta | None") -> int:
+        """The set's missing pictures drawn into datasets/<name>/images in gen_batch chunks, with items.jsonl and
+        sheet.jpg beside the images (the data repo's set format). Returns how many were drawn."""
+        root = self._cp_root(name)
+        img_dir = root / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+        (root / "items.jsonl").write_text("".join(json.dumps(it) + "\n" for it in items), encoding="utf-8")
+        gaps = set(_ts.missing_images(root, items))
+        todo = [it for it in items if it["name"] in gaps]
+        if todo:
+            self._assert_stock()
+            for i in range(0, len(todo), self.cfg.gen_batch):
+                chunk = todo[i:i + self.cfg.gen_batch]
+                for it, img in zip(chunk, self._render([c["prompt"] for c in chunk], [c["seed"] for c in chunk])):
+                    img.save(img_dir / f"{it['name']}.png")
+                    (img_dir / f"{it['name']}.txt").write_text(it["caption"], encoding="utf-8")
+                if eta is not None:
+                    eta.add(len(chunk))
+        if todo or not (root / "sheet.jpg").is_file():
+            from PIL import Image
+            ims = [Image.open(img_dir / f"{it['name']}.png") for it in items]
+            _grid([ims[r:r + 8] for r in range(0, len(ims), 8)], root / "sheet.jpg", tile=192)
+        return len(todo)
+
+    def _cp_push(self, name: str, items: list[dict]) -> "str | None":
+        """A complete set the data repo lacks, uploaded for later runs (a failure only warns). Returns its folder there."""
+        repo = getattr(self.cfg, "data_repo_id", None)
+        root = self._cp_root(name)
+        if not repo or _ts.missing_images(root, items):
+            return None
+        render = _ts.render_spec_of(self)
+        try:
+            folder = _ts.upload_set(self.state.get("hf_token"), repo, root, render, items)
+        except Exception as e:  # noqa: BLE001
+            print(f"[{self.TAG}] set {name}: upload failed ({type(e).__name__}: {str(e)[:120]}); it stays on this "
+                  "runtime only (a.save_training_sets() retries)", flush=True)
+            return None
+        if folder:
+            print(f"[{self.TAG}] set {name}: saved to {repo}", flush=True)
+        return _ts.hub_folder(name, render, items)
+
+    def _cp_judges(self, keys: list[str]):
+        """The tagger for e050: (probabilities fn [n pictures, every tag], {tag: column}, every tag's name, every tag's
+        Danbooru post count), loaded once per tag list."""
+        import csv
+
+        from huggingface_hub import hf_hub_download
+        tags = tuple(ax.cp_judge_tags(keys))
+        if getattr(self, "_cp_tagger_fns", (None,))[0] != tags:
+            print(f"[{self.TAG}] loading the tagger judge ({ax.TAGGER}; a 1.3 GB download the first time)...", flush=True)
+            probs, index = _wd_tagger(ax.TAGGER, list(tags))
+            with open(hf_hub_download(ax.TAGGER, "selected_tags.csv"), encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            self._cp_tagger_fns = (tags, probs, index, [r["name"] for r in rows],
+                                   {r["name"]: int(r["count"]) for r in rows})
+        return self._cp_tagger_fns[1:]
+
+    @staticmethod
+    def _cp_scores(p, index: dict, defs: dict) -> dict:
+        """{name: [score per picture]} for defs {name: (+ tag, - tag or None)}: the log-odds of the + tag minus those of
+        the - tag (the + tag alone where there is none), probabilities clipped to [1e-4, 1 - 1e-4]."""
+        import numpy as np
+
+        def logodds(tag):
+            q = np.clip(p[:, index[tag]], 1e-4, 1 - 1e-4)
+            return np.log(q / (1 - q))
+
+        return {k: [float(x) for x in logodds(plus) - (logodds(minus) if minus else 0.0)]
+                for k, (plus, minus) in defs.items()}
+
+    def _counterpoint_words(self, keys: list[str], out_dir: Path) -> dict:
+        import numpy as np
+        from PIL import Image, ImageDraw
+        probs_fn, index, names, counts = self._cp_judges(keys)     # both judges before any picture
+        self._judge()
+        sets = ax.cp_sets(keys)
+        plans = {n: ax.cp_items(t, f) for n, (t, f) in sets.items()}
+        repo = getattr(self.cfg, "data_repo_id", None)
+        pulled = {n for n, items in plans.items() if self._cp_pull(n, items)}
+        need = sum(len(_ts.missing_images(self._cp_root(n), items)) for n, items in plans.items())
+        total = sum(len(items) for items in plans.values())
+        print(f"[{self.TAG}] e050: {len(plans)} sets x {len(ax.attr_cells())} cells = {total} pictures; "
+              f"{total - need} already drawn ({len(pulled)} sets from {repo or 'no data repo'}), {need} to draw", flush=True)
+        eta = _sr._Eta(self.TAG, "e050 drawing", need) if need else None
+        pair_defs = {k: ax.CP_PAIRS[k][:2] for k in keys}
+        e012_defs = {a: (p, m) for a, (p, m, _) in ax.ATTRIBUTES.items()}
+        rcols = [index[r] for r in ax.CP_RATINGS]
+        judge, judge12, feats, probs, rating, origin, kept = {}, {}, {}, {}, {}, {}, {}
+        for n, items in plans.items():
+            drawn = self._cp_draw(n, items, eta)
+            root = self._cp_root(n)
+            imgs = [Image.open(root / "images" / f"{it['name']}.png").convert("RGB") for it in items]
+            p = probs_fn(imgs)
+            probs[n] = p.astype(np.float16)
+            rating[n] = [ax.CP_RATINGS[int(i)] for i in np.argmax(p[:, rcols], axis=1)]
+            judge[n] = self._cp_scores(p, index, pair_defs)
+            judge12[n] = self._cp_scores(p, index, e012_defs)
+            feats[n], _ = self._score(imgs)
+            origin[n] = ("drawn" if drawn == len(items) else f"{drawn} drawn, {len(items) - drawn} on this runtime"
+                         if drawn else "data repo" if n in pulled else "this runtime")
+            bad = [it["name"] for it, r in zip(items, rating[n]) if r in ax.CP_WITHHELD]
+            if bad:
+                (root / "withheld.json").write_text(json.dumps({"withheld": bad, "ratings": rating[n]}), encoding="utf-8")
+                kept[n] = None
+                print(f"[{self.TAG}] e050 {n}: the judge rates {len(bad)} picture(s) questionable or explicit: left off "
+                      "the sheets; this set stays out of the data repo", flush=True)
+            else:
+                (root / "withheld.json").unlink(missing_ok=True)
+                kept[n] = self._cp_push(n, items)
+            tag, framing = sets[n]
+            own = next((k for k in keys if tag and tag in ax.CP_PAIRS[k][:2]), None)
+            line = (f"{own} score {np.mean(judge[n][own]):+.2f} (plain {framing} "
+                    f"{np.mean(judge[ax.cp_set_name(None, framing)][own]):+.2f})" if own else f"the plain prompt, {framing}")
+            print(f"[{self.TAG}] e050 {n} ({origin[n]}): {line}", flush=True)
+        reads = ax.cp_reads(judge, keys)
+        for a in keys:
+            hi, lo, plain = ax.cp_sides(a)
+            reads[a]["content_kept"] = {s: float(np.mean((feats[n] * feats[plain]).sum(-1)))
+                                        for s, n in (("+", hi), ("-", lo)) if n}
+            reads[a]["posts"] = {t: counts.get(t.replace(" ", "_")) for t in ax.CP_PAIRS[a][:2] if t}
+        side = self._cp_side_by_side(judge12)
+        withheld = {n: {i for i, r in enumerate(rating[n]) if r in ax.CP_WITHHELD} for n in plans}
+
+        def tile(n, i):
+            if i in withheld[n]:
+                im = Image.new("RGB", (256, 256), (128, 128, 128))
+                ImageDraw.Draw(im).text((88, 120), "withheld", fill=(255, 255, 255))
+                return im
+            return Image.open(self._cp_root(n) / "images" / f"{plans[n][i]['name']}.png").convert("RGB")
+
+        first = [i for i, (_, sd) in enumerate(ax.attr_cells()) if sd == ax.ATTR_SEEDS[0]]
+        for a in keys:
+            hi, lo, plain = ax.cp_sides(a)
+            cols = ([lo] if lo else []) + [plain, hi]
+            _grid([[tile(n, i) for n in cols] for i in first], out_dir / f"sheet_{a}.jpg")
+        np.savez_compressed(out_dir / "tagger_probs.npz", tags=np.array(names), **probs)
+        return {"pairs": reads, "side_by_side": side,
+                "pictures": {"total": total, "drawn": need, "reused": total - need},
+                "sets": {n: {"tag": sets[n][0], "framing": sets[n][1], "from": origin[n], "data_repo_folder": kept[n],
+                             "ratings": {r: rating[n].count(r) for r in ax.CP_RATINGS}} for n in plans},
+                "withheld": {n: [plans[n][i]["name"] for i in sorted(v)] for n, v in withheld.items() if v},
+                "cells": [{"character": ax.CHARACTERS[ci][0], "seed": sd,
+                           **{n: {a: judge[n][a][j] for a in keys} for n in plans}}
+                          for j, (ci, sd) in enumerate(ax.attr_cells())]}
+
+    def _cp_side_by_side(self, judge12: dict) -> dict:
+        """This run beside the earlier attribute screen (another card, the same prompts and seeds): reported, never a
+        gate. Empty when that screen's result is not in the experiments repo."""
+        try:
+            raw = self._experiments_repo().read(f"experiments/{ax.ATTR_TEST_ID}/result.json")
+            cells = json.loads(raw).get("cells") if raw else None
+        except Exception as e:  # noqa: BLE001
+            print(f"[{self.TAG}] e050: the earlier screen's result was not read ({type(e).__name__}); no side-by-side read",
+                  flush=True)
+            return {}
+        if not cells or len(cells) != len(ax.attr_cells()):
+            return {}
+        return ax.cp_side_by_side(cells, judge12)
 
     # ---- e013-e015: Beatrix as a second conditioning source (a learned push after the adapter) ----------------
     def run_beatrix_connectors(self, arms: "list[str] | None" = None, *, force: bool = False) -> dict:

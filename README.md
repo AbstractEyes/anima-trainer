@@ -204,6 +204,13 @@ cache → two-phase train):
   steer the image with Beatrix's own phrase features through a learned push, each into its own folder of
   [AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). See
   [Anima experiments](#anima-experiments-the-flavor-bed).
+- **`anima_colab_counterpoint.ipynb`**
+  [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_counterpoint.ipynb)
+  — e050 on **Anima**: booru counterpoint pairs (hair colour, eye colour, body size, expression, eye
+  openness; more on request) drawn on the stock model and judged by an anime tagger: does each tag move its
+  own attribute, and what else does it move? Every drawn set is kept in
+  [AbstractPhil/geolip-beatrix-anima-data](https://huggingface.co/datasets/AbstractPhil/geolip-beatrix-anima-data)
+  and reused instead of drawn again.
 
 ## Programmatic / sweeps
 

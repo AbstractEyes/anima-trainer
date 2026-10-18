@@ -2149,3 +2149,282 @@ def render_connector_readme(arm: ConnectorArm, meta: dict, recipe: dict, phrases
             "- `result.json`: every cell's score, the reads, the per-phrase effects.",
             "- `sheet.jpg`: the contact sheet.", "", "## References", refs, ""]
     return "\n".join(out)
+
+
+# ---- e050: booru counterpoint pairs on the stock model (the words and their cross-talk; sets kept in the data repo) ------
+CP_TEST_ID = "e050_anima_counterpoint_words"
+CP_TEST_TITLE = "The stock model: booru counterpoint pairs, their words and their cross-talk"
+CP_DATE = "2026-10-17"
+CP_TEMPLATE = PREFIX + "1girl, solo, {tag}{framing}, {outfit}, {setting}."
+CP_FRAMINGS = ("upper body", "full body")
+# key: (+ tag, - tag or None = the plain prompt, framing). Danbooru tags as the model's captions write them (spaces, not
+# underscores), every one in the judge's vocabulary; the two tags of a pair come from one slot, so a picture normally
+# carries one of them. Adults only: the age pair only pushes older.
+CP_PAIRS = {
+    "hair_colour": ("blonde hair", "black hair", "upper body"),
+    "eye_colour": ("red eyes", "blue eyes", "upper body"),
+    "body_size": ("plump", "skinny", "full body"),
+    "expression": ("smile", "frown", "upper body"),
+    "eye_openness": ("wide-eyed", "half-closed eyes", "upper body"),
+    "hair_length": ("very long hair", "short hair", "upper body"),
+    "eye_shape": ("tareme", "tsurime", "upper body"),
+    "figure_scale": ("giant", "mini person", "full body"),
+    "eye_colour_2": ("green eyes", "purple eyes", "upper body"),
+    "hair_colour_2": ("pink hair", "blue hair", "upper body"),
+    "colour_scheme": ("monochrome", None, "upper body"),
+    "age": ("mature female", None, "upper body"),
+    "proportions": ("chibi", None, "full body"),
+}
+CP_DEFAULT = ("hair_colour", "eye_colour", "body_size", "expression", "eye_openness")
+CP_OVERLAP = 1 / 3          # a pair's words moving another pair's score by more than this share of its span: an overlap
+# overlaps named before the run as expected (parts of the face that move together); they hold no pair back
+CP_EXPECTED_OVERLAP = frozenset(frozenset(p) for p in (
+    ("eye_shape", "eye_openness"), ("expression", "eye_openness"), ("expression", "eye_shape"),
+    ("expression", "eye_colour"), ("expression", "eye_colour_2")))
+CP_RATINGS = ("general", "sensitive", "questionable", "explicit")      # the judge's own rating tags
+CP_WITHHELD = ("questionable", "explicit")   # a picture rated so stays off the sheets, and its set out of the data repo
+
+
+def cp_slug(text: str) -> str:
+    """'half-closed eyes' -> 'half-closed-eyes' (part of a set's name)."""
+    import re
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def cp_set_name(tag: "str | None", framing: str) -> str:
+    """The name of one tag's set (None: the plain prompt) at one framing, over the 16 cells."""
+    return f"cp_{cp_slug(tag) if tag else 'plain'}_{cp_slug(framing)}"
+
+
+def cp_prompt(tag: "str | None", framing: str, ci: int) -> str:
+    outfit, setting = CHARACTERS[ci]
+    return CP_TEMPLATE.format(tag=f"{tag}, " if tag else "", framing=framing, outfit=outfit, setting=setting)
+
+
+def cp_items(tag: "str | None", framing: str) -> list[dict]:
+    """One set in the data repo's set format: per cell its name, seed, prompt and caption. The caption is the plain
+    prompt, so the tag lives only in the picture and the set can train a slider on its attribute later."""
+    return [{"name": f"{ci:02d}_{sd}", "seed": sd, "prompt": cp_prompt(tag, framing, ci),
+             "caption": cp_prompt(None, framing, ci)} for ci, sd in attr_cells()]
+
+
+def cp_pairs(keys=None) -> list[str]:
+    """A run's pairs (default CP_DEFAULT), checked."""
+    keys = list(CP_DEFAULT if keys is None else keys)
+    unknown = [k for k in keys if k not in CP_PAIRS]
+    if unknown:
+        raise ValueError(f"unknown pair(s) {unknown}; the pairs are {list(CP_PAIRS)}")
+    if not keys or len(set(keys)) != len(keys):
+        raise ValueError(f"name each pair once (got {keys})")
+    return keys
+
+
+def cp_sets(keys: list[str]) -> dict:
+    """{set name: (tag or None, framing)} in drawing order: the plain prompt at each framing in use, then each pair's
+    + and - tags."""
+    sets: dict = {}
+    for f in CP_FRAMINGS:
+        if any(CP_PAIRS[k][2] == f for k in keys):
+            sets[cp_set_name(None, f)] = (None, f)
+    for k in keys:
+        plus, minus, f = CP_PAIRS[k]
+        for t in (plus, minus):
+            if t:
+                sets[cp_set_name(t, f)] = (t, f)
+    return sets
+
+
+def cp_sides(key: str) -> "tuple[str, str | None, str]":
+    """(the + set, the - set or None, the plain set) of a pair."""
+    plus, minus, f = CP_PAIRS[key]
+    return cp_set_name(plus, f), (cp_set_name(minus, f) if minus else None), cp_set_name(None, f)
+
+
+def cp_judge_tags(keys: list[str]) -> list[str]:
+    """Every tag the judge must have: the pairs', the earlier screen's (for the side-by-side read) and the ratings."""
+    tags = [t for k in keys for t in CP_PAIRS[k][:2] if t]
+    tags += [t for p, m, _ in ATTRIBUTES.values() for t in (p, m) if t]
+    return list(dict.fromkeys(tags + list(CP_RATINGS)))
+
+
+def cp_reads(judge: dict, keys: list[str]) -> dict:
+    """The registered reads from judge scores {set name: {pair: [score per cell]}} (names as cp_sets()): per side the
+    tag against the plain prompt under the words rule, the pair's verdict, its words on every pair's score in units of
+    that pair's span (cross-talk), the overlaps, and whether the pair goes on to the slider stage."""
+    import numpy as np
+    span = {}
+    for b in keys:
+        hi, lo, plain = cp_sides(b)
+        span[b] = float(np.mean(np.subtract(judge[hi][b], judge[lo or plain][b])))
+    out: dict = {}
+    for a in keys:
+        hi, lo, plain = cp_sides(a)
+        up = flavor_outcome(list(np.subtract(judge[hi][a], judge[plain][a])), 1, label="THE WORD MOVES IT")
+        down = (flavor_outcome(list(np.subtract(judge[lo][a], judge[plain][a])), -1, label="THE WORD MOVES IT")
+                if lo else None)
+        sides = [up] + ([down] if down else [])
+        if all(r["OUTCOME"] == "THE WORD MOVES IT" for r in sides):
+            verdict = "A HANDLE"
+        elif all(r["OUTCOME"] == "NO EFFECT" for r in sides):
+            verdict = "NO HANDLE"
+        else:
+            verdict = "MIXED"
+        out[a] = {"plus": CP_PAIRS[a][0], "minus": CP_PAIRS[a][1], "framing": CP_PAIRS[a][2], "words_up": up,
+                  "words_down": down, "span": span[a], "OUTCOME": verdict}
+    for a in keys:
+        hi, lo, plain = cp_sides(a)
+        cross = {b: (float(np.mean(np.subtract(judge[hi][b], judge[lo or plain][b]))) / span[b] if span[b] else 0.0)
+                 for b in keys}
+        over = [b for b in keys if b != a and abs(cross[b]) > CP_OVERLAP]
+        counted = [b for b in over if out[b]["OUTCOME"] == "A HANDLE" and frozenset((a, b)) not in CP_EXPECTED_OVERLAP]
+        worst = max(((abs(v), b) for b, v in cross.items() if b != a), default=(0.0, None))
+        out[a].update(cross_talk=cross, worst_cross_talk=worst[0], worst_with=worst[1], overlapping=over,
+                      overlap_counted=counted, to_sliders=out[a]["OUTCOME"] == "A HANDLE" and not counted)
+    return out
+
+
+def cp_side_by_side(stored_cells: list[dict], judge12: dict) -> dict:
+    """This run beside the earlier attribute screen (ATTR_TEST_ID: another card, the same characters, seeds and recipe)
+    on the sets both drew with the same prompts: the plain prompt's score on each of that screen's attributes (both means
+    and the per-cell correlation), and the words both measured (each tag's effect on its own attribute). stored_cells =
+    that screen's result.json 'cells' (attr_cells() order); judge12 = {set name: {attribute: [score per cell]}} here."""
+    import numpy as np
+
+    def col(key, a):
+        return np.array([c[key][a] for c in stored_cells], dtype=float)
+
+    def mse(x):
+        return float(np.std(x, ddof=1) / np.sqrt(len(x))) if len(x) > 1 else 0.0
+
+    plain = cp_set_name(None, "upper body")
+    out: dict = {"plain": {}, "words": {}}
+    if plain not in judge12 or "neutral" not in stored_cells[0]:
+        return out
+    for a in ATTRIBUTES:
+        here, there = np.asarray(judge12[plain][a], dtype=float), col("neutral", a)
+        r = float(np.corrcoef(here, there)[0, 1]) if here.std() > 0 and there.std() > 0 else None
+        out["plain"][a] = {"here": float(here.mean()), "there": float(there.mean()), "cell_r": r}
+    for a, (p, m, _) in ATTRIBUTES.items():
+        for tag, key in ((p, f"{a}+"), (m, f"{a}-")):
+            name = cp_set_name(tag, "upper body") if tag else None
+            if name in judge12 and key in stored_cells[0]:
+                here = np.subtract(judge12[name][a], judge12[plain][a])
+                there = col(key, a) - col("neutral", a)
+                out["words"][tag] = {"attribute": a, "here": float(here.mean()), "here_se": mse(here),
+                                     "there": float(there.mean()), "there_se": mse(there)}
+    return out
+
+
+def render_counterpoint_readme(meta: dict, recipe: dict) -> str:
+    """e050's README: why, the design and the rule fixed before the run, and the result when done."""
+    keys = meta.get("pairs") or list(CP_DEFAULT)
+    res = meta.get("result") or {}
+    posts = {a: v.get("posts", {}) for a, v in (res.get("pairs") or {}).items()}
+    sets = cp_sets(keys)
+
+    def n_posts(a, tag):
+        n = posts.get(a, {}).get(tag) if tag else None
+        return f"{n:,}" if isinstance(n, int) else ""
+
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    rows = "\n".join(f"| {a} | {p} | {m or '(none: the plain prompt)'} | {f} | {n_posts(a, p)} | {n_posts(a, m)} |"
+                     for a, (p, m, f) in ((k, CP_PAIRS[k]) for k in keys))
+    chars = "; ".join(f"{o} / {s}" for o, s in CHARACTERS)
+    named = ", ".join(" with ".join(sorted(p)) for p in sorted(CP_EXPECTED_OVERLAP, key=sorted)
+                      if p <= set(keys)) or "none among these pairs"
+    refs = "\n".join(f"- {t}: {u}" for t, u in ATTR_REFERENCES)
+    out = [f"# {CP_TEST_ID}: {CP_TEST_TITLE}", "",
+           f"Date: {CP_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Why",
+           "Anima learned from pictures described by Danbooru tags, so its own vocabulary is the natural handle. Mood words "
+           "such as \"cheerful\" and \"gloomy\" are not tags, and the earlier mood experiments here found their effect "
+           "lopsided and tied to how the text encoder splits the words. A counterpoint pair is two tags from one slot of "
+           "that vocabulary (two hair colours, two eye colours, two body sizes), so a picture normally carries one of them. "
+           "Before a pair can carry a slider, the stock model has to show that each tag moves the picture its way, and that "
+           "it moves only its own attribute.", "",
+           "## Questions",
+           "1. Does each tag move its own attribute, the + tag one way and the - tag the other, against the plain prompt?",
+           "2. Do a pair's tags move the other pairs' attributes (overlap)?",
+           "3. How much of the rest of the picture does each tag change (content kept)?", "",
+           "## Design",
+           f"- **Characters**: \"1girl, solo\" with eight outfits and settings ({chars}) x seeds "
+           f"{', '.join(map(str, ATTR_SEEDS))}: 16 cells per set, the cells of {ATTR_TEST_ID}. All characters are adults.",
+           "- **Framing**: \"upper body\" for the face and hair pairs, \"full body\" for the body pairs; each framing has its "
+           "own plain set.",
+           "- **Pairs** (posts: how many Danbooru posts carry the tag, from the judge's tag list):", "",
+           "| pair | + tag | - tag | framing | posts (+) | posts (-) |", "|---|---|---|---|---|---|", rows, "",
+           f"- **Sets**: the plain prompt at each framing in use, each + tag, each - tag: {len(sets)} sets x 16 = "
+           f"{16 * len(sets)} pictures.",
+           "- **Kept and reused**: every set is saved in the data repo once drawn (its pictures, the prompt and seed of "
+           "each, a contact sheet and the settings that drew it) and a later run with the same settings downloads it "
+           "instead of drawing it again. The caption stored with each picture is the plain prompt, so a set can train a "
+           "slider on its attribute later.", "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The judge",
+           f"Each picture is scored on its pixels by the [WD EVA02-Large tagger v3](https://huggingface.co/{TAGGER}), an "
+           "image tagger trained on Danbooru tags, with its reference preprocessing. A pair's score is the log-odds of its "
+           "+ tag minus the log-odds of its - tag (the + tag alone for a pair without a - tag). *Content kept* is the CLIP "
+           "ViT-L/14 image cosine to the plain prompt's picture of the same cell. The tagger also rates every picture "
+           "(general, sensitive, questionable, explicit): a picture rated questionable or explicit is left off the sheets, "
+           "and its set stays out of the data repo.", "",
+           "## The rule (fixed before the run)",
+           "Per side, over the 16 cells, read in the expected direction: **THE WORD MOVES IT** when the mean moves that way, "
+           "at least 75% of the cells move that way and the mean is beyond 3 standard errors; **NO EFFECT** within 2 "
+           "standard errors of zero or under 60% that way; **MIXED** otherwise. A pair is **A HANDLE** when every side "
+           "moves it, **NO HANDLE** when no side does, **MIXED** otherwise. **Cross-talk**: pair a's tags (its + set minus "
+           "its - set, or minus the plain set) on pair b's score, in units of b's own span (the same difference on b's own "
+           "sets); a pair **overlaps** b when the cross-talk is above a third. A pair goes on to the slider stage when it is "
+           "a handle and overlaps no other handle, except overlaps named before the run as expected (" + named + "); an "
+           "overlap on a pair that is not a handle is reported but holds nothing back, since that pair's span is no usable "
+           "unit.", ""]
+    if meta.get("status") == "done":
+        r = res["pairs"]
+        out += ["## Result", meta.get("summary", ""), "",
+                "| pair | + tag vs plain | - tag vs plain | verdict | worst cross-talk | content kept (+ / -) | to the sliders |",
+                "|---|---|---|---|---|---|---|"]
+        for a, v in r.items():
+            up, dn = v["words_up"], v.get("words_down")
+            kept = v.get("content_kept", {})
+            out.append(f"| {a} | {up['mean']:+.2f} +- {up['se']:.2f} ({up['OUTCOME']}) | "
+                       + (f"{dn['mean']:+.2f} +- {dn['se']:.2f} ({dn['OUTCOME']})" if dn else "") + f" | **{v['OUTCOME']}** | "
+                       + (f"{v['worst_cross_talk']:.2f} ({v['worst_with']})" if v["worst_with"] else "") + " | "
+                       + " / ".join(f"{kept[s]:.3f}" for s in ("+", "-") if s in kept) + " | "
+                       + ("yes" if v["to_sliders"] else "no") + " |")
+        names = list(r)
+        out += ["", "Cross-talk (row = a pair's tags, column = the pair read; units of that pair's span; the diagonal is 1):",
+                "", "| tags of | " + " | ".join(names) + " |", "|---|" + "---|" * len(names)]
+        for a in names:
+            out.append(f"| {a} | " + " | ".join(f"{r[a]['cross_talk'][b]:+.2f}" for b in names) + " |")
+        sbs = res.get("side_by_side") or {}
+        if sbs.get("plain"):
+            out += ["", f"Beside the earlier screen ({ATTR_TEST_ID}, another card, the same prompts and seeds): the plain "
+                        "prompt's scores, and each tag both runs drew against the plain prompt.", "",
+                    "| the plain prompt on | here | earlier | per-cell r |", "|---|---|---|---|"]
+            out += [f"| {a} | {v['here']:+.2f} | {v['there']:+.2f} | "
+                    + ("" if v["cell_r"] is None else f"{v['cell_r']:.2f}") + " |" for a, v in sbs["plain"].items()]
+            if sbs.get("words"):
+                out += ["", "| tag | attribute | here | earlier |", "|---|---|---|---|"]
+                out += [f"| {t} | {v['attribute']} | {v['here']:+.2f} +- {v['here_se']:.2f} | "
+                        f"{v['there']:+.2f} +- {v['there_se']:.2f} |" for t, v in sbs["words"].items()]
+        held = res.get("withheld") or {}
+        out += ["", ("The judge rated no picture questionable or explicit." if not held else
+                     "Withheld (rated questionable or explicit; off the sheets, the set out of the data repo): "
+                     + "; ".join(f"{n}: {', '.join(v)}" for n, v in held.items()) + ".")]
+        pics = res.get("pictures") or {}
+        if pics:
+            out += ["", f"Pictures: {pics.get('total')} in all, {pics.get('drawn')} drawn in this run, "
+                        f"{pics.get('reused')} reused from the data repo or this runtime."]
+        out += ["", "Sheets (`sheet_<pair>.jpg`): the eight characters at the first seed; columns: the - tag (where there "
+                    "is one), the plain prompt, the + tag.", ""]
+        out += [f"![{a}](sheet_{a}.jpg)" for a in names] + [""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    else:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files",
+            "- `result.json`: every cell's scores on every pair, the reads, the cross-talk, the side-by-side read, where "
+            "each set came from and where it is kept.",
+            "- `tagger_probs.npz`: every picture's probability for each of the judge's tags (float16, one array per set, "
+            "rows in cell order; `tags` names the columns), so another tag can be read without the pictures.",
+            "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
+    return "\n".join(out)

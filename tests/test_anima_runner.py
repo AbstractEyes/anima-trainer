@@ -527,7 +527,7 @@ def test_connector_registry_and_rules():
     assert ax.HUB_READ_ID in ax.HUB_READ
     for rid in (ax.HUB_READ_ID, ax.TRIANGULATION_ID, ax.ARM_READ_ID,    # e038 / e045 likewise: the reads' folders (triangulate)
                 ax.NANO_READ_ID, ax.NANO_RELAY_ID, ax.NANO_COMPARATOR_ID,   # e046-e049: the nano battery's folders
-                ax.NANO_RELAY_TRAINED_ID):
+                ax.NANO_RELAY_TRAINED_ID, ax.CP_TEST_ID):   # e050: the counterpoint pairs
         assert {i for i in ids_here if i[:4] == rid[:4]} == {rid}
     assert all(a.features is None and not a.reading and not a.date for a in ax.CONNECTOR_ARMS[:10])
     assert {a.date for a in hub} == {"2026-10-07"}
@@ -1699,3 +1699,163 @@ def test_config_validation_refuses_master_weights_without_plain_adam():
                           dataset=api.DatasetConfig(directories=[api.DirectoryConfig(path="d")]))
     with pytest.raises(api.ConfigError, match="bf16_master_weights"):
         api.validate(cfg)
+
+
+# ---- e050: booru counterpoint pairs ------------------------------------------------------------------------
+def test_counterpoint_sets_are_the_registered_design():
+    keys = ax.cp_pairs()
+    assert keys == ["hair_colour", "eye_colour", "body_size", "expression", "eye_openness"]
+    sets = ax.cp_sets(keys)
+    assert list(sets)[:2] == ["cp_plain_upper-body", "cp_plain_full-body"] and len(sets) == 12
+    assert sets["cp_half-closed-eyes_upper-body"] == ("half-closed eyes", "upper body")
+    assert sets["cp_plump_full-body"] == ("plump", "full body")
+    items = ax.cp_items("blonde hair", "upper body")
+    assert len(items) == 16 and items[0]["name"] == "00_11" and items[1]["name"] == "00_22" and items[1]["seed"] == 22
+    assert items[0]["prompt"] == ax.attr_prompt("blonde hair", 0)          # the attribute screen's prompts, word for word
+    assert ax.cp_items(None, "upper body")[3]["prompt"] == ax.attr_prompt(None, 1)
+    assert all(it["caption"] == ax.cp_prompt(None, "upper body", int(it["name"][:2])) for it in items)
+    assert all(it["prompt"].startswith(ax.PREFIX) and ", safe, " in it["prompt"] for it in items)
+    assert ax.cp_items("plump", "full body")[0]["prompt"].endswith("1girl, solo, plump, full body, office suit, modern office.")
+    assert ax.cp_sides("age") == ("cp_mature-female_upper-body", None, "cp_plain_upper-body")
+    assert all(f in ax.CP_FRAMINGS for _, _, f in ax.CP_PAIRS.values())
+    assert all(m is not None or k in ("colour_scheme", "age", "proportions") for k, (_, m, _) in ax.CP_PAIRS.items())
+    assert {"plump", "skinny", "general", "explicit", "old woman"} <= set(ax.cp_judge_tags(keys))
+    assert all(len(p) == 2 and p <= set(ax.CP_PAIRS) for p in ax.CP_EXPECTED_OVERLAP)
+    with pytest.raises(ValueError, match="unknown pair"):
+        ax.cp_pairs(["hair_colour", "mood"])
+    with pytest.raises(ValueError, match="once"):
+        ax.cp_pairs(["hair_colour", "hair_colour"])
+    readme = ax.render_counterpoint_readme({"status": "running", "pairs": keys}, {"model": "Anima"})
+    assert "fixed before the run" in readme and "Running." in readme and "2311.12092" in readme
+    assert "12 sets x 16 = 192 pictures" in readme and "expression with eye_openness" in readme
+    for word in ("S-1", "Phil", "docket", "canon/"):
+        assert word not in readme
+
+
+def test_counterpoint_reads_verdicts_and_overlaps():
+    """Constant effects per set (the cells' noise is shared by every set, so each paired difference is exact)."""
+    keys = ["hair_colour", "eye_colour", "body_size", "expression", "eye_openness", "age"]
+    noise = [0.1 * (i % 5) for i in range(16)]
+    effects = {"cp_blonde-hair_upper-body": {"hair_colour": 3.0},
+               "cp_black-hair_upper-body": {"hair_colour": -3.0},
+               "cp_red-eyes_upper-body": {"eye_colour": 4.0, "hair_colour": 2.5},      # drags hair colour: counted
+               "cp_blue-eyes_upper-body": {"eye_colour": -4.0},
+               "cp_plump_full-body": {"body_size": 2.0, "age": 9.0},                  # onto a pair with no handle
+               "cp_skinny_full-body": {},                                             # one side only
+               "cp_smile_upper-body": {"expression": 2.0, "eye_openness": -2.0},      # a named overlap
+               "cp_frown_upper-body": {"expression": -2.0},
+               "cp_wide-eyed_upper-body": {"eye_openness": 2.5},
+               "cp_half-closed-eyes_upper-body": {"eye_openness": -2.5}}
+    judge = {s: {k: [effects.get(s, {}).get(k, 0.0) + noise[i] for i in range(16)] for k in keys}
+             for s in ax.cp_sets(keys)}
+    r = ax.cp_reads(judge, keys)
+    assert {k: v["OUTCOME"] for k, v in r.items()} == {
+        "hair_colour": "A HANDLE", "eye_colour": "A HANDLE", "body_size": "MIXED", "expression": "A HANDLE",
+        "eye_openness": "A HANDLE", "age": "NO HANDLE"}
+    assert r["hair_colour"]["span"] == pytest.approx(6.0) and r["age"]["words_down"] is None
+    assert all(v["cross_talk"][k] == pytest.approx(1.0) for k, v in r.items() if v["span"])
+    assert r["eye_colour"]["cross_talk"]["hair_colour"] == pytest.approx(2.5 / 6.0)
+    assert r["eye_colour"]["overlap_counted"] == ["hair_colour"] and not r["eye_colour"]["to_sliders"]
+    assert r["expression"]["overlapping"] == ["eye_openness"] and r["expression"]["overlap_counted"] == []
+    assert r["expression"]["to_sliders"] and r["hair_colour"]["to_sliders"] and r["eye_openness"]["to_sliders"]
+    assert r["body_size"]["cross_talk"]["age"] == 0.0 and not r["body_size"]["to_sliders"]   # age's span is zero
+    assert r["body_size"]["words_up"]["OUTCOME"] == "THE WORD MOVES IT"
+    assert r["body_size"]["words_down"]["OUTCOME"] == "NO EFFECT"
+    assert r["eye_colour"]["worst_with"] == "hair_colour"
+
+
+def test_counterpoint_words_end_to_end(runner, fake_hub, tmp_path, monkeypatch, capsys):
+    """A fake renderer writes each picture's tag, seed and character into its pixels; a fake tagger reads them back:
+    every pair moves both ways except skinny, red eyes drag the hair colour, a smile half-closes the eyes (a named
+    overlap) and one plump picture is rated explicit (its set stays out of the data repo and off the sheet)."""
+    from PIL import Image
+
+    from geolip_anima_trainer import training_sets as ts
+    s, repo, pipe, calls = runner
+    s.cfg.data_repo_id = "AbstractPhil/geolip-beatrix-anima-data"
+    keys = ax.cp_pairs()
+    tags = ax.cp_judge_tags(keys)
+    cp_tags = [t for k in ax.CP_PAIRS for t in ax.CP_PAIRS[k][:2] if t]
+    index = {t: i for i, t in enumerate(tags)}
+    drawn = []
+
+    def render(prompts, seeds, **kw):
+        out = []
+        for p, sd in zip(prompts, seeds):
+            part = p.split(", ")[6]
+            tid = cp_tags.index(part) + 1 if part in cp_tags else 0
+            ci = next(i for i, (o, _) in enumerate(ax.CHARACTERS) if o in p)
+            out.append(Image.new("RGB", (8, 8), (tid, sd, ci)))
+            drawn.append(p)
+        return out
+
+    def probs(imgs):
+        rows = []
+        for im in imgs:
+            tid, sd, ci = im.getpixel((0, 0))
+            v = np.full(len(tags), 0.5)
+            v[[index[r] for r in ax.CP_RATINGS]] = (0.9, 0.05, 0.05, 0.05)
+            tag = cp_tags[tid - 1] if tid else None
+            if tag and tag != "skinny":
+                v[index[tag]] = 0.95
+                pair = next(k for k in keys if tag in ax.CP_PAIRS[k][:2])
+                other = [t for t in ax.CP_PAIRS[pair][:2] if t != tag][0]
+                v[index[other]] = 0.05
+            if tag == "red eyes":
+                v[index["blonde hair"]] = 0.99
+            if tag == "smile":
+                v[index["half-closed eyes"]], v[index["wide-eyed"]] = 0.95, 0.05
+            if tag == "plump" and (ci, sd) == (3, 22):
+                v[index["explicit"]], v[index["general"]] = 0.9, 0.05
+            rows.append(v)
+        return np.array(rows)
+
+    loaded = []
+    monkeypatch.setattr(s, "_render", render)
+    monkeypatch.setattr(s, "_cp_judges", lambda k: (loaded.append("tagger") or probs, index, list(tags),
+                                                    {t.replace(" ", "_"): 1000 for t in tags}))
+    monkeypatch.setattr(s, "_judge", lambda: loaded.append("clip"))
+    earlier = [{"character": ax.CHARACTERS[ci][0], "seed": sd,
+                **{k: {a: (13.5 if k == "hair_colour+" and a == "hair_colour" else 0.0) for a in ax.ATTRIBUTES}
+                   for k in ("neutral", "hair_colour+", "hair_colour-", "eye_colour+", "eye_colour-")}}
+               for ci, sd in ax.attr_cells()]
+    repo.commit({f"experiments/{ax.ATTR_TEST_ID}/result.json": json.dumps({"cells": earlier})}, "the earlier screen")
+
+    meta = s.run_counterpoint_words()
+    assert loaded == ["tagger", "clip"] and len(drawn) == 192          # the judges load before the first picture
+    r = meta["result"]
+    assert meta["status"] == "done" and meta["pairs"] == keys and meta["kind"] == "counterpoint_words"
+    assert {k: v["OUTCOME"] for k, v in r["pairs"].items()} == {
+        "hair_colour": "A HANDLE", "eye_colour": "A HANDLE", "body_size": "MIXED", "expression": "A HANDLE",
+        "eye_openness": "A HANDLE"}
+    assert [k for k, v in r["pairs"].items() if v["to_sliders"]] == ["hair_colour", "expression", "eye_openness"]
+    assert r["withheld"] == {"cp_plump_full-body": ["03_22"]}
+    assert r["sets"]["cp_plump_full-body"]["data_repo_folder"] is None
+    assert r["sets"]["cp_plump_full-body"]["ratings"]["explicit"] == 1
+    assert r["pictures"] == {"total": 192, "drawn": 192, "reused": 0}
+    hub_sets = sorted(p.name.rsplit("-", 1)[0] for p in (fake_hub.d / "sets").iterdir())
+    assert len(hub_sets) == 11 and "cp_plump_full-body" not in hub_sets and len(fake_hub.commits) == 11
+    assert r["pairs"]["hair_colour"]["posts"] == {"blonde hair": 1000, "black hair": 1000}
+    sbs = r["side_by_side"]
+    assert sbs["words"]["blonde hair"]["there"] == pytest.approx(13.5)
+    assert sbs["words"]["blonde hair"]["here"] == pytest.approx(2 * np.log(0.95 / 0.05))
+    assert sbs["plain"]["hair_colour"]["here"] == pytest.approx(0.0)
+    base = f"experiments/{ax.CP_TEST_ID}"
+    for f in ["meta.json", "README.md", "result.json", "tagger_probs.npz"] + [f"sheet_{k}.jpg" for k in keys]:
+        assert f"{base}/{f}" in repo.files_
+    readme = repo.files_[f"{base}/README.md"].decode()
+    assert "**A HANDLE**" in readme and "Withheld" in readme and "cp_plump_full-body: 03_22" in readme
+    assert ax.CP_TEST_ID in repo.files_["README.md"].decode()
+    assert len(json.loads(repo.files_[f"{base}/result.json"])["cells"]) == 16
+    assert ts.upload_local_sets(s, s.cfg.data_repo_id)["cp_plump_full-body"] == "withheld"
+    assert s.run_counterpoint_words()["status"] == "done" and len(drawn) == 192     # done already: skipped
+
+    # a fresh runtime: every kept set comes back from the data repo; only the withheld one is drawn again
+    s.state["data_root"] = str(tmp_path / "data2")
+    capsys.readouterr()
+    meta = s.run_counterpoint_words(force=True)
+    out = capsys.readouterr().out
+    assert len(drawn) == 192 + 16 and "176 already drawn (11 sets from AbstractPhil/geolip-beatrix-anima-data)" in out
+    assert meta["result"]["pictures"] == {"total": 192, "drawn": 16, "reused": 176}
+    assert meta["result"]["sets"]["cp_blonde-hair_upper-body"]["from"] == "data repo"
+    assert len(fake_hub.commits) == 11
