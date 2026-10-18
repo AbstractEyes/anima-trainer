@@ -525,11 +525,13 @@ def test_connector_registry_and_rules():
     ids_here = {v for v in vars(ax).values() if isinstance(v, str) and v[:1] == "e" and v[1:4].isdigit() and v[4:5] == "_"}
     ids_here |= set(ax.CONNECTOR_IDS) | set(ax.SEQUENCE_IDS)
     assert ax.HUB_READ_ID in ax.HUB_READ
-    for rid in (ax.HUB_READ_ID, ax.TRIANGULATION_ID, ax.ARM_READ_ID):  # e038 / e045 likewise: the reads' folders (triangulate)
+    for rid in (ax.HUB_READ_ID, ax.TRIANGULATION_ID, ax.ARM_READ_ID,    # e038 / e045 likewise: the reads' folders (triangulate)
+                ax.NANO_READ_ID, ax.NANO_RELAY_ID, ax.NANO_COMPARATOR_ID):  # e046-e048: the nano battery's folders
         assert {i for i in ids_here if i[:4] == rid[:4]} == {rid}
     assert all(a.features is None and not a.reading and not a.date for a in ax.CONNECTOR_ARMS[:10])
     assert {a.date for a in hub} == {"2026-10-07"}
     assert not set(ax.CONNECTOR_IDS) & set(ax.SEQUENCE_IDS)
+    assert sx.NANO_COMPARATOR_ID[:4] not in {i[:4] for i in sx.SEQUENCE_IDS}            # Sana's e014: no sequence arm takes it
     assert ax.CONNECTOR_STEPS * ax.CONNECTOR_BATCH == 5 * 576 and ax.CONNECTOR_SAVE_EVERY * ax.CONNECTOR_BATCH == 576
     assert ax.connector_lrs("trained", 4096) == {"W": 1e-3 / 4096, "b": 1e-3}          # the fan-in rule (e013, e014)
     assert ax.connector_lrs("onehot", 3) == {"W": 1e-3, "b": 1e-3}

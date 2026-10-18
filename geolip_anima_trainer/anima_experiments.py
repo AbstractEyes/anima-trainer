@@ -1588,6 +1588,15 @@ TRIANGULATION_ID = "e038_beatrix_dual_extraction_read"
 # written by alephllm_diffusion.triangulate.arm_read (the same repo): the dual-extraction read's gauges on her Qwen tokenizer arm
 # (a surface arm: she reads Qwen3's spelling of a text as she reads its own bytes), mounted; a read of her states, no pictures
 ARM_READ_ID = "e045_beatrix_qwen_arm_read"
+# written by alephllm_diffusion.nano (the same repo): the four nano v1.1 bodies (each version and each untrained birth) on the
+# dual-extraction read's rows and gauges, their stacks and hubs, and each reader's own mood axis; a read of states, no pictures
+NANO_READ_ID = "e046_nano_dual_extraction_read"
+# written by alephllm_diffusion.nano (the same repo): the relay in pictures over whole captions, Qwen3's final states replaced by
+# a reader's mapped states (Qwen3, Beatrix 3s, the nano bodies, a token lookup as the floor)
+NANO_RELAY_ID = "e047_nano_relay_in_pictures"
+# written by alephllm_diffusion.nano (the same repo): the uniform comparator, fixed mood directions from this model's own prepared
+# conditioning with each reader setting only the amount (Qwen3, Beatrix 3s, the nano bodies)
+NANO_COMPARATOR_ID = "e048_nano_uniform_comparator"
 HUB_FEATURES = {r: f"beatrix/mood_phrases_{r.replace('/', '-')}_mini-beatrix-3_step245674.safetensors"
                 for r in ("close/stream/18", "close/hub/22", "close/both/18", "close/stream/20",
                           "frame/qwen3-arm/20")}                                                     # in the data repo

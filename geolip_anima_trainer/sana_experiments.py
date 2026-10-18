@@ -92,6 +92,9 @@ SEQUENCE: list[ArmSpec] = [
             question="On a second draw of images: how does the effect depend on the learning rate?"),
 ]
 SEQUENCE_IDS = [a.id for a in SEQUENCE]
+# written by alephllm_diffusion.nano (github AbstractEyes/alephllm-diffusion-experiments): the uniform comparator on this bed's
+# flavor direction, each reader (Qwen3, Beatrix 3s, the nano bodies) setting only the amount
+NANO_COMPARATOR_ID = "e014_nano_uniform_comparator"
 # each arm's role inside its draw of training images: (flavor, learning rate)
 DRAW_ROLES = {"up": ("up", 1e-4), "neutral": ("neutral", 1e-4), "down": ("down", 1e-4),
               "lr_half": ("up", 5e-5), "lr_double": ("up", 2e-4)}
