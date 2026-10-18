@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "geolip-anima-trainer"
-version = "0.3.0"
+version = "0.4.0"
 description = "Bridge + orchestration to finetune CircleStone Anima (2B DiT) with tdrussell/diffusion-pipe, and Sana with the AbstractEyes fork."
 readme = "README.md"
 requires-python = ">=3.12"

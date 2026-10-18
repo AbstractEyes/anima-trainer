@@ -527,7 +527,8 @@ def test_connector_registry_and_rules():
     assert ax.HUB_READ_ID in ax.HUB_READ
     for rid in (ax.HUB_READ_ID, ax.TRIANGULATION_ID, ax.ARM_READ_ID,    # e038 / e045 likewise: the reads' folders (triangulate)
                 ax.NANO_READ_ID, ax.NANO_RELAY_ID, ax.NANO_COMPARATOR_ID,   # e046-e049: the nano battery's folders
-                ax.NANO_RELAY_TRAINED_ID, ax.CP_TEST_ID, ax.CPS_TEST_ID):   # e050-e051: the counterpoint pairs
+                ax.NANO_RELAY_TRAINED_ID, ax.CP_TEST_ID, ax.CPS_TEST_ID,     # e050-e052: the counterpoint pairs
+                ax.CPG_TEST_ID):
         assert {i for i in ids_here if i[:4] == rid[:4]} == {rid}
     assert all(a.features is None and not a.reading and not a.date for a in ax.CONNECTOR_ARMS[:10])
     assert {a.date for a in hub} == {"2026-10-07"}
@@ -1795,6 +1796,7 @@ def test_counterpoint_words_end_to_end(runner, fake_hub, tmp_path, monkeypatch, 
             tid, sd, ci = im.getpixel((0, 0))
             v = np.full(len(tags), 0.5)
             v[[index[r] for r in ax.CP_RATINGS]] = (0.9, 0.05, 0.05, 0.05)
+            v[[index[t] for t in ax.AGE_TAGS]] = 0.01                 # the age screen passes every picture
             tag = cp_tags[tid - 1] if tid else None
             if tag and tag != "skinny":
                 v[index[tag]] = 0.95
@@ -1939,6 +1941,7 @@ def test_counterpoint_sliders_end_to_end(runner, fake_hub, tmp_path, monkeypatch
             w = im.getpixel((1, 0))[0] / 100
             v = np.full(len(tags), 0.5)
             v[[index[r] for r in ax.CP_RATINGS]] = (0.9, 0.05, 0.05, 0.05)
+            v[[index[t] for t in ax.AGE_TAGS]] = 0.01                 # the age screen passes every picture
             tag = cp_tags[tid - 1] if tid else None
             if tag:
                 pair = next(k for k in ax.CP_DEFAULT if tag in ax.CP_PAIRS[k][:2])
@@ -1981,3 +1984,147 @@ def test_counterpoint_sliders_end_to_end(runner, fake_hub, tmp_path, monkeypatch
     out = capsys.readouterr().out
     assert "416 already drawn (26 sets from AbstractPhil/geolip-beatrix-anima-data), 0 to draw" in out
     assert len(drawn) == 424 + 8 and meta["result"]["pictures"]["drawn"] == 0 and len(fake_hub.commits) == 26
+
+
+# ---- e052: the readers set the counterpoint sliders' amount, on the second bed --------------------------------------
+def test_reader_design_is_the_registered_one():
+    rows = ax.cpg_rows()
+    assert len(rows) == 103 and not any(ax.cpg_leaks().values())
+    assert sum(r["split"] == "train" for r in rows) == 72 and sum(r["split"] == "unseen" for r in rows) == 24
+    assert rows[0]["frame"] == ax.PREFIX + "1girl, solo, upper body, blonde hair."
+    assert ax.CPG_GRID[0] == -1.5 and ax.CPG_GRID[-1] == 1.5 and len(ax.CPG_GRID) == 13 and len(ax.CPG_NEW) == 6
+    assert [ax.cpg_grid(x) for x in (0.12, 0.13, -0.86, 2.7, -9.0)] == [0.0, 0.25, -0.75, 1.5, -1.5]
+    plans = ax.cpg_plans()
+    assert len(plans) == 44 and list(plans)[:5] == list(ax.CPG_GATE)
+    assert sum(1 for n in plans if ax.cpg_first_bed(n)) == 26
+    assert ax.cpg_first_bed("cps2_blonde-hair_upper-body_x0.25") is None
+    assert ax.cpg_first_bed("cps2_smile_upper-body_x1.5") == "cps_smile_upper-body_x1.5"
+    assert ax.cpg_set_of("expression", -1.0) == "cp2_frown_upper-body" and ax.cpg_set_of("expression", 0.75) == \
+        "cps2_smile_upper-body_x0.75"
+    one, two = ax.cp_items("blonde hair", "upper body"), ax.cp_items("blonde hair", "upper body", 2)
+    assert [a == b for a, b in zip(one, two)] == [i not in (6, 7) for i in range(16)]   # only the fourth character changed
+    assert "evening gown" in two[6]["prompt"] and two[6]["negative"].endswith(", " + ax.AGE_GUARD)
+    assert "negative" not in two[0] and two[6]["caption"] == ax.cp_prompt(None, "upper body", 3, 2)
+    s = ax.cps_items("hair_colour", 0.25, bed=2)[7]
+    assert s["mix_weight"] == 0.25 and "negative" in s and "blonde hair" in s["mix_prompt"]
+    tags = ax.cp_judge_tags(list(ax.CP_DEFAULT))
+    index = {t: i for i, t in enumerate(tags)}
+    p = np.full((3, len(tags)), 0.01)
+    p[:, [index[r] for r in ax.CP_RATINGS]] = (0.9, 0.05, 0.03, 0.02)
+    p[1, index["child"]], p[2, index["questionable"]] = 0.3, 0.99
+    ratings, ages, held = ax.cp_screen(p, index)
+    assert held == [1, 2] and ratings[2] == "questionable" and ages[1] == pytest.approx(0.3)
+    readme = ax.render_readers_readme({"status": "running", "pairs": list(ax.CPG_PAIRS)}, {"model": "Anima"})
+    assert "fixed before the run" in readme and "evening gown" in readme and "flaxen hair" in readme
+    for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable"):
+        assert word not in readme
+
+
+def test_reader_marks():
+    k = "hair_colour"
+    noise = [0.05 * (i % 4) for i in range(16)]
+    scores = {k: {g: [6.0 * g + n for n in noise] for g in ax.CPG_GRID}}
+    P = ax.CPG_PHRASES[k]
+    words = P["train+"] + P["train-"] + P["unseen+"] + P["unseen-"] + P["descriptive"]
+
+    def amounts(f):
+        return {w: f(w) for w in words}
+
+    sign = {w: (1 if w in P["unseen+"] else -1) for w in P["unseen+"] + P["unseen-"]}
+    readers = {k: {"qwen": amounts(lambda w: 0.9 * sign.get(w, 0) + (0.1 * P["descriptive"].index(w) if w in P["descriptive"]
+                                                                       else 0)),
+                   "q0": amounts(lambda w: 0.05),
+                   "nano": amounts(lambda w: -0.9 * sign.get(w, 0)),
+                   "stack": amounts(lambda w: 0.9 if w in P["unseen+"] else 0.0)}}
+    r = ax.cpg_reads(scores, readers, [k])[k]
+    out = {n: v["OUTCOME"] for n, v in r["readers"].items()}
+    assert out == {"qwen": "CARRIES THE PAIR", "q0": "DOES NOT CARRY IT", "nano": "DOES NOT CARRY IT",
+                   "stack": "CARRIES ONE SIDE"}
+    assert r["readers"]["qwen"]["graded"] is True and r["readers"]["q0"]["graded"] is False
+    assert r["readers"]["qwen"]["words"]["flaxen hair"]["grid"] == 1.0 and r["controls_carrying"] == []
+    assert r["readers"]["stack"]["sides"] == {"+": 4, "-": 0}
+
+
+def test_counterpoint_readers_end_to_end(runner, fake_hub, tmp_path, monkeypatch, capsys):
+    """The counterpoint and slider runs fill the first bed; the readers' run reuses its pictures for the seven kept
+    characters, draws the new character (with the age guard in its negative prompt) and the quarter steps once, and reads
+    each reader's amounts on the grid: the right-signed reader carries every pair, the zero and wrong-signed ones none."""
+    from PIL import Image
+    s, repo, pipe, calls = runner
+    s.cfg.data_repo_id = "AbstractPhil/geolip-beatrix-anima-data"
+    tags = ax.cp_judge_tags(list(ax.CP_DEFAULT))
+    cp_tags = [t for k in ax.CP_PAIRS for t in ax.CP_PAIRS[k][:2] if t]
+    index = {t: i for i, t in enumerate(tags)}
+    outfits = [o for o, _ in ax.CHARACTERS] + [ax.CHARACTERS_BED2[3][0]]
+    drawn, negs = [], []
+
+    def tag_of(p):
+        part = p.split(", ")[6]
+        return part if part in cp_tags else None
+
+    def render(prompts, seeds, mix_prompts=None, mix_weights=None, negative=None, **kw):
+        out = []
+        for j, (p, sd) in enumerate(zip(prompts, seeds)):
+            tag, w = (tag_of(mix_prompts[j]), float(mix_weights[j])) if mix_prompts else (tag_of(p), 1.0)
+            ci = next(i for i, o in enumerate(outfits) if o in p)
+            im = Image.new("RGB", (8, 8), (cp_tags.index(tag) + 1 if tag else 0, sd, ci))
+            im.putpixel((1, 0), (int(round(100 * w)) if tag else 0, 0, 0))
+            out.append(im)
+            drawn.append(p)
+            negs.append(negative)
+        return out
+
+    def probs(imgs):
+        rows = []
+        for im in imgs:
+            tid, sd, ci = im.getpixel((0, 0))
+            w = im.getpixel((1, 0))[0] / 100
+            v = np.full(len(tags), 0.5)
+            v[[index[r] for r in ax.CP_RATINGS]] = (0.9, 0.05, 0.05, 0.05)
+            v[[index[t] for t in ax.AGE_TAGS]] = 0.01
+            tag = cp_tags[tid - 1] if tid else None
+            if tag:
+                pair = next(k for k in ax.CP_DEFAULT if tag in ax.CP_PAIRS[k][:2])
+                other = [t for t in ax.CP_PAIRS[pair][:2] if t != tag][0] if ax.CP_PAIRS[pair][1] else None
+                z = w + 0.01 * (sd % 7)
+                v[index[tag]] = 1 / (1 + np.exp(-3 * z))
+                if other:
+                    v[index[other]] = 1 / (1 + np.exp(3 * z))
+            rows.append(v)
+        return np.array(rows)
+
+    monkeypatch.setattr(s, "_render", render)
+    monkeypatch.setattr(s, "_cp_judges", lambda k: (probs, index, list(tags), {t.replace(" ", "_"): 1000 for t in tags}))
+    monkeypatch.setattr(s, "_judge", lambda: None)
+    s.run_counterpoint_words()
+    s.run_counterpoint_sliders()
+    n_before = len(drawn)
+    readers = {"pairs": {}, "reading": {}, "source": "a test"}
+    for k in ax.CPG_PAIRS:
+        P = ax.CPG_PHRASES[k]
+        words = P["train+"] + P["train-"] + P["unseen+"] + P["unseen-"] + P["descriptive"]
+        sign = {w: 1 if w in P["train+"] + P["unseen+"] else -1 if w in P["train-"] + P["unseen-"] else 0 for w in words}
+        readers["pairs"][k] = {"qwen": {w: 0.8 * sign[w] for w in words}, "q0": {w: 0.0 for w in words},
+                               "nano": {w: -0.6 * sign[w] for w in words}}
+        readers["reading"][k] = {r: {"loo_train": 24, "unseen_sides": 8, "unseen_sep": 1.6} for r in readers["pairs"][k]}
+    meta = s.run_counterpoint_readers(readers)
+    r = meta["result"]
+    assert meta["status"] == "done" and r["gate"]["passed"] and r["gate"]["pictures"] == 10
+    assert r["pictures"] == {"total": 704, "drawn": 340, "reused": 364, "from_first_bed": 364}
+    assert len(drawn) - n_before == 340
+    new = [n for p, n in zip(drawn[n_before:], negs[n_before:]) if "evening gown" in p]
+    assert len(new) == 52 + 36 and all(n and n.endswith(ax.AGE_GUARD) for n in new)
+    assert all(n is None for p, n in zip(drawn[n_before:], negs[n_before:]) if "evening gown" not in p)
+    for k in ax.CPG_PAIRS:
+        out = {n: v["OUTCOME"] for n, v in r["readers"][k]["readers"].items()}
+        assert out == {"qwen": "CARRIES THE PAIR", "q0": "DOES NOT CARRY IT", "nano": "DOES NOT CARRY IT"}, (k, out)
+    assert r["slider"]["hair_colour"]["dial"]["OUTCOME"] == "A DIAL"
+    base = f"experiments/{ax.CPG_TEST_ID}"
+    for f in ["meta.json", "README.md", "result.json", "readers.json", "tagger_probs.npz"] + \
+             [f"sheet_{x}_{k}.jpg" for x in ("grid", "readers") for k in ax.CPG_PAIRS]:
+        assert f"{base}/{f}" in repo.files_, f
+    readme = repo.files_[f"{base}/README.md"].decode()
+    assert "**CARRIES THE PAIR**" in readme and "passed" in readme
+    assert len(json.loads(repo.files_[f"{base}/result.json"])["cells"]) == 16
+    assert any(f.startswith("sets/cps2_blonde-hair_upper-body_x0.25-") for f in fake_hub.files_) if hasattr(
+        fake_hub, "files_") else True

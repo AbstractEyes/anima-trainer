@@ -150,6 +150,60 @@ def download_set(token: "str | None", repo_id: str, root: "str | Path", render: 
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def find_folders(token: "str | None", repo_id: str, name: str) -> list[str]:
+    """Every folder of the data repo holding a set of this name (sets/<name>-<key>), whatever its key."""
+    files = _retry(lambda: _api(token).list_repo_files(repo_id, repo_type="dataset"), f"list {repo_id}")
+    return sorted({f.rsplit("/", 1)[0] for f in files if f.startswith(f"sets/{name}-") and f.endswith("/render.json")})
+
+
+def download_folder(token: "str | None", repo_id: str, folder: str, root: "str | Path") -> Path:
+    """A set folder as it is on the Hub (no check: a later step decides which of its pictures to use) into root."""
+    from huggingface_hub import snapshot_download
+    root = Path(root)
+    tmp = root.parent / f".pull_{root.name}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        _retry(lambda: snapshot_download(repo_id, repo_type="dataset", allow_patterns=[f"{folder}/*"],
+                                         local_dir=str(tmp), token=token or None), f"download {folder}")
+        (root / "images").mkdir(parents=True, exist_ok=True)
+        src = tmp / folder
+        for f in (src / "images").iterdir():
+            if f.is_file():
+                os.replace(f, root / "images" / f.name)
+        for name in ("items.jsonl", "render.json"):
+            if (src / name).is_file():
+                os.replace(src / name, root / name)
+        return root
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def reuse_identical(src: "str | Path", dst: "str | Path", items: list[dict], render: dict) -> list[str]:
+    """Copy into dst/images the pictures of `items` that the set at src holds drawn the same way: its render.json's
+    settings equal `render` and its items.jsonl lists the identical item (every field), with the image and the caption
+    file present and the caption as listed. Pictures already in dst stay. Returns the names copied."""
+    src, dst = Path(src), Path(dst)
+    try:
+        meta = json.loads((src / "render.json").read_text(encoding="utf-8"))
+        have = {it["name"]: it for it in read_items(src)}
+    except (OSError, ValueError):
+        return []
+    if meta.get("render") != render:
+        return []
+    (dst / "images").mkdir(parents=True, exist_ok=True)
+    done = []
+    missing = set(missing_images(dst, items))
+    for it in items:
+        n = it["name"]
+        png, txt = src / "images" / f"{n}.png", src / "images" / f"{n}.txt"
+        if n in missing and have.get(n) == it and png.is_file() and txt.is_file() \
+                and txt.read_text(encoding="utf-8") == it["caption"]:
+            shutil.copyfile(png, dst / "images" / f"{n}.png")
+            shutil.copyfile(txt, dst / "images" / f"{n}.txt")
+            done.append(n)
+    return done
+
+
 def upload_local_sets(runner, repo_id: str = DATA_REPO, *, token: "str | None" = None) -> dict:
     """Every complete set under the runner's datasets/ folder, uploaded unless the Hub has it (a set still being
     drawn is reported and skipped: run this again once it is complete). Returns {set: hub folder | status}."""

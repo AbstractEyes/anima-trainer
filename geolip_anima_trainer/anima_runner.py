@@ -699,8 +699,9 @@ class AnimaRunner(_sr.SanaRunner):
         return self._pipe
 
     def _render(self, prompts: list[str], seeds: list[int], **kw) -> list:
+        negative = kw.pop("negative", None) or self.NEGATIVE          # a set item may carry its own (e052's age guard)
         return self._eval_pipe().generate(prompts, seeds, res=self._need("resolution"), steps=self.GEN_STEPS,
-                                          cfg=self.GEN_CFG, shift=self.GEN_SHIFT, negative=self.NEGATIVE,
+                                          cfg=self.GEN_CFG, shift=self.GEN_SHIFT, negative=negative,
                                           batch=self.cfg.gen_batch, **kw)
 
     # ---- the training config ----------------------------------------------------------------------
@@ -2013,15 +2014,22 @@ class AnimaRunner(_sr.SanaRunner):
         todo = [it for it in items if it["name"] in gaps]
         if todo:
             self._assert_stock()
-            for i in range(0, len(todo), self.cfg.gen_batch):
-                chunk = todo[i:i + self.cfg.gen_batch]
-                kw = ({"mix_prompts": [c["mix_prompt"] for c in chunk], "mix_weights": [c["mix_weight"] for c in chunk]}
-                      if "mix_prompt" in chunk[0] else {})              # a slider set (e051): the mix of two prompts
-                for it, img in zip(chunk, self._render([c["prompt"] for c in chunk], [c["seed"] for c in chunk], **kw)):
-                    img.save(img_dir / f"{it['name']}.png")
-                    (img_dir / f"{it['name']}.txt").write_text(it["caption"], encoding="utf-8")
-                if eta is not None:
-                    eta.add(len(chunk))
+            groups: dict = {}
+            for it in todo:                                           # one negative prompt per batch (e052's age guard)
+                groups.setdefault(it.get("negative"), []).append(it)
+            for negative, group in groups.items():
+                for i in range(0, len(group), self.cfg.gen_batch):
+                    chunk = group[i:i + self.cfg.gen_batch]
+                    kw = ({"mix_prompts": [c["mix_prompt"] for c in chunk], "mix_weights": [c["mix_weight"] for c in chunk]}
+                          if "mix_prompt" in chunk[0] else {})          # a slider set (e051): the mix of two prompts
+                    if negative:
+                        kw["negative"] = negative
+                    for it, img in zip(chunk, self._render([c["prompt"] for c in chunk], [c["seed"] for c in chunk],
+                                                           **kw)):
+                        img.save(img_dir / f"{it['name']}.png")
+                        (img_dir / f"{it['name']}.txt").write_text(it["caption"], encoding="utf-8")
+                    if eta is not None:
+                        eta.add(len(chunk))
         if todo or not (root / "sheet.jpg").is_file():
             from PIL import Image
             ims = [Image.open(img_dir / f"{it['name']}.png") for it in items]
@@ -2091,25 +2099,26 @@ class AnimaRunner(_sr.SanaRunner):
         pair_defs = {k: ax.CP_PAIRS[k][:2] for k in keys}
         e012_defs = {a: (p, m) for a, (p, m, _) in ax.ATTRIBUTES.items()}
         rcols = [index[r] for r in ax.CP_RATINGS]
-        judge, judge12, feats, probs, rating, origin, kept = {}, {}, {}, {}, {}, {}, {}
+        judge, judge12, feats, probs, rating, origin, kept, held_sets = {}, {}, {}, {}, {}, {}, {}, {}
         for n, items in plans.items():
             drawn = self._cp_draw(n, items, eta)
             root = self._cp_root(n)
             imgs = [Image.open(root / "images" / f"{it['name']}.png").convert("RGB") for it in items]
             p = probs_fn(imgs)
             probs[n] = p.astype(np.float16)
-            rating[n] = [ax.CP_RATINGS[int(i)] for i in np.argmax(p[:, rcols], axis=1)]
+            rating[n], _, held_n = ax.cp_screen(p, index)
             judge[n] = self._cp_scores(p, index, pair_defs)
             judge12[n] = self._cp_scores(p, index, e012_defs)
             feats[n], _ = self._score(imgs)
             origin[n] = ("drawn" if drawn == len(items) else f"{drawn} drawn, {len(items) - drawn} on this runtime"
                          if drawn else "data repo" if n in pulled else "this runtime")
-            bad = [it["name"] for it, r in zip(items, rating[n]) if r in ax.CP_WITHHELD]
+            bad = [items[i]["name"] for i in held_n]
+            held_sets[n] = set(held_n)
             if bad:
                 (root / "withheld.json").write_text(json.dumps({"withheld": bad, "ratings": rating[n]}), encoding="utf-8")
                 kept[n] = None
-                print(f"[{self.TAG}] e050 {n}: the judge rates {len(bad)} picture(s) questionable or explicit: left off "
-                      "the sheets; this set stays out of the data repo", flush=True)
+                print(f"[{self.TAG}] e050 {n}: the judge rates {len(bad)} picture(s) questionable or explicit, or reads them "
+                      f"as a child above {ax.AGE_BAR}: left off the sheets; this set stays out of the data repo", flush=True)
             else:
                 (root / "withheld.json").unlink(missing_ok=True)
                 kept[n] = self._cp_push(n, items)
@@ -2125,7 +2134,7 @@ class AnimaRunner(_sr.SanaRunner):
                                         for s, n in (("+", hi), ("-", lo)) if n}
             reads[a]["posts"] = {t: counts.get(t.replace(" ", "_")) for t in ax.CP_PAIRS[a][:2] if t}
         side = self._cp_side_by_side(judge12)
-        withheld = {n: {i for i, r in enumerate(rating[n]) if r in ax.CP_WITHHELD} for n in plans}
+        withheld = {n: held_sets.get(n, set()) for n in plans}
 
         def tile(n, i):
             if i in withheld[n]:
@@ -2234,20 +2243,19 @@ class AnimaRunner(_sr.SanaRunner):
         root = self._cp_root(name)
         imgs = [Image.open(root / "images" / f"{it['name']}.png").convert("RGB") for it in items]
         p = probs_fn(imgs)
-        ratings = [ax.CP_RATINGS[int(i)] for i in np.argmax(p[:, [index[r] for r in ax.CP_RATINGS]], axis=1)]
-        held = [i for i, r in enumerate(ratings) if r in ax.CP_WITHHELD]
+        ratings, ages, held = ax.cp_screen(p, index)
         if held:
             (root / "withheld.json").write_text(json.dumps({"withheld": [items[i]["name"] for i in held],
-                                                            "ratings": ratings}), encoding="utf-8")
+                                                            "ratings": ratings, "age": ages}), encoding="utf-8")
             kept = None
-            print(f"[{self.TAG}] {name}: the judge rates {len(held)} picture(s) questionable or explicit: left off the "
-                  "sheets; this set stays out of the data repo", flush=True)
+            print(f"[{self.TAG}] {name}: the judge rates {len(held)} picture(s) questionable or explicit, or reads them as a "
+                  f"child above {ax.AGE_BAR}: left off the sheets; this set stays out of the data repo", flush=True)
         else:
             (root / "withheld.json").unlink(missing_ok=True)
             kept = self._cp_push(name, items)
         feats, _ = self._score(imgs)
-        return {"drawn": drawn, "probs": p.astype(np.float16), "ratings": ratings, "withheld": held, "kept": kept,
-                "scores": self._cp_scores(p, index, defs), "feats": feats}
+        return {"drawn": drawn, "probs": p.astype(np.float16), "ratings": ratings, "age": ages, "withheld": held,
+                "kept": kept, "scores": self._cp_scores(p, index, defs), "feats": feats}
 
     def _counterpoint_sliders(self, keys: list[str], out_dir: Path) -> dict:
         import numpy as np
@@ -2321,6 +2329,188 @@ class AnimaRunner(_sr.SanaRunner):
                 "cells": [{"character": ax.CHARACTERS[ci][0], "seed": sd,
                            **{f"{k}@{a:+g}": {b: scores[k][a][b][j] for b in judged}
                               for k in keys for a in ax.cps_amounts(k)}}
+                          for j, (ci, sd) in enumerate(ax.attr_cells())]}
+
+    # ---- e052: text readers set the counterpoint sliders' amount, on the second bed -------------------------------------
+    def prefetch_first_bed(self) -> dict:
+        """The first bed's counterpoint sets as kept in the data repo (cfg.data_repo_id, else the default; the fourth
+        character removed) into this runtime's datasets/, so the second bed reuses their pictures instead of drawing them.
+        Needs the network (no token for a public repo); a set already here is left as it is. Returns {set: pictures}."""
+        repo = getattr(self.cfg, "data_repo_id", None) or _ts.DATA_REPO
+        token = self.state.get("hf_token")
+        files = _ts._retry(lambda: _ts._api(token).list_repo_files(repo, repo_type="dataset"), f"list {repo}")
+        out = {}
+        for name in ax.cpg_plans():
+            first = ax.cpg_first_bed(name)
+            if not first or first in out:
+                continue
+            root = self._cp_root(first)
+            if not (root / "render.json").is_file():
+                folders = sorted({f.rsplit("/", 1)[0] for f in files
+                                  if f.startswith(f"sets/{first}-") and f.endswith("/render.json")})
+                if len(folders) != 1:
+                    raise RuntimeError(f"{first}: {len(folders)} folders in {repo} ({folders}); expected one")
+                _ts.download_folder(token, repo, folders[0], root)
+            out[first] = len(list((root / "images").glob("*.png")))
+            print(f"[{self.TAG}] first bed {first}: {out[first]} pictures here", flush=True)
+        return out
+
+    def run_counterpoint_readers(self, readers: "str | Path | dict", *, force: bool = False) -> dict:
+        """e052 into its own folder of cfg.repo_id: text readers set the amount of e051's sliders from wordings they never
+        trained on, on the second bed (the fourth character replaced, its pictures drawn with the age guard). readers =
+        readers.json from the reading step ({"pairs": {pair: {reader: {wording: amount}}}, "reading": {pair: {reader:
+        marks}}, ...}) or its path. The pictures: every quarter step of each slider on 16 cells (shared by every reader);
+        the first bed's pictures reused where the second bed draws them the same way (prefetch_first_bed() first); the new
+        character's hardest pictures judged first (the gate). Skipped when done already (force=True reruns the reads)."""
+        R = readers if isinstance(readers, dict) else json.loads(Path(readers).read_text(encoding="utf-8"))
+        keys = list(ax.CPG_PAIRS)
+        missing = [k for k in keys if k not in R.get("pairs", {})]
+        if missing:
+            raise ValueError(f"the readers file has no amounts for {missing}")
+        self._need_model()
+        _drop_torchao()
+        repo = self._experiments_repo()
+        metas = repo.metas()
+        try:
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        eid = ax.CPG_TEST_ID
+        prev = metas.get(eid, {})
+        if prev.get("status") == "done" and not force:
+            print(f"[{self.TAG}] {eid} is done already (force=True reruns it)", flush=True)
+            return prev
+        base = f"experiments/{eid}"
+        recipe = self._cp_recipe()
+        recipe["slider"] = ("v(plain) + |amount| (v(tag of the amount's side) - v(plain)) on the conditional branch at every "
+                            "step; the negative branch and the guidance scale unchanged")
+        recipe["characters"] = ("the eight of the counterpoint pairs with the fourth replaced (evening gown / ballroom); its "
+                                f"pictures add \"{ax.AGE_GUARD}\" to the negative prompt")
+        recipe["readers"] = R.get("source", "readers.json")
+        meta = {"id": eid, "title": ax.CPG_TEST_TITLE, "date": ax.CPG_DATE, "kind": "counterpoint_readers",
+                "status": "running", "pairs": keys, "recipe": recipe}
+        repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                     f"{base}/README.md": ax.render_readers_readme(meta, recipe)}, f"{eid}: started (README)")
+        out_dir = Path(self._need("data_root")) / "experiments" / eid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "readers.json").write_text(json.dumps(R, indent=1), encoding="utf-8")
+        t0 = time.time()
+        try:
+            result = self._counterpoint_readers(keys, R, out_dir)
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                                            f"{base}/README.md": ax.render_readers_readme(meta, recipe)},
+                                           f"{eid}: failed"))
+            raise
+        summary = "; ".join(f"{k}: " + ", ".join(f"{r} {v['OUTCOME'].lower()}" for r, v in result["readers"][k]["readers"].items())
+                            for k in keys)
+        meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
+                    seconds=round(time.time() - t0), finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
+        files = {f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_readers_readme(meta, recipe),
+                 f"{base}/result.json": out_dir / "result.json", f"{base}/readers.json": out_dir / "readers.json",
+                 f"{base}/tagger_probs.npz": out_dir / "tagger_probs.npz"}
+        for f in sorted(out_dir.glob("sheet_*.jpg")):
+            files[f"{base}/{f.name}"] = f
+        repo.commit(files, f"{eid}: result")
+        metas[eid] = meta
+        self._safe(lambda: self._publish_index(repo, metas))
+        print(f"[{self.TAG}] {eid} done in {_sr._hms(meta['seconds'])}", flush=True)
+        for k in keys:
+            for r, v in result["readers"][k]["readers"].items():
+                print(f"[{self.TAG}]   {k:13s} {r:18s} + {v['sides']['+']}/4  - {v['sides']['-']}/4  {v['OUTCOME']}", flush=True)
+        return meta
+
+    def _counterpoint_readers(self, keys: list[str], R: dict, out_dir: Path) -> dict:
+        import numpy as np
+        from PIL import Image, ImageDraw
+        judged = list(ax.CP_DEFAULT)
+        probs_fn, index, names, counts = self._cp_judges(judged)        # both judges before any picture
+        self._judge()
+        defs = {k: ax.CP_PAIRS[k][:2] for k in judged}
+        plans = ax.cpg_plans()
+        render = _ts.render_spec_of(self)
+        pulled = {n for n, items in plans.items() if self._cp_pull(n, items)}
+        reused = {}
+        for n, items in plans.items():
+            first = ax.cpg_first_bed(n)
+            if n not in pulled and first and (self._cp_root(first) / "render.json").is_file():
+                reused[n] = _ts.reuse_identical(self._cp_root(first), self._cp_root(n), items, render)
+        need = sum(len(_ts.missing_images(self._cp_root(n), items)) for n, items in plans.items())
+        total = sum(len(items) for items in plans.values())
+        n_reused = sum(len(v) for v in reused.values())
+        print(f"[{self.TAG}] e052: {len(plans)} sets x {len(ax.attr_cells())} cells = {total} pictures; {n_reused} reused from "
+              f"the first bed, {len(pulled)} sets from the data repo, {total - need - n_reused} already on this runtime; "
+              f"{need} to draw", flush=True)
+        eta = _sr._Eta(self.TAG, "e052 drawing", need) if need else None
+        res = {}
+
+        def pass_(n):
+            res[n] = self._cp_pass(n, plans[n], eta, (probs_fn, index), defs)
+            d = res[n]["drawn"]
+            res[n]["from"] = ("drawn" if d == len(plans[n]) else
+                              f"{d} drawn, {len(reused.get(n, []))} from the first bed" if d else
+                              "data repo" if n in pulled else "first bed" if reused.get(n) else "this runtime")
+            print(f"[{self.TAG}] e052 {n} ({res[n]['from']}; highest age read {max(res[n]['age']):.2f})", flush=True)
+
+        guarded = [(n, i) for n in ax.CPG_GATE for i, it in enumerate(plans[n]) if "negative" in it]
+        for n in ax.CPG_GATE:                                       # the gate: the new character's hardest pictures first
+            pass_(n)
+        ages = [res[n]["age"][i] for n, i in guarded]
+        ratings = [res[n]["ratings"][i] for n, i in guarded]
+        gate = {"pictures": len(guarded), "max_age": float(max(ages)), "ages": [float(a) for a in ages],
+                "ratings": {r: ratings.count(r) for r in ax.CP_RATINGS},
+                "passed": bool(max(ages) <= ax.AGE_BAR and all(r in ("general", "sensitive") for r in ratings))}
+        (out_dir / "gate.json").write_text(json.dumps(gate, indent=1), encoding="utf-8")
+        print(f"[{self.TAG}] e052 THE GATE ({len(guarded)} pictures of the new character): highest age read "
+              f"{gate['max_age']:.3f} (bar {ax.AGE_BAR}), ratings {gate['ratings']}: "
+              f"{'PASSED' if gate['passed'] else 'FAILED'}", flush=True)
+        if not gate["passed"]:
+            raise RuntimeError(f"the new character's gate failed ({gate}); nothing else drawn")
+        for n in plans:
+            if n not in res:
+                pass_(n)
+        self._assert_stock()
+
+        def bed2(tag, f):
+            return ax.cp_set_name(tag, f, ax.CPG_BED)
+
+        spans = {}
+        for b in judged:
+            plus, minus, f = ax.CP_PAIRS[b]
+            hi, lo = bed2(plus, f), bed2(minus, f) if minus else bed2(None, f)
+            spans[b] = float(np.mean(np.subtract(res[hi]["scores"][b], res[lo]["scores"][b])))
+        full = {k: {g: {b: res[ax.cpg_set_of(k, g)]["scores"][b] for b in judged} for g in ax.CPG_GRID} for k in keys}
+        slider = ax.cps_reads(full, spans, keys)
+        own = {k: {g: full[k][g][k] for g in ax.CPG_GRID} for k in keys}
+        reads = ax.cpg_reads(own, {k: R["pairs"][k] for k in keys}, keys)
+
+        def tile(n, i):
+            if i in res[n]["withheld"]:
+                im = Image.new("RGB", (256, 256), (128, 128, 128))
+                ImageDraw.Draw(im).text((88, 120), "withheld", fill=(255, 255, 255))
+                return im
+            return Image.open(self._cp_root(n) / "images" / f"{plans[n][i]['name']}.png").convert("RGB")
+
+        first = [i for i, (_, sd) in enumerate(ax.attr_cells()) if sd == ax.ATTR_SEEDS[0]]
+        for k in keys:
+            _grid([[tile(ax.cpg_set_of(k, g), i) for g in ax.CPG_GRID] for i in first], out_dir / f"sheet_grid_{k}.jpg",
+                  tile=192)
+            words = list(ax.CPG_PHRASES[k]["unseen+"]) + list(ax.CPG_PHRASES[k]["unseen-"])
+            _grid([[tile(ax.cpg_set_of(k, ax.cpg_grid(R["pairs"][k][r][w])), 0) for w in words] for r in R["pairs"][k]],
+                  out_dir / f"sheet_readers_{k}.jpg", tile=192)
+        drawn = [n for n in plans if res[n]["drawn"]]
+        np.savez_compressed(out_dir / "tagger_probs.npz", tags=np.array(names), **{n: res[n]["probs"] for n in drawn})
+        return {"readers": reads, "reading": R.get("reading", {}), "picks": R.get("picks", {}), "slider": slider,
+                "spans": spans, "gate": gate,
+                "pictures": {"total": total, "drawn": need, "reused": total - need, "from_first_bed": n_reused},
+                "sets": {n: {"from": res[n]["from"], "data_repo_folder": res[n]["kept"],
+                             "ratings": {r: res[n]["ratings"].count(r) for r in ax.CP_RATINGS},
+                             "max_age": float(max(res[n]["age"]))} for n in plans},
+                "withheld": {n: [plans[n][i]["name"] for i in r["withheld"]] for n, r in res.items() if r["withheld"]},
+                "cells": [{"character": ax.CHARACTERS_BED2[ci][0], "seed": sd,
+                           **{f"{k}@{g:+g}": {b: full[k][g][b][j] for b in judged} for k in keys for g in ax.CPG_GRID}}
                           for j, (ci, sd) in enumerate(ax.attr_cells())]}
 
     # ---- e013-e015: Beatrix as a second conditioning source (a learned push after the adapter) ----------------

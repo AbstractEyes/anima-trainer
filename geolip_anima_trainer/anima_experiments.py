@@ -261,6 +261,15 @@ CHARACTERS = (                                  # adult-coded outfits and settin
     ("knit cardigan", "library"),
 )
 CHARACTER_TEMPLATE = PREFIX + "1girl, solo, {tag}upper body, {outfit}, {setting}."
+# The second bed (2026-10-18): the fourth character replaced, since the first bed's sundress / flower garden came out younger
+# than the others at one of its seeds (an image tagger read several of its pictures as a child). Every picture of the new
+# character carries an age guard in its negative prompt; the other seven keep the card's negative, so their pictures are the
+# first bed's, byte for byte.
+CHARACTERS_BED2 = CHARACTERS[:3] + (("evening gown", "ballroom"),) + CHARACTERS[4:]
+BED2_GUARDED = (3,)
+AGE_GUARD = "child, loli, aged down"
+AGE_TAGS = ("child", "loli", "aged down")     # the judge's own tags: a picture above AGE_BAR on any is withheld
+AGE_BAR = 0.2
 # key: (+ tag, - tag or None = the neutral prompt, slider strengths). Age stays adult: pushed upward only.
 ATTRIBUTES = {
     "hair_length": ("very long hair", "short hair", (-2.0, 2.0)),
@@ -2191,21 +2200,29 @@ def cp_slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
-def cp_set_name(tag: "str | None", framing: str) -> str:
-    """The name of one tag's set (None: the plain prompt) at one framing, over the 16 cells."""
-    return f"cp_{cp_slug(tag) if tag else 'plain'}_{cp_slug(framing)}"
+def cp_set_name(tag: "str | None", framing: str, bed: int = 1) -> str:
+    """The name of one tag's set (None: the plain prompt) at one framing, over the 16 cells (the second bed's: cp2_...)."""
+    return f"cp{'' if bed == 1 else bed}_{cp_slug(tag) if tag else 'plain'}_{cp_slug(framing)}"
 
 
-def cp_prompt(tag: "str | None", framing: str, ci: int) -> str:
-    outfit, setting = CHARACTERS[ci]
+def cp_prompt(tag: "str | None", framing: str, ci: int, bed: int = 1) -> str:
+    outfit, setting = (CHARACTERS if bed == 1 else CHARACTERS_BED2)[ci]
     return CP_TEMPLATE.format(tag=f"{tag}, " if tag else "", framing=framing, outfit=outfit, setting=setting)
 
 
-def cp_items(tag: "str | None", framing: str) -> list[dict]:
-    """One set in the data repo's set format: per cell its name, seed, prompt and caption. The caption is the plain
-    prompt, so the tag lives only in the picture and the set can train a slider on its attribute later."""
-    return [{"name": f"{ci:02d}_{sd}", "seed": sd, "prompt": cp_prompt(tag, framing, ci),
-             "caption": cp_prompt(None, framing, ci)} for ci, sd in attr_cells()]
+def cp_guard(item: dict, ci: int, bed: int) -> dict:
+    """The second bed's age guard: the guarded character's pictures are drawn with it added to the negative prompt."""
+    if bed != 1 and ci in BED2_GUARDED:
+        item["negative"] = NEGATIVE + ", " + AGE_GUARD
+    return item
+
+
+def cp_items(tag: "str | None", framing: str, bed: int = 1) -> list[dict]:
+    """One set in the data repo's set format: per cell its name, seed, prompt and caption (and, for a guarded character
+    of the second bed, its negative prompt). The caption is the plain prompt, so the tag lives only in the picture and
+    the set can train a slider on its attribute later."""
+    return [cp_guard({"name": f"{ci:02d}_{sd}", "seed": sd, "prompt": cp_prompt(tag, framing, ci, bed),
+                      "caption": cp_prompt(None, framing, ci, bed)}, ci, bed) for ci, sd in attr_cells()]
 
 
 def cp_pairs(keys=None) -> list[str]:
@@ -2244,7 +2261,17 @@ def cp_judge_tags(keys: list[str]) -> list[str]:
     """Every tag the judge must have: the pairs', the earlier screen's (for the side-by-side read) and the ratings."""
     tags = [t for k in keys for t in CP_PAIRS[k][:2] if t]
     tags += [t for p, m, _ in ATTRIBUTES.values() for t in (p, m) if t]
-    return list(dict.fromkeys(tags + list(CP_RATINGS)))
+    return list(dict.fromkeys(tags + list(CP_RATINGS) + list(AGE_TAGS)))
+
+
+def cp_screen(p, index: dict) -> tuple:
+    """The content screen on the judge's probabilities [n pictures, tags]: (each picture's rating, its highest read on
+    AGE_TAGS, the pictures withheld: rated questionable or explicit, or an age read above AGE_BAR)."""
+    import numpy as np
+    ratings = [CP_RATINGS[int(i)] for i in np.argmax(p[:, [index[r] for r in CP_RATINGS]], axis=1)]
+    ages = [float(x) for x in np.asarray(p[:, [index[t] for t in AGE_TAGS]], dtype=float).max(1)]
+    held = [i for i, (r, a) in enumerate(zip(ratings, ages)) if r in CP_WITHHELD or a > AGE_BAR]
+    return ratings, ages, held
 
 
 def cp_reads(judge: dict, keys: list[str]) -> dict:
@@ -2463,22 +2490,23 @@ def cps_side_tag(key: str, amount: float) -> "str | None":
     return None if amount == 0 else plus if amount > 0 else minus
 
 
-def cps_cached(key: str, amount: float) -> "str | None":
+def cps_cached(key: str, amount: float, bed: int = 1) -> "str | None":
     """The counterpoint set an amount of 0 or +-1 is (the plain prompt, the tag itself); None for one the slider draws."""
-    return cp_set_name(cps_side_tag(key, amount), CP_PAIRS[key][2]) if amount in (-1.0, 0.0, 1.0) else None
+    return cp_set_name(cps_side_tag(key, amount), CP_PAIRS[key][2], bed) if amount in (-1.0, 0.0, 1.0) else None
 
 
-def cps_set_name(key: str, amount: float) -> str:
+def cps_set_name(key: str, amount: float, bed: int = 1) -> str:
     """A drawn slider set's name: the side's tag, the framing and the amount (x0.5 half way to the tag, x1.5 past it)."""
-    return f"cps_{cp_slug(cps_side_tag(key, amount))}_{cp_slug(CP_PAIRS[key][2])}_x{abs(amount):g}"
+    return f"cps{'' if bed == 1 else bed}_{cp_slug(cps_side_tag(key, amount))}_{cp_slug(CP_PAIRS[key][2])}_x{abs(amount):g}"
 
 
-def cps_items(key: str, amount: float, cells=None) -> list[dict]:
+def cps_items(key: str, amount: float, cells=None, bed: int = 1) -> list[dict]:
     """A slider set in the data repo's set format: per cell the plain prompt (also its caption), the side's tag prompt
     and the amount: the conditional prediction moved from the plain prompt's toward the tag prompt's by it."""
     tag, f = cps_side_tag(key, amount), CP_PAIRS[key][2]
-    return [{"name": f"{ci:02d}_{sd}", "seed": sd, "prompt": cp_prompt(None, f, ci), "caption": cp_prompt(None, f, ci),
-             "mix_prompt": cp_prompt(tag, f, ci), "mix_weight": abs(amount)}
+    return [cp_guard({"name": f"{ci:02d}_{sd}", "seed": sd, "prompt": cp_prompt(None, f, ci, bed),
+                      "caption": cp_prompt(None, f, ci, bed), "mix_prompt": cp_prompt(tag, f, ci, bed),
+                      "mix_weight": abs(amount)}, ci, bed)
             for ci, sd in (attr_cells() if cells is None else cells)]
 
 
@@ -2603,6 +2631,260 @@ def render_slider_readme(meta: dict, recipe: dict) -> str:
     out += ["## Files",
             "- `result.json`: every cell's scores at every amount on every judged pair, the reads, the parity read, where "
             "each set came from and where it is kept.",
+            "- `tagger_probs.npz`: every drawn picture's probability for each of the judge's tags (float16, one array per set).",
+            "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
+    return "\n".join(out)
+
+
+# ---- e052: text readers set the counterpoint sliders' amount, on the second bed --------------------------------------------
+CPG_TEST_ID = "e052_anima_counterpoint_readers"
+CPG_TEST_TITLE = ("The stock model: text readers set the counterpoint sliders' amount from wordings they never trained on "
+                  "(Qwen3, Beatrix, the nano bodies)")
+CPG_DATE = "2026-10-18"
+CPG_PAIRS = ("hair_colour", "expression", "eye_openness")       # e051's sliders
+CPG_BED = 2
+CPG_GRID = tuple(x / 4 for x in range(-6, 7))                  # -1.5 .. 1.5 in quarter steps: every amount lands on one
+CPG_NEW = tuple(a for a in CPG_GRID if a not in CPS_AMOUNTS)   # the quarter steps e051 did not draw
+CPG_READ_FORM = PREFIX + "1girl, solo, upper body, {w}."        # the frame a reader reads a wording in (its closing full stop)
+CPG_READERS = ("qwen", "q0", "beatrix", "beatrix_untrained", "nano", "stack", "birth")
+CPG_CONTROLS = ("q0", "beatrix_untrained", "birth")
+CPG_SIDE_MIN = 3                                                # of the 4 unseen wordings of a side: the reader carries it
+CPG_GATE = ("cp2_plain_upper-body", "cp2_plain_full-body", "cp2_skinny_full-body", "cps2_wide-eyed_upper-body_x1.5",
+            "cps2_frown_upper-body_x1.5")                     # the guarded character's hardest pictures, judged first
+_HAIR = " hair"
+CPG_PHRASES = {
+    "hair_colour": {
+        "train+": tuple(w + _HAIR for w in ("blonde", "golden", "yellow", "light blonde", "platinum blonde", "honey blonde",
+                                            "sandy blonde", "pale blonde", "bright blonde", "ash blonde", "golden blonde",
+                                            "silky blonde")),
+        "train-": tuple(w + _HAIR for w in ("black", "jet black", "raven", "dark", "ebony", "coal black", "inky black",
+                                            "pitch black", "deep black", "glossy black", "blue-black", "midnight black")),
+        "unseen+": tuple(w + _HAIR for w in ("flaxen", "straw-coloured", "wheat-coloured", "fair")),
+        "unseen-": tuple(w + _HAIR for w in ("sable", "onyx", "obsidian", "soot-coloured")),
+        "descriptive": ("dark brown hair", "brown hair", "light brown hair")},
+    "expression": {
+        "train+": ("smile", "smiling", "a smile", "a big smile", "a warm smile", "a bright smile", "a happy smile",
+                   "a gentle smile", "grinning", "a grin", "beaming", "smiling happily"),
+        "train-": ("frown", "frowning", "a frown", "a deep frown", "a stern frown", "an angry frown", "scowling", "a scowl",
+                   "glaring", "a glare", "frowning angrily", "an irritated frown"),
+        "unseen+": ("a joyful expression", "a delighted face", "a pleased look", "a radiant expression"),
+        "unseen-": ("a sullen expression", "a displeased face", "a sour look", "a disapproving expression"),
+        "descriptive": ("a neutral expression", "a calm face")},
+    "eye_openness": {
+        "train+": ("wide-eyed", "wide eyes", "wide open eyes", "eyes wide open", "big wide eyes", "eyes opened wide",
+                   "staring wide-eyed", "round wide eyes", "fully open eyes", "large open eyes", "bright wide eyes",
+                   "eyes wide"),
+        "train-": ("half-closed eyes", "half-lidded eyes", "sleepy eyes", "drowsy eyes", "heavy-lidded eyes", "droopy eyes",
+                   "eyes half shut", "half-open eyes", "tired eyes", "eyes half closed", "sleepy half-closed eyes",
+                   "heavy eyelids"),
+        "unseen+": ("saucer eyes", "goggling eyes", "eyes like saucers", "unblinking eyes"),
+        "unseen-": ("bedroom eyes", "dozy eyes", "slumberous eyes", "languid eyes"),
+        "descriptive": ("relaxed eyes", "calm eyes")},
+}
+CPG_GRADED = {"hair_colour": ("dark brown hair", "brown hair", "light brown hair")}   # expected in this order (descriptive)
+CPG_SHARED_WORDS = frozenset({"a", "an", "hair", "eyes"})        # the words every wording of a pair may share
+CPG_REFERENCES = CPS_REFERENCES + (
+    ("Bolukbasi, Chang, Zou, Saligrama, Kalai, \"Man is to Computer Programmer as Woman is to Homemaker? Debiasing Word "
+     "Embeddings\" (NeurIPS 2016; a direction in a text model's states from paired wordings)",
+     "https://arxiv.org/abs/1607.06520"),)
+
+
+def cpg_rows(keys=None) -> list[dict]:
+    """Every wording the readers read, in a fixed order: per pair its training wordings (+ then -), the unseen ones (+ then
+    -) and the descriptive ones; each {pair, split ('train' / 'unseen' / 'descriptive'), side (+1 / -1 / 0), text, frame}."""
+    out = []
+    for k in (CPG_PAIRS if keys is None else keys):
+        P = CPG_PHRASES[k]
+        for split, side, group in (("train", 1, "train+"), ("train", -1, "train-"), ("unseen", 1, "unseen+"),
+                                   ("unseen", -1, "unseen-"), ("descriptive", 0, "descriptive")):
+            out += [{"pair": k, "split": split, "side": side, "text": w, "frame": CPG_READ_FORM.format(w=w)}
+                    for w in P[group]]
+    return out
+
+
+def cpg_words(text: str) -> set:
+    import re
+    return {w for w in re.split(r"[\s\-]+", text.lower()) if w and w not in CPG_SHARED_WORDS}
+
+
+def cpg_leaks() -> dict:
+    """{pair: [unseen wordings sharing a word with that pair's training wordings]}; fixed before the run: none may."""
+    out = {}
+    for k, P in CPG_PHRASES.items():
+        train = set().union(*(cpg_words(w) for w in P["train+"] + P["train-"]))
+        out[k] = [w for w in P["unseen+"] + P["unseen-"] if cpg_words(w) & train]
+    return out
+
+
+def cpg_grid(a: float) -> float:
+    """A reader's amount on the picture grid: the nearest quarter step, clipped to the range the slider was measured on."""
+    return float(min(max(round(float(a) * 4) / 4, CPG_GRID[0]), CPG_GRID[-1]))
+
+
+def cpg_set_of(key: str, amount: float) -> str:
+    """The second bed's set a pair's grid amount is (0 and +-1: the counterpoint sets themselves; the rest slider sets)."""
+    return cps_cached(key, amount, CPG_BED) or cps_set_name(key, amount, CPG_BED)
+
+
+def cpg_plans(keys=None) -> dict:
+    """{set name: items} the run draws or reuses, in drawing order: the gate's sets first, then every set of the
+    counterpoint pairs and sliders on the second bed (the dataset brought up to date), then the quarter steps."""
+    keys = list(CPG_PAIRS if keys is None else keys)
+    plans = {}
+    for t, f in cp_sets(list(CP_DEFAULT)).values():
+        plans[cp_set_name(t, f, CPG_BED)] = cp_items(t, f, CPG_BED)
+    for k, a in cps_sets(list(CPS_PAIRS)).values():
+        plans[cps_set_name(k, a, CPG_BED)] = cps_items(k, a, bed=CPG_BED)
+    for k in keys:
+        for a in CPG_NEW:
+            plans[cps_set_name(k, a, CPG_BED)] = cps_items(k, a, bed=CPG_BED)
+    first = [n for n in CPG_GATE if n in plans]
+    return {n: plans[n] for n in first + [n for n in plans if n not in first]}
+
+
+def cpg_first_bed(name: str) -> "str | None":
+    """The first bed's set a second-bed set reuses its unchanged pictures from (None for a quarter step: never drawn)."""
+    for p2, p1 in (("cps2_", "cps_"), ("cp2_", "cp_")):
+        if name.startswith(p2):
+            first = p1 + name[len(p2):]
+            return None if first.startswith("cps_") and not any(first.endswith(f"_x{abs(a):g}") for a in (0.5, 1.5)) \
+                else first
+    return None
+
+
+def cpg_reads(scores: dict, readers: dict, keys=None) -> dict:
+    """The picture marks fixed before the run. scores = {pair: {grid amount: [the pair's own score per cell]}}; readers = {pair: {reader:
+    {wording: its amount}}}. Per reader and pair: each unseen wording's pictures (the grid amount nearest its reading)
+    against the plain prompt's under the words rule in the wording's direction; a side carried at CPG_SIDE_MIN of its 4;
+    the pair when both sides are. The controls must carry no pair. The graded order and the descriptive amounts beside."""
+    import numpy as np
+    out = {}
+    for k in (CPG_PAIRS if keys is None else keys):
+        P = CPG_PHRASES[k]
+        plain = np.asarray(scores[k][0.0], dtype=float)
+        per = {}
+        for r, amounts in readers[k].items():
+            words = {}
+            for side, group in ((1, "unseen+"), (-1, "unseen-")):
+                for w in P[group]:
+                    g = cpg_grid(amounts[w])
+                    res = flavor_outcome(list(np.asarray(scores[k][g], dtype=float) - plain), side, label="CARRIES IT")
+                    words[w] = {"side": side, "a": float(amounts[w]), "grid": g, **res}
+            sides = {s: sum(1 for v in words.values() if v["side"] == sv and v["OUTCOME"] == "CARRIES IT")
+                     for s, sv in (("+", 1), ("-", -1))}
+            carried = {s: n >= CPG_SIDE_MIN for s, n in sides.items()}
+            graded = None
+            if k in CPG_GRADED:
+                seq = [float(amounts[w]) for w in CPG_GRADED[k]]
+                graded = all(x < y for x, y in zip(seq, seq[1:]))
+            per[r] = {"words": words, "sides": sides, "carried": carried, "graded": graded,
+                      "descriptive": {w: float(amounts[w]) for w in P["descriptive"]},
+                      "OUTCOME": ("CARRIES THE PAIR" if all(carried.values()) else
+                                  "CARRIES ONE SIDE" if any(carried.values()) else "DOES NOT CARRY IT")}
+        out[k] = {"readers": per, "controls_carrying": [r for r in CPG_CONTROLS if r in per
+                                                        and per[r]["OUTCOME"] == "CARRIES THE PAIR"]}
+    return out
+
+
+CPG_NAMES = {"qwen": "Qwen3 0.6B, final state (Anima's own text encoder: the positive control)",
+             "q0": "Qwen3's token layer (the lookup: a control)",
+             "beatrix": "Beatrix 3s, block 20",
+             "beatrix_untrained": "Beatrix's architecture untrained (a control that must fail)",
+             "nano": "the best nano body tap (picked on the training wordings)",
+             "stack": "the four nano bodies side by side (picked on the training wordings)",
+             "birth": "the picked nano body at birth (a control that must fail)"}
+
+
+def render_readers_readme(meta: dict, recipe: dict) -> str:
+    """e052's README: why, the design and the rule fixed before the run, and the result when done."""
+    keys = meta.get("pairs") or list(CPG_PAIRS)
+    res = meta.get("result") or {}
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    refs = "\n".join(f"- {t}: {u}" for t, u in CPG_REFERENCES)
+    words = "\n".join(f"| {k} | {', '.join(CPG_PHRASES[k]['unseen+'])} | {', '.join(CPG_PHRASES[k]['unseen-'])} | "
+                      f"{len(CPG_PHRASES[k]['train+'])} + {len(CPG_PHRASES[k]['train-'])} |" for k in keys)
+    out = [f"# {CPG_TEST_ID}: {CPG_TEST_TITLE}", "",
+           f"Date: {CPG_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Why",
+           f"{CPS_TEST_ID} built a slider between each pair's booru tags from the model's own predictions: hair colour, "
+           "expression and eye openness move smoothly with the amount. A text model can set that amount from a wording: if "
+           "its states for 'golden hair' sit near those for 'blonde hair' and far from 'black hair', the amount it reads for a "
+           "wording it never saw puts the picture on the right side. This experiment asks which text models can: Anima's own "
+           "encoder (Qwen3, which reads Danbooru-style prompts), a byte-level language model (Beatrix) and four small byte "
+           "models (the nano bodies), each beside a control that must fail.", "",
+           "## Design",
+           "- **The characters (updated)**: the eight characters of the earlier pairs with the fourth replaced (evening gown / "
+           "ballroom in place of sundress / flower garden, which came out younger than the others at one seed); every picture "
+           f"of the new character adds \"{AGE_GUARD}\" to the negative prompt. The other seven characters' pictures are the "
+           "earlier experiments' own, reused. Every picture is screened: rated questionable or explicit, or read by the tagger "
+           f"as {', '.join(AGE_TAGS)} above {AGE_BAR}, it is withheld (off the sheets, its set out of the data repo).",
+           f"- **The readers' wordings** (read in the frame `{CPG_READ_FORM.format(w='<wording>')}`, at its closing full "
+           "stop): per pair 12 training wordings a side and 4 unseen a side (no unseen wording shares a word with that pair's "
+           "training wordings), plus a few descriptive ones read but never trained:", "",
+           "| pair | unseen + | unseen - | training (+ / -) |", "|---|---|---|---|", words, "",
+           "- **The reading** (a difference-of-means axis, the same for every reader): a = (f - m) . u / (u . u / 2), with f "
+           "the reader's state standardized per feature over the pair's 24 training wordings, u the + training centre minus "
+           "the - one and m their midpoint, so the training centres sit at +1 and -1, the tags' own level on the slider. A "
+           "training wording is read with itself left out.",
+           "- **The readers**: " + "; ".join(f"{v}" for v in CPG_NAMES.values()) + ".",
+           f"- **The pictures**: the slider of {CPS_TEST_ID} at the reader's amount, rounded to a quarter step and clipped to "
+           "[-1.5, 1.5]. Every quarter step from -1.5 to 1.5 is drawn once on the 16 cells, so every reader's amount is a "
+           "picture already drawn.", "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           "**The reading** (no pictures): the training wordings on their side when each is left out (of 24), the unseen "
+           "wordings on their side (of 8), the separation (the mean amount of the + unseen wordings minus the - ones). **The "
+           "pictures**: per unseen wording, its pictures against the plain prompt's on the 16 cells, read in the wording's "
+           "direction: CARRIES IT when the mean moves that way, at least 12 of the 16 cells move that way and the mean is "
+           f"beyond 3 standard errors. A reader carries a side when at least {CPG_SIDE_MIN} of its 4 unseen wordings carry it, "
+           "and the pair when it carries both sides. The controls must carry no pair; a pair a control carries is credited "
+           "to no reader's training. Descriptive: the hair-colour browns in order (dark brown below brown below light brown).",
+           ""]
+    if meta.get("status") == "done":
+        r = res.get("readers") or {}
+        R = res.get("reading") or {}
+        out += ["## Result", meta.get("summary", ""), ""]
+        for k in keys:
+            if k not in r:
+                continue
+            out += [f"### {k.replace('_', ' ')}", "",
+                    "| reader | training wordings on their side (left out) | unseen on their side | separation | + side "
+                    "carried | - side carried | outcome |", "|---|---|---|---|---|---|---|"]
+            for rd, v in r[k]["readers"].items():
+                q = (R.get(k) or {}).get(rd) or {}
+                out.append(f"| {CPG_NAMES.get(rd, rd)} | {q.get('loo_train', '')} of 24 | {q.get('unseen_sides', '')} of 8 | "
+                           f"{q.get('unseen_sep', float('nan')):+.2f} | {v['sides']['+']} of 4 | {v['sides']['-']} of 4 | "
+                           f"**{v['OUTCOME']}** |")
+            ctl = r[k]["controls_carrying"]
+            out += ["", ("No control carries this pair." if not ctl else
+                         f"A control carries this pair ({', '.join(ctl)}): no reader's result on it is credited to training."),
+                    ""]
+        sl = res.get("slider") or {}
+        if sl:
+            out += ["The slider on the updated characters at quarter steps (the earlier experiment's own marks): "
+                    + "; ".join(f"{k}: slope {v['dial']['mean']:+.2f} per unit, {v['OUTCOME']}" for k, v in sl.items()) + ".", ""]
+        gate = res.get("gate") or {}
+        if gate:
+            out += [f"The new character's gate (its hardest pictures, judged before the rest): the highest age read "
+                    f"{gate.get('max_age', 0):.2f} against {AGE_BAR}; {'passed' if gate.get('passed') else 'FAILED'}.", ""]
+        held = res.get("withheld") or {}
+        out += [("No picture was withheld." if not held else
+                 "Withheld (off the sheets, the set out of the data repo): "
+                 + "; ".join(f"{n}: {', '.join(v)}" for n, v in held.items()) + "."), ""]
+        pics = res.get("pictures") or {}
+        if pics:
+            out += [f"Pictures: {pics.get('total')} read, {pics.get('drawn')} drawn in this run, {pics.get('reused')} reused.", ""]
+        out += ["Sheets: `sheet_grid_<pair>.jpg` (the slider at every quarter step from -1.5 to 1.5; the eight characters "
+                "at the first seed, the new one fourth); `sheet_readers_<pair>.jpg` (rows: the readers in the order of the "
+                "table; columns: the 8 unseen wordings, + then -; the first character at the first seed).", ""]
+        out += [f"![{k}](sheet_readers_{k}.jpg)" for k in keys if k in r] + [""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    else:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files",
+            "- `readers.json`: every reader's amount for every wording, the taps picked and the reading marks.",
+            "- `result.json`: every cell's score at every grid amount, the marks, the gate, where each set came from.",
             "- `tagger_probs.npz`: every drawn picture's probability for each of the judge's tags (float16, one array per set).",
             "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
     return "\n".join(out)

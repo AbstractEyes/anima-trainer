@@ -209,7 +209,10 @@ cache → two-phase train):
   — e050 on **Anima**: booru counterpoint pairs (hair colour, eye colour, body size, expression, eye
   openness; more on request) drawn on the stock model and judged by an anime tagger: does each tag move its
   own attribute, and what else does it move? Then e051: a slider between each pair's tags from the model's
-  own predictions. Every drawn set is kept in
+  own predictions. Then e052 (run locally): text models (Qwen3, Beatrix, the nano bodies) set each slider's
+  amount from wordings they never trained on, on an updated set of characters (one replaced; its pictures drawn
+  with an age guard in the negative prompt; every picture screened by the tagger's ratings and age tags). Every
+  drawn set is kept in
   [AbstractPhil/geolip-beatrix-anima-data](https://huggingface.co/datasets/AbstractPhil/geolip-beatrix-anima-data)
   and reused instead of drawn again.
 

@@ -129,11 +129,18 @@ the runner's release tag, then `setup()` → `run_counterpoint_words()`.
   moving another pair's score by more than a third of that pair's span).
 - **Kept and reused:** every set uploads to the data repo as soon as it is drawn (`sets/cp_<tag>_<framing>-<key>/`, the
   training-set format of `training_sets.py`, captioned with the plain prompt) and comes back instead of being drawn
-  again. The tagger's ratings screen every picture: a set with a picture rated questionable or explicit stays local and
-  off the sheets.
+  again. The tagger screens every picture: a set with a picture rated questionable or explicit, or read as child, loli
+  or aged down above 0.2, stays local and off the sheets.
 - **Step 4, the sliders (e051, `run_counterpoint_sliders`):** for the pairs that passed (hair colour, expression, eye
   openness; body size one way toward plump) a slider from the model's own predictions, v(plain) + amount (v(tag) -
   v(plain)) at every sampling step (`AnimaPipe.generate(mix_prompts=, mix_weights=)`); amounts -1.5 to +1.5, the
   amounts 0 and +-1 being step 3's own pictures from the data repo, so only 224 new pictures are drawn (kept as
   `sets/cps_*`). Read: the slope as a dial, the half amount between the ends (graded) or not (a switch), past the tag,
   and the pull on the other attributes. The launch point is v0.3.0.
+- **Step 5, the readers (e052, `run_counterpoint_readers(readers)`; run locally first):** text models set each slider's
+  amount from wordings they never trained on (12 training and 4 unseen wordings a side per pair, one difference-of-means
+  reading for every model); the pictures are the slider at every quarter step from -1.5 to 1.5, drawn once and shared by
+  every reader. It runs on the updated characters (`cp2_*` / `cps2_*` sets: the fourth character replaced, its
+  pictures drawn with "child, loli, aged down" added to the negative prompt; the other seven characters' pictures are
+  the earlier sets', reused through `prefetch_first_bed()`). The readers' amounts come from a separate reading step
+  (`readers.json`); the notebook never runs the text models.
