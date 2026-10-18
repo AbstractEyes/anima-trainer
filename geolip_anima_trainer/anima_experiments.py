@@ -1597,6 +1597,9 @@ NANO_RELAY_ID = "e047_nano_relay_in_pictures"
 # written by alephllm_diffusion.nano (the same repo): the uniform comparator, fixed mood directions from this model's own prepared
 # conditioning with each reader setting only the amount (Qwen3, Beatrix 3s, the nano bodies)
 NANO_COMPARATOR_ID = "e048_nano_uniform_comparator"
+# written by alephllm_diffusion.nano (the same repo): the trained relay, a ridge-born connector per reader taught through this
+# model's frozen text adapter to reproduce the context Qwen3's own states give, then the relay's pictures (connectors shipped)
+NANO_RELAY_TRAINED_ID = "e049_nano_trained_relay"
 HUB_FEATURES = {r: f"beatrix/mood_phrases_{r.replace('/', '-')}_mini-beatrix-3_step245674.safetensors"
                 for r in ("close/stream/18", "close/hub/22", "close/both/18", "close/stream/20",
                           "frame/qwen3-arm/20")}                                                     # in the data repo

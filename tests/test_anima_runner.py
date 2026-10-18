@@ -526,7 +526,8 @@ def test_connector_registry_and_rules():
     ids_here |= set(ax.CONNECTOR_IDS) | set(ax.SEQUENCE_IDS)
     assert ax.HUB_READ_ID in ax.HUB_READ
     for rid in (ax.HUB_READ_ID, ax.TRIANGULATION_ID, ax.ARM_READ_ID,    # e038 / e045 likewise: the reads' folders (triangulate)
-                ax.NANO_READ_ID, ax.NANO_RELAY_ID, ax.NANO_COMPARATOR_ID):  # e046-e048: the nano battery's folders
+                ax.NANO_READ_ID, ax.NANO_RELAY_ID, ax.NANO_COMPARATOR_ID,   # e046-e049: the nano battery's folders
+                ax.NANO_RELAY_TRAINED_ID):
         assert {i for i in ids_here if i[:4] == rid[:4]} == {rid}
     assert all(a.features is None and not a.reading and not a.date for a in ax.CONNECTOR_ARMS[:10])
     assert {a.date for a in hub} == {"2026-10-07"}
