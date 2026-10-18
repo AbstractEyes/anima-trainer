@@ -2384,8 +2384,8 @@ class AnimaRunner(_sr.SanaRunner):
         recipe = self._cp_recipe()
         recipe["slider"] = ("v(plain) + |amount| (v(tag of the amount's side) - v(plain)) on the conditional branch at every "
                             "step; the negative branch and the guidance scale unchanged")
-        recipe["characters"] = ("the eight of the counterpoint pairs with the fourth replaced (evening gown / ballroom); its "
-                                f"pictures add \"{ax.AGE_GUARD}\" to the negative prompt")
+        recipe["characters"] = (f"the eight of the counterpoint pairs with the fourth replaced ({ax.BED2_FOURTH[0]} / "
+                                f"{ax.BED2_FOURTH[1]}); its pictures add \"{ax.AGE_GUARD}\" to the negative prompt")
         recipe["readers"] = R.get("source", "readers.json")
         meta = {"id": eid, "title": ax.CPG_TEST_TITLE, "date": ax.CPG_DATE, "kind": "counterpoint_readers",
                 "status": "running", "pairs": keys, "recipe": recipe}
@@ -2457,14 +2457,14 @@ class AnimaRunner(_sr.SanaRunner):
         guarded = [(n, i) for n in ax.CPG_GATE for i, it in enumerate(plans[n]) if "negative" in it]
         for n in ax.CPG_GATE:                                       # the gate: the new character's hardest pictures first
             pass_(n)
-        ages = [res[n]["age"][i] for n, i in guarded]
-        ratings = [res[n]["ratings"][i] for n, i in guarded]
-        gate = {"pictures": len(guarded), "max_age": float(max(ages)), "ages": [float(a) for a in ages],
-                "ratings": {r: ratings.count(r) for r in ax.CP_RATINGS},
-                "passed": bool(max(ages) <= ax.AGE_BAR and all(r in ("general", "sensitive") for r in ratings))}
+        gate = ax.cpg_gate([res[n]["age"][i] for n, i in guarded], [res[n]["ratings"][i] for n, i in guarded],
+                           [float(res[n]["probs"][i, index[ax.FRAME_TAG]]) for n, i in guarded])
+        gate["character"] = list(ax.BED2_FOURTH)
         (out_dir / "gate.json").write_text(json.dumps(gate, indent=1), encoding="utf-8")
-        print(f"[{self.TAG}] e052 THE GATE ({len(guarded)} pictures of the new character): highest age read "
-              f"{gate['max_age']:.3f} (bar {ax.AGE_BAR}), ratings {gate['ratings']}: "
+        print(f"[{self.TAG}] e052 THE GATE ({len(guarded)} pictures of the new character, {ax.BED2_FOURTH[0]} / "
+              f"{ax.BED2_FOURTH[1]}): highest age read {gate['max_age']:.3f} (bar {ax.AGE_BAR}), ratings {gate['ratings']} "
+              f"(sensitive at most {ax.CPG_GATE_SENSITIVE}), highest head-out-of-frame read "
+              f"{max(gate['head_out_of_frame']):.2f} (bar {ax.CPG_GATE_FRAME_BAR}): "
               f"{'PASSED' if gate['passed'] else 'FAILED'}", flush=True)
         if not gate["passed"]:
             raise RuntimeError(f"the new character's gate failed ({gate}); nothing else drawn")

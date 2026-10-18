@@ -141,6 +141,7 @@ the runner's release tag, then `setup()` → `run_counterpoint_words()`.
   amount from wordings they never trained on (12 training and 4 unseen wordings a side per pair, one difference-of-means
   reading for every model); the pictures are the slider at every quarter step from -1.5 to 1.5, drawn once and shared by
   every reader. It runs on the updated characters (`cp2_*` / `cps2_*` sets: the fourth character replaced, its
-  pictures drawn with "child, loli, aged down" added to the negative prompt; the other seven characters' pictures are
-  the earlier sets', reused through `prefetch_first_bed()`). The readers' amounts come from a separate reading step
+  pictures drawn with "child, loli, aged down" added to the negative prompt and checked first by a gate on its 10
+  hardest pictures: no age read above .2, none rated questionable or explicit, at most 5 rated sensitive, the face in
+  view; the other seven characters' pictures are the earlier sets', reused through `prefetch_first_bed()`). The readers' amounts come from a separate reading step
   (`readers.json`); the notebook never runs the text models.

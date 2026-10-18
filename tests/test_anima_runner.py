@@ -2003,7 +2003,8 @@ def test_reader_design_is_the_registered_one():
         "cps2_smile_upper-body_x0.75"
     one, two = ax.cp_items("blonde hair", "upper body"), ax.cp_items("blonde hair", "upper body", 2)
     assert [a == b for a, b in zip(one, two)] == [i not in (6, 7) for i in range(16)]   # only the fourth character changed
-    assert "evening gown" in two[6]["prompt"] and two[6]["negative"].endswith(", " + ax.AGE_GUARD)
+    assert ax.BED2_FOURTH[0] in two[6]["prompt"] and two[6]["negative"].endswith(", " + ax.AGE_GUARD)
+    assert "evening gown" not in two[6]["prompt"] and ax.FRAME_TAG in ax.cp_judge_tags(list(ax.CP_DEFAULT))
     assert "negative" not in two[0] and two[6]["caption"] == ax.cp_prompt(None, "upper body", 3, 2)
     s = ax.cps_items("hair_colour", 0.25, bed=2)[7]
     assert s["mix_weight"] == 0.25 and "negative" in s and "blonde hair" in s["mix_prompt"]
@@ -2015,9 +2016,21 @@ def test_reader_design_is_the_registered_one():
     ratings, ages, held = ax.cp_screen(p, index)
     assert held == [1, 2] and ratings[2] == "questionable" and ages[1] == pytest.approx(0.3)
     readme = ax.render_readers_readme({"status": "running", "pairs": list(ax.CPG_PAIRS)}, {"model": "Anima"})
-    assert "fixed before the run" in readme and "evening gown" in readme and "flaxen hair" in readme
+    assert "fixed before the run" in readme and ax.BED2_FOURTH[0] in readme and "flaxen hair" in readme
     for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable"):
         assert word not in readme
+
+
+def test_reader_gate():
+    """The new character's gate: the age bar, no questionable or explicit rating, at most CPG_GATE_SENSITIVE of the 10
+    rated sensitive, the face in view."""
+    ok = ax.cpg_gate([0.01] * 10, ["general"] * 5 + ["sensitive"] * 5, [0.0] * 10)
+    assert ok["passed"] and ok["ratings"]["sensitive"] == 5 and ok["pictures"] == 10
+    assert not ax.cpg_gate([0.01] * 10, ["general"] * 4 + ["sensitive"] * 6, [0.0] * 10)["passed"]   # the evening gown: 10 of 10
+    assert not ax.cpg_gate([0.01] * 9 + [0.21], ["general"] * 10, [0.0] * 10)["passed"]
+    assert not ax.cpg_gate([0.01] * 10, ["general"] * 9 + ["questionable"], [0.0] * 10)["passed"]
+    assert not ax.cpg_gate([0.01] * 10, ["general"] * 10, [0.0] * 9 + [0.6])["passed"]           # a face cropped out
+    assert ax.cpg_gate([0.01] * 10, ["general"] * 10, [0.0] * 9 + [0.5])["passed"]
 
 
 def test_reader_marks():
@@ -2082,6 +2095,7 @@ def test_counterpoint_readers_end_to_end(runner, fake_hub, tmp_path, monkeypatch
             v = np.full(len(tags), 0.5)
             v[[index[r] for r in ax.CP_RATINGS]] = (0.9, 0.05, 0.05, 0.05)
             v[[index[t] for t in ax.AGE_TAGS]] = 0.01
+            v[index[ax.FRAME_TAG]] = 0.01
             tag = cp_tags[tid - 1] if tid else None
             if tag:
                 pair = next(k for k in ax.CP_DEFAULT if tag in ax.CP_PAIRS[k][:2])
@@ -2110,11 +2124,12 @@ def test_counterpoint_readers_end_to_end(runner, fake_hub, tmp_path, monkeypatch
     meta = s.run_counterpoint_readers(readers)
     r = meta["result"]
     assert meta["status"] == "done" and r["gate"]["passed"] and r["gate"]["pictures"] == 10
+    assert r["gate"]["character"] == list(ax.BED2_FOURTH) and len(r["gate"]["head_out_of_frame"]) == 10
     assert r["pictures"] == {"total": 704, "drawn": 340, "reused": 364, "from_first_bed": 364}
     assert len(drawn) - n_before == 340
-    new = [n for p, n in zip(drawn[n_before:], negs[n_before:]) if "evening gown" in p]
+    new = [n for p, n in zip(drawn[n_before:], negs[n_before:]) if ax.BED2_FOURTH[0] in p]
     assert len(new) == 52 + 36 and all(n and n.endswith(ax.AGE_GUARD) for n in new)
-    assert all(n is None for p, n in zip(drawn[n_before:], negs[n_before:]) if "evening gown" not in p)
+    assert all(n is None for p, n in zip(drawn[n_before:], negs[n_before:]) if ax.BED2_FOURTH[0] not in p)
     for k in ax.CPG_PAIRS:
         out = {n: v["OUTCOME"] for n, v in r["readers"][k]["readers"].items()}
         assert out == {"qwen": "CARRIES THE PAIR", "q0": "DOES NOT CARRY IT", "nano": "DOES NOT CARRY IT"}, (k, out)

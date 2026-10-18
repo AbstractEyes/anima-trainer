@@ -264,12 +264,16 @@ CHARACTER_TEMPLATE = PREFIX + "1girl, solo, {tag}upper body, {outfit}, {setting}
 # The second bed (2026-10-18): the fourth character replaced, since the first bed's sundress / flower garden came out younger
 # than the others at one of its seeds (an image tagger read several of its pictures as a child). Every picture of the new
 # character carries an age guard in its negative prompt; the other seven keep the card's negative, so their pictures are the
-# first bed's, byte for byte.
-CHARACTERS_BED2 = CHARACTERS[:3] + (("evening gown", "ballroom"),) + CHARACTERS[4:]
+# first bed's, byte for byte. The new character came from a short screen of four candidates on the image tagger (none read as
+# a child or rated questionable or explicit, the face and the hair in view, the fewest rated sensitive), after a first pick
+# (an evening gown in a ballroom) came out framed on the chest.
+BED2_FOURTH = ("tuxedo", "jazz club")
+CHARACTERS_BED2 = CHARACTERS[:3] + (BED2_FOURTH,) + CHARACTERS[4:]
 BED2_GUARDED = (3,)
 AGE_GUARD = "child, loli, aged down"
 AGE_TAGS = ("child", "loli", "aged down")     # the judge's own tags: a picture above AGE_BAR on any is withheld
 AGE_BAR = 0.2
+FRAME_TAG = "head out of frame"               # the judge's own tag: the new character's gate needs the face in view
 # key: (+ tag, - tag or None = the neutral prompt, slider strengths). Age stays adult: pushed upward only.
 ATTRIBUTES = {
     "hair_length": ("very long hair", "short hair", (-2.0, 2.0)),
@@ -2258,10 +2262,11 @@ def cp_sides(key: str) -> "tuple[str, str | None, str]":
 
 
 def cp_judge_tags(keys: list[str]) -> list[str]:
-    """Every tag the judge must have: the pairs', the earlier screen's (for the side-by-side read) and the ratings."""
+    """Every tag the judge must have: the pairs', the earlier screen's (for the side-by-side read), the ratings, the age
+    tags and the framing tag."""
     tags = [t for k in keys for t in CP_PAIRS[k][:2] if t]
     tags += [t for p, m, _ in ATTRIBUTES.values() for t in (p, m) if t]
-    return list(dict.fromkeys(tags + list(CP_RATINGS) + list(AGE_TAGS)))
+    return list(dict.fromkeys(tags + list(CP_RATINGS) + list(AGE_TAGS) + [FRAME_TAG]))
 
 
 def cp_screen(p, index: dict) -> tuple:
@@ -2651,6 +2656,8 @@ CPG_CONTROLS = ("q0", "beatrix_untrained", "birth")
 CPG_SIDE_MIN = 3                                                # of the 4 unseen wordings of a side: the reader carries it
 CPG_GATE = ("cp2_plain_upper-body", "cp2_plain_full-body", "cp2_skinny_full-body", "cps2_wide-eyed_upper-body_x1.5",
             "cps2_frown_upper-body_x1.5")                     # the guarded character's hardest pictures, judged first
+CPG_GATE_SENSITIVE = 5            # of the gate's 10: at most this many rated sensitive (the first bed's characters: 2-73%)
+CPG_GATE_FRAME_BAR = 0.5          # and none read head out of frame above this
 _HAIR = " hair"
 CPG_PHRASES = {
     "hair_colour": {
@@ -2752,6 +2759,16 @@ def cpg_first_bed(name: str) -> "str | None":
     return None
 
 
+def cpg_gate(ages: list, ratings: list, frame: list) -> dict:
+    """The new character's gate on its hardest pictures (judged before any other is drawn): every age read at most AGE_BAR,
+    every rating general or sensitive, at most CPG_GATE_SENSITIVE rated sensitive and no head-out-of-frame read above
+    CPG_GATE_FRAME_BAR."""
+    return {"pictures": len(ages), "max_age": float(max(ages)), "ages": [float(a) for a in ages],
+            "ratings": {r: ratings.count(r) for r in CP_RATINGS}, "head_out_of_frame": [float(x) for x in frame],
+            "passed": bool(max(ages) <= AGE_BAR and all(r in ("general", "sensitive") for r in ratings)
+                           and ratings.count("sensitive") <= CPG_GATE_SENSITIVE and max(frame) <= CPG_GATE_FRAME_BAR)}
+
+
 def cpg_reads(scores: dict, readers: dict, keys=None) -> dict:
     """The picture marks fixed before the run. scores = {pair: {grid amount: [the pair's own score per cell]}}; readers = {pair: {reader:
     {wording: its amount}}}. Per reader and pair: each unseen wording's pictures (the grid amount nearest its reading)
@@ -2813,11 +2830,17 @@ def render_readers_readme(meta: dict, recipe: dict) -> str:
            "encoder (Qwen3, which reads Danbooru-style prompts), a byte-level language model (Beatrix) and four small byte "
            "models (the nano bodies), each beside a control that must fail.", "",
            "## Design",
-           "- **The characters (updated)**: the eight characters of the earlier pairs with the fourth replaced (evening gown / "
-           "ballroom in place of sundress / flower garden, which came out younger than the others at one seed); every picture "
-           f"of the new character adds \"{AGE_GUARD}\" to the negative prompt. The other seven characters' pictures are the "
-           "earlier experiments' own, reused. Every picture is screened: rated questionable or explicit, or read by the tagger "
-           f"as {', '.join(AGE_TAGS)} above {AGE_BAR}, it is withheld (off the sheets, its set out of the data repo).",
+           f"- **The characters (updated)**: the eight characters of the earlier pairs with the fourth replaced ({BED2_FOURTH[0]} "
+           f"/ {BED2_FOURTH[1]} in place of sundress / flower garden, which came out younger than the others at one seed); "
+           f"every picture of the new character adds \"{AGE_GUARD}\" to the negative prompt. The new character was picked by a "
+           "short screen of four candidates on the image tagger (none read as a child or rated questionable or explicit, the "
+           "face and the hair in view, the fewest rated sensitive) after a first pick, an evening gown in a ballroom, came out "
+           "framed on the chest (its pictures were never published). Its gate, judged before any other picture is drawn: its "
+           f"10 hardest pictures all under {AGE_BAR} on the age tags, none rated questionable or explicit, at most "
+           f"{CPG_GATE_SENSITIVE} rated sensitive, none read head out of frame above {CPG_GATE_FRAME_BAR}. The other seven "
+           "characters' pictures are the earlier experiments' own, reused. Every picture is screened: rated questionable or "
+           f"explicit, or read by the tagger as {', '.join(AGE_TAGS)} above {AGE_BAR}, it is withheld (off the sheets, its set "
+           "out of the data repo).",
            f"- **The readers' wordings** (read in the frame `{CPG_READ_FORM.format(w='<wording>')}`, at its closing full "
            "stop): per pair 12 training wordings a side and 4 unseen a side (no unseen wording shares a word with that pair's "
            "training wordings), plus a few descriptive ones read but never trained:", "",
@@ -2865,8 +2888,12 @@ def render_readers_readme(meta: dict, recipe: dict) -> str:
                     + "; ".join(f"{k}: slope {v['dial']['mean']:+.2f} per unit, {v['OUTCOME']}" for k, v in sl.items()) + ".", ""]
         gate = res.get("gate") or {}
         if gate:
+            rt = gate.get("ratings") or {}
+            fr = gate.get("head_out_of_frame") or [0.0]
             out += [f"The new character's gate (its hardest pictures, judged before the rest): the highest age read "
-                    f"{gate.get('max_age', 0):.2f} against {AGE_BAR}; {'passed' if gate.get('passed') else 'FAILED'}.", ""]
+                    f"{gate.get('max_age', 0):.2f} against {AGE_BAR}; rated sensitive {rt.get('sensitive', 0)} of "
+                    f"{gate.get('pictures', 0)} (at most {CPG_GATE_SENSITIVE}); the highest head-out-of-frame read "
+                    f"{max(fr):.2f} against {CPG_GATE_FRAME_BAR}; {'passed' if gate.get('passed') else 'FAILED'}.", ""]
         held = res.get("withheld") or {}
         out += [("No picture was withheld." if not held else
                  "Withheld (off the sheets, the set out of the data repo): "
