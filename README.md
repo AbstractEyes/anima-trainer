@@ -215,6 +215,13 @@ cache → two-phase train):
   drawn set is kept in
   [AbstractPhil/geolip-beatrix-anima-data](https://huggingface.co/datasets/AbstractPhil/geolip-beatrix-anima-data)
   and reused instead of drawn again.
+- **`anima_colab_groups.ipynb`**
+  [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_groups.ipynb)
+  — e053 on **Anima**: grouped conditionings. Hair colour, expression and eye colour asked for at once, at every
+  side of every pair (8 groups), by words (the three tags in one prompt) and by composed sliders (the three
+  single-tag predictions added at every sampling step): does each attribute survive the group, how much of its
+  single-tag move does it keep, and does one pull on another? The plain and single-tag pictures come from the
+  data repo; the new group sets are kept there (`sets/cgr2_*`).
 
 ## Programmatic / sweeps
 

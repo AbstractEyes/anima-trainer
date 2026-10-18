@@ -528,7 +528,7 @@ def test_connector_registry_and_rules():
     for rid in (ax.HUB_READ_ID, ax.TRIANGULATION_ID, ax.ARM_READ_ID,    # e038 / e045 likewise: the reads' folders (triangulate)
                 ax.NANO_READ_ID, ax.NANO_RELAY_ID, ax.NANO_COMPARATOR_ID,   # e046-e049: the nano battery's folders
                 ax.NANO_RELAY_TRAINED_ID, ax.CP_TEST_ID, ax.CPS_TEST_ID,     # e050-e052: the counterpoint pairs
-                ax.CPG_TEST_ID):
+                ax.CPG_TEST_ID, ax.CGR_TEST_ID):
         assert {i for i in ids_here if i[:4] == rid[:4]} == {rid}
     assert all(a.features is None and not a.reading and not a.date for a in ax.CONNECTOR_ARMS[:10])
     assert {a.date for a in hub} == {"2026-10-07"}
@@ -2143,3 +2143,149 @@ def test_counterpoint_readers_end_to_end(runner, fake_hub, tmp_path, monkeypatch
     assert len(json.loads(repo.files_[f"{base}/result.json"])["cells"]) == 16
     assert any(f.startswith("sets/cps2_blonde-hair_upper-body_x0.25-") for f in fake_hub.files_) if hasattr(
         fake_hub, "files_") else True
+
+
+def test_compose_is_the_slider_for_one_member_and_sums_deltas_for_a_group():
+    """One member is e051's slider, bit for bit; a group adds every member's delta from the prompt's own prediction."""
+    g = torch.Generator().manual_seed(0)
+    v, a, b = (torch.randn(2, 3, 4, generator=g) for _ in range(3))
+    w = torch.tensor([0.5, 1.5]).view(2, 1, 1)
+    assert torch.equal(ar._compose(v, [a], [w]), v + w * (a - v))
+    assert torch.allclose(ar._compose(v, [a, b], [1.0, 1.0]), a + b - v)
+    assert torch.equal(ar._compose(v, [a, b], [0.0, 0.0]), v)
+    assert ar._mix_lists(["p", "q"], [0.5, 1.0]) == ([["p"], ["q"]], [[0.5], [1.0]])
+    assert ar._mix_lists([["p", "r"]], [(1.0, 1.0)]) == ([["p", "r"]], [[1.0, 1.0]])
+    for bad in (([["p", "r"], ["q"]], [[1.0, 1.0], [1.0]]), ([["p", "r"]], [[1.0]]), ([[]], [[]])):
+        with pytest.raises(ValueError):
+            ar._mix_lists(*bad)
+
+
+def test_group_design_is_the_registered_one():
+    assert ax.CGR_PAIRS == ("hair_colour", "expression", "eye_colour") and len(ax.CGR_CORNERS) == 8
+    assert all(ax.CP_PAIRS[k][2] == ax.CGR_FRAMING for k in ax.CGR_PAIRS)
+    assert ax.cgr_label((1, -1, -1)) == "blonde hair, frown, blue eyes"
+    plans = ax.cgr_plans()
+    assert len(plans) == 16 and list(plans)[:2] == ["cgr2_blonde-hair_smile_red-eyes_words",
+                                                    "cgr2_blonde-hair_smile_red-eyes_sliders"]
+    words, sliders = plans["cgr2_black-hair_frown_blue-eyes_words"], plans["cgr2_black-hair_frown_blue-eyes_sliders"]
+    assert "1girl, solo, black hair, frown, blue eyes, upper body, office suit" in words[0]["prompt"]
+    assert sliders[0]["prompt"] == sliders[0]["caption"] == words[0]["caption"] == ax.cp_prompt(None, "upper body", 0, 2)
+    assert sliders[0]["mix_weights"] == [1.0, 1.0, 1.0]
+    assert sliders[0]["mix_prompts"] == [ax.cp_prompt(t, "upper body", 0, 2) for t in ("black hair", "frown", "blue eyes")]
+    assert [("negative" in it) for it in words] == [i in (6, 7) for i in range(16)]       # the age guard: character 3 only
+    assert ax.BED2_FOURTH[0] in sliders[6]["mix_prompts"][2] and sliders[6]["negative"].endswith(ax.AGE_GUARD)
+    refs = ax.cgr_refs()
+    assert set(refs.values()) <= set(ax.cpg_plans())          # the reference sets are the updated counterpoint sets
+    assert ax.cgr_ref_plans()[refs["eye_colour-"]] == ax.cp_items("blue eyes", "upper body", 2)
+    readme = ax.render_groups_readme({"status": "running"}, {"model": "Anima"})
+    assert "fixed before the run" in readme and "COMPOSES" in readme and ax.BED2_FOURTH[0] in readme
+    for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery"):
+        assert word not in readme
+
+
+def _group_scores(drag: float = 0.0, lose: "str | None" = None):
+    """Made-up judge scores: every tag moves its own pair by 6 (span 12), plus a drag of blue eyes on the hair score; `lose`
+    names one pair that does not move in the group."""
+    noise = [0.05 * (i % 4) for i in range(16)]
+    refs = {"plain": {k: list(noise) for k in ax.CGR_PAIRS}}
+    for k in ax.CGR_PAIRS:
+        for m, s in (("+", 1), ("-", -1)):
+            refs[f"{k}{m}"] = {o: [6.0 * s * (o == k) + n for n in noise] for o in ax.CGR_PAIRS}
+    groups = {}
+    for c in ax.CGR_CORNERS:
+        sc = {}
+        for i, k in enumerate(ax.CGR_PAIRS):
+            move = 0.0 if k == lose else 6.0 * c[i]
+            if k == "hair_colour" and c[2] < 0:
+                move += drag
+            sc[k] = [move + n for n in noise]
+        groups[ax.cgr_label(c)] = sc
+    return groups, refs
+
+
+def test_group_reads():
+    plain, refs = _group_scores()
+    dragged, _ = _group_scores(drag=5.0)
+    lost, _ = _group_scores(lose="expression")
+    r = ax.cgr_reads({"words": plain, "sliders": dragged, "flat": lost}, refs)
+    assert r["span"]["hair_colour"] == pytest.approx(12.0)
+    w, s, f = r["arms"]["words"], r["arms"]["sliders"], r["arms"]["flat"]
+    assert w["OUTCOME"] == "COMPOSES" and w["overlapping"] == [] and all(n == 8 for n in w["corners_carried"].values())
+    assert all(v["OUTCOME"] == "KEPT" and v["share"] == pytest.approx(1.0) for v in w["kept"].values())
+    assert s["OUTCOME"] == "COMPOSES WITH OVERLAP" and s["overlapping"] == ["eye_colour on hair_colour"]
+    assert s["overlap"]["eye_colour on hair_colour"]["of_span"] == pytest.approx(-5.0 / 12)
+    assert s["kept"]["hair_colour-"]["share"] == pytest.approx((1 + 1 / 6) / 2) and s["kept"]["hair_colour-"]["OUTCOME"] == "PARTLY"
+    assert s["kept"]["hair_colour+"]["share"] == pytest.approx((1 + 11 / 6) / 2)
+    assert f["OUTCOME"] == "PARTLY COMPOSES" and f["corners_carried"]["expression"] == 0
+    assert f["kept"]["expression+"]["OUTCOME"] == "LOST"
+
+
+def test_counterpoint_groups_end_to_end(runner, fake_hub, monkeypatch):
+    """The group run draws the reference sets it lacks and the 16 group sets, the sliders arm through one mix prompt per
+    tag at amount 1 and the guarded character with its age guard, keeps every set in the data repo, and reads the
+    marks: the words compose, the sliders (where blue eyes drag the hair here) compose with that overlap."""
+    from PIL import Image
+    s, repo, pipe, calls = runner
+    s.cfg.data_repo_id = "AbstractPhil/geolip-beatrix-anima-data"
+    tags = ax.cp_judge_tags(list(ax.CP_DEFAULT))
+    index = {t: i for i, t in enumerate(tags)}
+    calls_mix, negs = [], []
+
+    def codes(text):
+        return [1 if ax.CP_PAIRS[k][0] in text else 2 if ax.CP_PAIRS[k][1] in text else 0 for k in ax.CGR_PAIRS]
+
+    def render(prompts, seeds, mix_prompts=None, mix_weights=None, negative=None, **kw):
+        out = []
+        for j, (p, sd) in enumerate(zip(prompts, seeds)):
+            if mix_prompts is not None:
+                calls_mix.append((list(mix_prompts[j]), list(mix_weights[j])))
+                c = [max(x) for x in zip(*(codes(m) for m in mix_prompts[j]))]
+            else:
+                c = codes(p.split(", upper body")[0])
+            im = Image.new("RGB", (8, 8), tuple(c))
+            im.putpixel((1, 0), (sd, 1 if mix_prompts is not None else 0, 0))
+            out.append(im)
+            negs.append((p, negative))
+        return out
+
+    def probs(imgs):
+        rows = []
+        for im in imgs:
+            c, (sd, mixed, _) = im.getpixel((0, 0)), im.getpixel((1, 0))
+            v = np.full(len(tags), 0.5)
+            v[[index[r] for r in ax.CP_RATINGS]] = (0.9, 0.05, 0.05, 0.05)
+            v[[index[t] for t in ax.AGE_TAGS]] = 0.01
+            v[index[ax.FRAME_TAG]] = 0.01
+            for k, code in zip(ax.CGR_PAIRS, c):
+                z = (3.0 if code == 1 else -3.0 if code == 2 else 0.0) + 0.01 * (sd % 7)
+                if k == "hair_colour" and mixed and c[2] == 2:
+                    z += 2.5                                      # blue eyes drag the hair toward blonde (sliders only)
+                plus, minus = ax.CP_PAIRS[k][:2]
+                v[index[plus]], v[index[minus]] = 1 / (1 + np.exp(-z)), 1 / (1 + np.exp(z))
+            rows.append(v)
+        return np.array(rows)
+
+    monkeypatch.setattr(s, "_render", render)
+    monkeypatch.setattr(s, "_cp_judges", lambda k: (probs, index, list(tags), {t.replace(" ", "_"): 1000 for t in tags}))
+    monkeypatch.setattr(s, "_judge", lambda: None)
+    meta = s.run_counterpoint_groups()
+    r = meta["result"]
+    assert meta["status"] == "done" and r["pictures"] == {"total": 368, "drawn": 368, "reused": 0}
+    assert len(calls_mix) == 128 and all(len(m) == 3 and w == [1.0, 1.0, 1.0] for m, w in calls_mix)
+    guarded = [n for p, n in negs if ax.BED2_FOURTH[0] in p]
+    assert len(guarded) == 23 * 2 and all(n.endswith(ax.AGE_GUARD) for n in guarded)
+    assert all(n is None for p, n in negs if ax.BED2_FOURTH[0] not in p)
+    arms = r["reads"]["arms"]
+    assert arms["words"]["OUTCOME"] == "COMPOSES", arms["words"]["overlap"]
+    assert arms["sliders"]["OUTCOME"] == "COMPOSES WITH OVERLAP"
+    assert arms["sliders"]["overlapping"] == ["eye_colour on hair_colour"]
+    base = f"experiments/{ax.CGR_TEST_ID}"
+    for f in ["meta.json", "README.md", "result.json", "tagger_probs.npz", "sheet_words.jpg", "sheet_sliders.jpg"]:
+        assert f"{base}/{f}" in repo.files_, f
+    readme = repo.files_[f"{base}/README.md"].decode()
+    assert "**COMPOSES**" in readme and "**COMPOSES WITH OVERLAP**" in readme and "overlap**" in readme
+    assert len(json.loads(repo.files_[f"{base}/result.json"])["cells"]) == 16
+    kept = {p.name.rsplit("-", 1)[0] for p in (fake_hub.d / "sets").iterdir()}
+    assert {n for n in ax.cgr_plans()} <= kept and set(ax.cgr_refs().values()) <= kept
+    assert s.run_counterpoint_groups()["status"] == "done"            # done already: skipped, nothing drawn again
+    assert len(calls_mix) == 128

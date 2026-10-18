@@ -2915,3 +2915,218 @@ def render_readers_readme(meta: dict, recipe: dict) -> str:
             "- `tagger_probs.npz`: every drawn picture's probability for each of the judge's tags (float16, one array per set).",
             "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
     return "\n".join(out)
+
+
+# ---- e053: grouped conditionings (three attribute conditionings in one picture, by words and by composed sliders) -------------
+CGR_TEST_ID = "e053_anima_grouped_conditionings"
+CGR_TEST_TITLE = ("The stock model: three attribute conditionings in one picture (hair colour, expression, eye colour), by "
+                  "words and by composed sliders")
+CGR_DATE = "2026-10-18"
+CGR_PAIRS = ("hair_colour", "expression", "eye_colour")         # e050's handles, eye colour in place of eye openness
+CGR_BED = 2                                                     # the updated characters
+CGR_FRAMING = "upper body"
+CGR_ARMS = ("words", "sliders")
+CGR_CORNERS = tuple((a, b, c) for a in (1, -1) for b in (1, -1) for c in (1, -1))   # every side of every pair
+CGR_KEPT, CGR_LOST = 0.75, 0.5          # a side keeps its single-tag move at >= .75 of it; under .5 it is lost
+CGR_REFERENCES = CPS_REFERENCES
+
+
+def cgr_tags(corner) -> list[str]:
+    """A corner's tag for each pair of the group, in the group's order (+1: the pair's + tag, -1: its - tag)."""
+    return [CP_PAIRS[k][0] if s > 0 else CP_PAIRS[k][1] for k, s in zip(CGR_PAIRS, corner)]
+
+
+def cgr_label(corner) -> str:
+    """'blonde hair, smile, red eyes'."""
+    return ", ".join(cgr_tags(corner))
+
+
+def cgr_set_name(corner, arm: str, bed: int = CGR_BED) -> str:
+    """A group set's name: its tags and its arm (cgr2_blonde-hair_smile_red-eyes_words)."""
+    return f"cgr{'' if bed == 1 else bed}_" + "_".join(cp_slug(t) for t in cgr_tags(corner)) + f"_{arm}"
+
+
+def cgr_items(corner, arm: str, bed: int = CGR_BED) -> list[dict]:
+    """One group set in the data repo's set format, captioned with the plain prompt. words: the corner's tags in the
+    prompt's tag slot; sliders: the plain prompt composed with one prompt per tag at amount 1."""
+    tags = cgr_tags(corner)
+    out = []
+    for ci, sd in attr_cells():
+        plain = cp_prompt(None, CGR_FRAMING, ci, bed)
+        it = {"name": f"{ci:02d}_{sd}", "seed": sd, "caption": plain}
+        if arm == "words":
+            it["prompt"] = cp_prompt(", ".join(tags), CGR_FRAMING, ci, bed)
+        elif arm == "sliders":
+            it.update(prompt=plain, mix_prompts=[cp_prompt(t, CGR_FRAMING, ci, bed) for t in tags],
+                      mix_weights=[1.0] * len(tags))
+        else:
+            raise ValueError(f"unknown arm {arm!r}; the arms are {CGR_ARMS}")
+        out.append(cp_guard(it, ci, bed))
+    return out
+
+
+def cgr_plans(bed: int = CGR_BED) -> dict:
+    """{set name: items} of the group sets, in drawing order (per corner: words, then sliders)."""
+    return {cgr_set_name(c, a, bed): cgr_items(c, a, bed) for c in CGR_CORNERS for a in CGR_ARMS}
+
+
+def cgr_refs(bed: int = CGR_BED) -> dict:
+    """The sets the group is read against, reused from the counterpoint pairs on the same characters: {'plain': the
+    plain prompt's set, '<pair>+' / '<pair>-': the set of that side's tag alone}."""
+    refs = {"plain": cp_set_name(None, CGR_FRAMING, bed)}
+    for k in CGR_PAIRS:
+        refs[f"{k}+"] = cp_set_name(CP_PAIRS[k][0], CGR_FRAMING, bed)
+        refs[f"{k}-"] = cp_set_name(CP_PAIRS[k][1], CGR_FRAMING, bed)
+    return refs
+
+
+def cgr_ref_plans(bed: int = CGR_BED) -> dict:
+    """{set name: items} of the reference sets."""
+    refs = cgr_refs(bed)
+    plans = {refs["plain"]: cp_items(None, CGR_FRAMING, bed)}
+    for k in CGR_PAIRS:
+        plans[refs[f"{k}+"]] = cp_items(CP_PAIRS[k][0], CGR_FRAMING, bed)
+        plans[refs[f"{k}-"]] = cp_items(CP_PAIRS[k][1], CGR_FRAMING, bed)
+    return plans
+
+
+def cgr_reads(scores: dict, refs: dict) -> dict:
+    """The marks fixed before the run. scores = {arm: {corner label: {pair: [score per cell]}}}; refs = {'plain' /
+    '<pair>+' / '<pair>-': {pair: [score per cell]}} (the reference sets). Per arm: SURVIVAL (per corner and pair, the
+    group picture against the plain one under the words rule in the pair's corner direction; a pair survives when it
+    carries at all 8 corners), KEPT (per pair and side, the group's mean move over the single tag's, averaged over the 4
+    corners on that side), OVERLAP (per pair k and other pair j, k's score with j at + minus with j at -, averaged over
+    the 4 settings of k and the third pair, over k's span; beyond CP_OVERLAP) and the verdict."""
+    import numpy as np
+    plain = {k: np.asarray(refs["plain"][k], dtype=float) for k in CGR_PAIRS}
+    span = {k: float(np.mean(np.asarray(refs[f"{k}+"][k], dtype=float) - np.asarray(refs[f"{k}-"][k], dtype=float)))
+            for k in CGR_PAIRS}
+    solo = {f"{k}{m}": float(np.mean(np.asarray(refs[f"{k}{m}"][k], dtype=float) - plain[k]))
+            for k in CGR_PAIRS for m in "+-"}
+    out = {"span": span, "single_tag_move": solo, "arms": {}}
+    for arm, by_corner in scores.items():
+        moves, survival = {}, {}
+        for c in CGR_CORNERS:
+            lab = cgr_label(c)
+            survival[lab] = {}
+            for i, k in enumerate(CGR_PAIRS):
+                d = np.asarray(by_corner[lab][k], dtype=float) - plain[k]
+                moves[(c, k)] = float(d.mean())
+                survival[lab][k] = flavor_outcome(list(d), c[i], label="CARRIES IT")
+        survives = {k: sum(survival[cgr_label(c)][k]["OUTCOME"] == "CARRIES IT" for c in CGR_CORNERS) for k in CGR_PAIRS}
+        kept = {}
+        for i, k in enumerate(CGR_PAIRS):
+            for s, m in ((1, "+"), (-1, "-")):
+                ref = solo[f"{k}{m}"]
+                per = {cgr_label(c): (moves[(c, k)] / ref if ref else 0.0) for c in CGR_CORNERS if c[i] == s}
+                share = float(np.mean(list(per.values())))
+                kept[f"{k}{m}"] = {"share": share, "per_corner": per,
+                                   "OUTCOME": "KEPT" if share >= CGR_KEPT else "LOST" if share < CGR_LOST else "PARTLY"}
+        overlap = {}
+        for i, k in enumerate(CGR_PAIRS):
+            for j, o in enumerate(CGR_PAIRS):
+                if j == i:
+                    continue
+                d = [moves[(c, k)] - moves[(tuple(-x if n == j else x for n, x in enumerate(c)), k)]
+                     for c in CGR_CORNERS if c[j] == 1]
+                val = float(np.mean(d)) / span[k] if span[k] else 0.0
+                overlap[f"{o} on {k}"] = {"of_span": val, "OVERLAP": abs(val) > CP_OVERLAP}
+        over = [n for n, v in overlap.items() if v["OVERLAP"]]
+        whole = all(n == len(CGR_CORNERS) for n in survives.values())
+        verdict = ("COMPOSES WITH OVERLAP" if whole and over else "COMPOSES" if whole else
+                   "PARTLY COMPOSES" if any(n == len(CGR_CORNERS) for n in survives.values()) else "DOES NOT COMPOSE")
+        out["arms"][arm] = {"survival": survival, "corners_carried": survives, "kept": kept, "overlap": overlap,
+                            "overlapping": over, "OUTCOME": verdict}
+    return out
+
+
+def render_groups_readme(meta: dict, recipe: dict) -> str:
+    """e053's README: why, the design and the rule fixed before the run, and the result when done."""
+    res = meta.get("result") or {}
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    refs = "\n".join(f"- {t}: {u}" for t, u in CGR_REFERENCES)
+    pairs = "\n".join(f"| {k.replace('_', ' ')} | {CP_PAIRS[k][0]} | {CP_PAIRS[k][1]} |" for k in CGR_PAIRS)
+    out = [f"# {CGR_TEST_ID}: {CGR_TEST_TITLE}", "",
+           f"Date: {CGR_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Why",
+           f"{CP_TEST_ID} found booru tag pairs that each move one attribute in every picture, and {CPS_TEST_ID} turned "
+           "them into smooth sliders. A description usually asks for several attributes at once, so the next question is "
+           "whether these conditionings work as a group: with three attributes asked for together, does each still move "
+           "its own attribute, how much of its single-tag effect does it keep, and does one attribute pull on another? "
+           "The group is asked for in two ways: the three tags written in one prompt, and the three single-tag predictions "
+           "composed at every step.", "",
+           "## Design",
+           "- **The group** (the tags as the model's captions write them):", "",
+           "| pair | + tag | - tag |", "|---|---|---|", pairs, "",
+           f"- **The corners**: every side of every pair, {len(CGR_CORNERS)} groups (for example blonde hair, frown, blue "
+           "eyes).",
+           "- **Words**: the group's three tags in the prompt's tag slot, in the order above.",
+           "- **Sliders**: v = v(plain) + sum over the group of (v(the tag's prompt) - v(plain)), on the conditional "
+           f"branch at every sampling step, every tag at amount 1 (the single-tag case is the slider of {CPS_TEST_ID}); "
+           "the negative prompt's branch and the guidance scale unchanged.",
+           f"- **Cells**: the 16 of the updated characters (eight adult-coded characters x seeds "
+           f"{', '.join(map(str, ATTR_SEEDS))}; the fourth, {BED2_FOURTH[0]} / {BED2_FOURTH[1]}, drawn with \"{AGE_GUARD}\" "
+           "added to the negative prompt), upper body.",
+           f"- **Reused**: the plain prompt's set and each tag's own set on the same characters, from {CP_TEST_ID}'s "
+           f"updated sets. New: {len(CGR_CORNERS)} corners x {len(CGR_ARMS)} arms x 16 = "
+           f"{len(CGR_CORNERS) * len(CGR_ARMS) * 16} pictures, each set kept in the data repo (`sets/cgr2_*`).", "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The judge",
+           f"The [WD EVA02-Large tagger v3](https://huggingface.co/{TAGGER}) on the pixels: a pair's score is the log-odds of "
+           "its + tag minus those of its - tag, read on every picture for every pair. Every picture is screened: rated "
+           f"questionable or explicit, or read as {', '.join(AGE_TAGS)} above {AGE_BAR}, it is withheld (off the sheets, its "
+           "set out of the data repo).", "",
+           "## The rule (fixed before the run)",
+           "**SURVIVAL** (per arm, group and pair): the group's pictures against the plain prompt's on the 16 cells, in the "
+           "direction of the pair's side in that group: it carries when the mean moves that way, at least 12 of the 16 "
+           "cells move that way and the mean is beyond 3 standard errors. A pair **survives the group** in an arm when it "
+           f"carries in all {len(CGR_CORNERS)} groups. **KEPT** (per arm, pair and side): the group's mean move over the "
+           "single tag's mean move (both against the plain prompt), averaged over the 4 groups on that side: at least "
+           f"{CGR_KEPT} KEPT, under {CGR_LOST} LOST, else PARTLY. **OVERLAP** (per arm, pair and other pair): the pair's "
+           "score with the other pair at + minus with it at -, averaged over the 4 settings of the pair and the third "
+           f"pair, in units of the pair's span (its + tag's set minus its - tag's): beyond {CP_OVERLAP:.2f} it is an "
+           "overlap. Verdict per arm: **COMPOSES** (every pair survives, no overlap), **COMPOSES WITH OVERLAP**, **PARTLY "
+           "COMPOSES** (some pair survives), **DOES NOT COMPOSE**. The words and the sliders are compared side by side "
+           "(descriptive).", ""]
+    if meta.get("status") == "done":
+        r = res.get("reads") or {}
+        out += ["## Result", meta.get("summary", ""), ""]
+        arms = r.get("arms") or {}
+        if arms:
+            out += ["| | " + " | ".join(arms) + " |", "|---|" + "---|" * len(arms)]
+            out.append("| verdict | " + " | ".join(f"**{v['OUTCOME']}**" for v in arms.values()) + " |")
+            for k in CGR_PAIRS:
+                out.append(f"| {k.replace('_', ' ')}: groups carried | "
+                           + " | ".join(f"{v['corners_carried'][k]} of {len(CGR_CORNERS)}" for v in arms.values()) + " |")
+            for k in CGR_PAIRS:
+                for m in "+-":
+                    out.append(f"| {k.replace('_', ' ')} {m}: share of the single tag kept | "
+                               + " | ".join(f"{v['kept'][k + m]['share']:.2f} ({v['kept'][k + m]['OUTCOME'].lower()})"
+                                            for v in arms.values()) + " |")
+            names = list(next(iter(arms.values()))["overlap"])
+            for n in names:
+                out.append(f"| {n.replace('_', ' ')} (of its span) | "
+                           + " | ".join(f"{v['overlap'][n]['of_span']:+.2f}" + (" **overlap**" if v["overlap"][n]["OVERLAP"]
+                                                                                 else "") for v in arms.values()) + " |")
+            out.append("")
+        held = res.get("withheld") or {}
+        out += [("No picture was withheld." if not held else
+                 "Withheld (off the sheets, the set out of the data repo): "
+                 + "; ".join(f"{n}: {', '.join(v)}" for n, v in held.items()) + "."), ""]
+        pics = res.get("pictures") or {}
+        if pics:
+            out += [f"Pictures: {pics.get('total')} read, {pics.get('drawn')} drawn in this run, {pics.get('reused')} "
+                    "reused.", ""]
+        out += ["Sheets (`sheet_<arm>.jpg`): the eight characters at the first seed; columns: the plain prompt, then the "
+                "groups in the order of the corners.", ""]
+        out += [f"![{a}](sheet_{a}.jpg)" for a in arms] + [""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    else:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files",
+            "- `result.json`: every cell's score on every judged pair in every set, the marks, where each set came from.",
+            "- `tagger_probs.npz`: every group picture's probability for each of the judge's tags (float16, one array per "
+            "set).",
+            "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
+    return "\n".join(out)

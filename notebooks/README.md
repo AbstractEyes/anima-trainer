@@ -145,3 +145,24 @@ the runner's release tag, then `setup()` → `run_counterpoint_words()`.
   hardest pictures: no age read above .2, none rated questionable or explicit, at most 5 rated sensitive, the face in
   view; the other seven characters' pictures are the earlier sets', reused through `prefetch_first_bed()`). The readers' amounts come from a separate reading step
   (`readers.json`); the notebook never runs the text models.
+
+## `anima_colab_groups.ipynb`
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_groups.ipynb)
+
+**e053, grouped conditionings on Anima** (`AnimaRunner.run_counterpoint_groups`), uploaded into
+`experiments/e053_anima_grouped_conditionings` of
+[AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). The bootstrap checks out
+the runner's release tag (v0.5.0), then `setup()` → `run_counterpoint_groups()`.
+
+- **The question:** with several attributes asked for at once, does each still move its own attribute, how much of its
+  single-tag move does it keep, and does one attribute pull on another?
+- **The group:** hair colour (blonde / black hair), expression (smile / frown), eye colour (red / blue eyes), at every
+  side of every pair (8 groups), on the updated characters (16 cells), upper body.
+- **Two ways of asking:** words (the three tags in one prompt) and composed sliders, v(plain) + sum over the tags of
+  (v(tag) - v(plain)) at every sampling step, each at amount 1 (`AnimaPipe.generate` takes a list of mix prompts and
+  amounts per picture; one member is the e051 slider). 8 x 2 x 16 = 256 new pictures; the plain and single-tag sets
+  (`cp2_*`) come back from the data repo; the group sets are kept as `sets/cgr2_*`.
+- **The rule (fixed before the run):** survival (each pair moves the group's way against the plain prompt in at least 12
+  of 16 cells, beyond 3 SE, in all 8 groups), kept (the group's move over the single tag's, at least 0.75), overlap (a
+  pair's score shifting by more than a third of its span when another pair flips side). Verdict per way of asking:
+  COMPOSES, COMPOSES WITH OVERLAP, PARTLY COMPOSES, DOES NOT COMPOSE.

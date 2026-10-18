@@ -200,6 +200,25 @@ def _read_lora(folder: "str | Path", weight_name: str = "adapter_model.safetenso
     return sd, scaling
 
 
+def _mix_lists(mix_prompts: list, mix_weights: list) -> "tuple[list, list]":
+    """Per image (its mix prompts, their amounts) as two lists of lists: a single prompt and amount become a group of
+    one. Every image takes the same number, one amount per prompt."""
+    mp = [list(m) if isinstance(m, (list, tuple)) else [m] for m in mix_prompts]
+    mw = [list(w) if isinstance(w, (list, tuple)) else [w] for w in mix_weights]
+    if any(len(a) != len(b) or not a for a, b in zip(mp, mw)) or len({len(a) for a in mp}) != 1:
+        raise ValueError("every image takes the same number of mix prompts, one amount each")
+    return mp, mw
+
+
+def _compose(v, mixed: list, weights: list):
+    """v + sum_k w_k (mixed_k - v): every member's delta from the prompt's own prediction v (one member is e051's
+    slider, computed the same way)."""
+    out = v
+    for vm, w in zip(mixed, weights):
+        out = out + w * (vm - v)
+    return out
+
+
 # =============================================================================
 # Stock Anima in this process (the fork's model code)
 # =============================================================================
@@ -463,12 +482,14 @@ class AnimaPipe:
     def generate(self, prompts: list[str], seeds: list[int], *, res: int, steps: int, cfg: float, shift: float,
                  negative: str = "", batch: int = 8, source_add=None, context_add=None, uncond_add=None,
                  t5_prompts: "list[str] | None" = None, query_add=None, source_token=None, slot_word: "str | None" = None,
-                 slot_query=None, slot_source=None, source_states=None, mix_prompts: "list[str] | None" = None,
-                 mix_weights: "list[float] | None" = None) -> list:
+                 slot_query=None, slot_source=None, source_states=None, mix_prompts: "list | None" = None,
+                 mix_weights: "list | None" = None) -> list:
         """PIL images, one per (prompt, seed). mix_prompts / mix_weights: per image a second prompt and an amount w;
         the conditional prediction becomes v(prompt) + w (v(mix prompt) - v(prompt)) at every step (w = 1 is the mix
         prompt's own prediction, w = 0 the prompt's; past 1 it extrapolates), the negative branch unchanged; the edits
-        below apply to the prompt only. source_add / context_add: a 1024-vector added to every prompt token
+        below apply to the prompt only. Per image a list of mix prompts and a list of amounts composes a group:
+        v(prompt) + sum_k w_k (v(mix prompt k) - v(prompt)), every delta taken from the prompt's own prediction (every
+        image of one call takes the same number). source_add / context_add: a 1024-vector added to every prompt token
         before / after the LLM adapter, on the conditional branch; uncond_add: the same after the adapter on the
         negative prompt's branch (a trained push goes on both branches, as a LoRA acts; e001's dial on neither).
         t5_prompts: per image, the prompt whose T5 token ids the adapter reads in place of the prompt's own, while
@@ -489,6 +510,7 @@ class AnimaPipe:
         if (mix_prompts is None) != (mix_weights is None) or (
                 mix_prompts is not None and not len(mix_prompts) == len(mix_weights) == len(prompts)):
             raise ValueError("a mix takes one mix prompt and one weight per prompt")
+        mixes = _mix_lists(mix_prompts, mix_weights) if mix_prompts is not None else None
         if (slot_query is not None or slot_source is not None) and (slot_word is None or query_add is not None
                                                                    or t5_prompts is not None):
             raise ValueError("a slot push needs slot_word, and takes neither query_add nor t5_prompts")
@@ -518,9 +540,11 @@ class AnimaPipe:
                         q_add, q_mask = slot_query, m_t5
                 un = tuple(u.expand(n, *u.shape[1:]).contiguous() for u in unc) if unc is not None else None
                 mix = None
-                if mix_prompts is not None:
-                    mix = (self.encode(list(mix_prompts[i:i + batch])),
-                           torch.tensor([float(w) for w in mix_weights[i:i + batch]], device="cuda").view(n, 1, 1, 1, 1))
+                if mixes is not None:                                  # one (encoding, amounts) per member of the group
+                    mp, mw = mixes[0][i:i + batch], mixes[1][i:i + batch]
+                    mix = [(self.encode([m[k] for m in mp]),
+                            torch.tensor([float(w[k]) for w in mw], device="cuda").view(n, 1, 1, 1, 1))
+                           for k in range(len(mp[0]))]
                 x = torch.cat([torch.randn((1, 16, res // 8, res // 8), device="cuda",
                                            generator=torch.Generator(device="cuda").manual_seed(int(sd)))
                                for sd in s]).unsqueeze(2)
@@ -530,7 +554,7 @@ class AnimaPipe:
                     t = (step / 1000).float().reshape(1).repeat(n)
                     v = self._forward(x, t, conds, context_add, q_add, q_mask).float()
                     if mix is not None:
-                        v = v + mix[1] * (self._forward(x, t, mix[0]).float() - v)
+                        v = _compose(v, [self._forward(x, t, enc).float() for enc, _ in mix], [w for _, w in mix])
                     if un is not None:
                         vu = self._forward(x, t, un, uncond_add).float()
                         v = vu + cfg * (v - vu)
@@ -2021,7 +2045,9 @@ class AnimaRunner(_sr.SanaRunner):
                 for i in range(0, len(group), self.cfg.gen_batch):
                     chunk = group[i:i + self.cfg.gen_batch]
                     kw = ({"mix_prompts": [c["mix_prompt"] for c in chunk], "mix_weights": [c["mix_weight"] for c in chunk]}
-                          if "mix_prompt" in chunk[0] else {})          # a slider set (e051): the mix of two prompts
+                          if "mix_prompt" in chunk[0] else              # a slider set (e051): the mix of two prompts
+                          {"mix_prompts": [c["mix_prompts"] for c in chunk], "mix_weights": [c["mix_weights"] for c in chunk]}
+                          if "mix_prompts" in chunk[0] else {})         # a group (e053): several sliders composed
                     if negative:
                         kw["negative"] = negative
                     for it, img in zip(chunk, self._render([c["prompt"] for c in chunk], [c["seed"] for c in chunk],
@@ -2511,6 +2537,122 @@ class AnimaRunner(_sr.SanaRunner):
                 "withheld": {n: [plans[n][i]["name"] for i in r["withheld"]] for n, r in res.items() if r["withheld"]},
                 "cells": [{"character": ax.CHARACTERS_BED2[ci][0], "seed": sd,
                            **{f"{k}@{g:+g}": {b: full[k][g][b][j] for b in judged} for k in keys for g in ax.CPG_GRID}}
+                          for j, (ci, sd) in enumerate(ax.attr_cells())]}
+
+    # ---- e053: grouped conditionings (three attribute conditionings in one picture) --------------------------------------
+    def run_counterpoint_groups(self, *, force: bool = False) -> dict:
+        """e053 into its own folder of cfg.repo_id: hair colour, expression and eye colour asked for together on the
+        updated characters, at every side of every pair (8 groups), by words (the three tags in one prompt) and by
+        composed sliders (the three single-tag predictions composed at every step), read against the plain prompt's and
+        each tag's own pictures (reused from the counterpoint sets: downloaded from cfg.data_repo_id or found on this
+        runtime, drawn only when absent). Every new set is kept in the data repo. Skipped when the repo lists it as done
+        (force=True reruns the reads; the sets come back from the data repo)."""
+        self._need_model()
+        _drop_torchao()
+        repo = self._experiments_repo()
+        metas = repo.metas()
+        try:
+            self._publish_index(repo, metas)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
+        eid = ax.CGR_TEST_ID
+        prev = metas.get(eid, {})
+        if prev.get("status") == "done" and not force:
+            print(f"[{self.TAG}] {eid} is done already (force=True reruns it)", flush=True)
+            return prev
+        base = f"experiments/{eid}"
+        recipe = self._cp_recipe()
+        recipe["group"] = ", ".join(f"{k.replace('_', ' ')} ({ax.CP_PAIRS[k][0]} / {ax.CP_PAIRS[k][1]})" for k in ax.CGR_PAIRS)
+        recipe["words"] = "the group's three tags in the prompt's tag slot (hair, expression, eyes)"
+        recipe["sliders"] = ("v(plain) + sum over the group of (v(tag's prompt) - v(plain)) on the conditional branch at "
+                             "every step, each tag at amount 1; the negative branch and the guidance scale unchanged")
+        recipe["characters"] = (f"the updated characters (the fourth: {ax.BED2_FOURTH[0]} / {ax.BED2_FOURTH[1]}, its "
+                                f"pictures with \"{ax.AGE_GUARD}\" added to the negative prompt)")
+        meta = {"id": eid, "title": ax.CGR_TEST_TITLE, "date": ax.CGR_DATE, "kind": "counterpoint_groups",
+                "status": "running", "pairs": list(ax.CGR_PAIRS), "recipe": recipe}
+        repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                     f"{base}/README.md": ax.render_groups_readme(meta, recipe)}, f"{eid}: started (README)")
+        out_dir = Path(self._need("data_root")) / "experiments" / eid
+        out_dir.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        try:
+            result = self._counterpoint_groups(out_dir)
+        except Exception as e:  # noqa: BLE001
+            meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
+            self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
+                                            f"{base}/README.md": ax.render_groups_readme(meta, recipe)},
+                                           f"{eid}: failed"))
+            raise
+        arms = result["reads"]["arms"]
+        summary = "; ".join(f"{a}: {v['OUTCOME'].lower()}" + (f" ({', '.join(v['overlapping'])})" if v["overlapping"] else "")
+                            for a, v in arms.items())
+        meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
+                    seconds=round(time.time() - t0), finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
+        (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
+        files = {f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_groups_readme(meta, recipe),
+                 f"{base}/result.json": out_dir / "result.json", f"{base}/tagger_probs.npz": out_dir / "tagger_probs.npz"}
+        for f in sorted(out_dir.glob("sheet_*.jpg")):
+            files[f"{base}/{f.name}"] = f
+        repo.commit(files, f"{eid}: result")
+        metas[eid] = meta
+        self._safe(lambda: self._publish_index(repo, metas))
+        print(f"[{self.TAG}] {eid} done in {_sr._hms(meta['seconds'])}", flush=True)
+        for a, v in arms.items():
+            print(f"[{self.TAG}]   {a:8s} {v['OUTCOME']}: groups carried "
+                  + ", ".join(f"{k} {n}/{len(ax.CGR_CORNERS)}" for k, n in v["corners_carried"].items())
+                  + "; kept " + ", ".join(f"{s} {m['share']:.2f}" for s, m in v["kept"].items())
+                  + (f"; overlaps {', '.join(v['overlapping'])}" if v["overlapping"] else "; no overlap"), flush=True)
+        return meta
+
+    def _counterpoint_groups(self, out_dir: Path) -> dict:
+        import numpy as np
+        from PIL import Image, ImageDraw
+        judged = list(ax.CP_DEFAULT)
+        probs_fn, index, names, counts = self._cp_judges(judged)        # both judges before any picture
+        self._judge()
+        defs = {k: ax.CP_PAIRS[k][:2] for k in judged}
+        refs = ax.cgr_refs()
+        groups = ax.cgr_plans()
+        plans = {**ax.cgr_ref_plans(), **groups}
+        pulled = {n for n, items in plans.items() if self._cp_pull(n, items)}
+        need = sum(len(_ts.missing_images(self._cp_root(n), items)) for n, items in plans.items())
+        total = sum(len(items) for items in plans.values())
+        print(f"[{self.TAG}] e053: {len(plans)} sets x {len(ax.attr_cells())} cells = {total} pictures ({len(groups)} group "
+              f"sets, {len(plans) - len(groups)} reference sets); {len(pulled)} sets from the data repo, {total - need} "
+              f"pictures already here; {need} to draw (a slider group draws {len(ax.CGR_PAIRS) + 2} passes a step)",
+              flush=True)
+        eta = _sr._Eta(self.TAG, "e053 drawing", need) if need else None
+        res = {}
+        for n, items in plans.items():
+            res[n] = self._cp_pass(n, items, eta, (probs_fn, index), defs)
+            d = res[n]["drawn"]
+            res[n]["from"] = ("drawn" if d == len(items) else f"{d} drawn" if d else
+                              "data repo" if n in pulled else "this runtime")
+            print(f"[{self.TAG}] e053 {n} ({res[n]['from']}; highest age read {max(res[n]['age']):.2f})", flush=True)
+        self._assert_stock()
+        scores = {a: {ax.cgr_label(c): res[ax.cgr_set_name(c, a)]["scores"] for c in ax.CGR_CORNERS} for a in ax.CGR_ARMS}
+        reads = ax.cgr_reads(scores, {r: res[n]["scores"] for r, n in refs.items()})
+
+        def tile(n, i):
+            if i in res[n]["withheld"]:
+                im = Image.new("RGB", (256, 256), (128, 128, 128))
+                ImageDraw.Draw(im).text((88, 120), "withheld", fill=(255, 255, 255))
+                return im
+            return Image.open(self._cp_root(n) / "images" / f"{plans[n][i]['name']}.png").convert("RGB")
+
+        first = [i for i, (_, sd) in enumerate(ax.attr_cells()) if sd == ax.ATTR_SEEDS[0]]
+        for a in ax.CGR_ARMS:
+            cols = [refs["plain"]] + [ax.cgr_set_name(c, a) for c in ax.CGR_CORNERS]
+            _grid([[tile(n, i) for n in cols] for i in first], out_dir / f"sheet_{a}.jpg", tile=192)
+        np.savez_compressed(out_dir / "tagger_probs.npz", tags=np.array(names), **{n: res[n]["probs"] for n in groups})
+        return {"reads": reads, "corners": [ax.cgr_label(c) for c in ax.CGR_CORNERS],
+                "pictures": {"total": total, "drawn": need, "reused": total - need},
+                "sets": {n: {"from": res[n]["from"], "data_repo_folder": res[n]["kept"],
+                             "ratings": {r: res[n]["ratings"].count(r) for r in ax.CP_RATINGS},
+                             "max_age": float(max(res[n]["age"]))} for n in plans},
+                "withheld": {n: [plans[n][i]["name"] for i in r["withheld"]] for n, r in res.items() if r["withheld"]},
+                "cells": [{"character": ax.CHARACTERS_BED2[ci][0], "seed": sd,
+                           "scores": {n: {b: res[n]["scores"][b][j] for b in judged} for n in plans}}
                           for j, (ci, sd) in enumerate(ax.attr_cells())]}
 
     # ---- e013-e015: Beatrix as a second conditioning source (a learned push after the adapter) ----------------
