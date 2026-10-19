@@ -2662,7 +2662,7 @@ class AnimaRunner(_sr.SanaRunner):
                           for j, (ci, sd) in enumerate(ax.attr_cells())]}
 
     # ---- e054: readers on the group (one description read, the group's three sliders set at once) ----------------------
-    def run_group_readers(self, readers: "str | Path | dict", *, force: bool = False) -> dict:
+    def run_group_readers(self, readers: "str | Path | dict", *, test: str = "e054", force: bool = False) -> dict:
         """e054 into its own folder of cfg.repo_id: text readers read one description of hair colour, expression and eye
         colour and set the group's three sliders from that one reading (e053's composed sliders at the reader's amounts),
         one picture per description of the trained and the unseen tier, read against the plain prompt's pictures and
@@ -2671,9 +2671,10 @@ class AnimaRunner(_sr.SanaRunner):
         "marks": ..., "picks": ..., "source": ...}) or its path. A picture identical to one already drawn (the plain
         prompt, e053's group, another reader's) is copied, not drawn again. Every new set is kept in the data repo.
         Skipped when the repo lists it as done (force=True reruns the reads; the sets come back from the data repo)."""
+        spec = ax.GROUP_READER_TESTS[test]
         R = readers if isinstance(readers, dict) else json.loads(Path(readers).read_text(encoding="utf-8"))
         ids = [r["id"] for r in ax.cgd_rows() if r["split"] in ax.CGD_TIERS]
-        lacking = [n for n in ax.CGD_READERS if any(i not in R.get("amounts", {}).get(n, {}) for i in ids)]
+        lacking = [n for n in spec["readers"] if any(i not in R.get("amounts", {}).get(n, {}) for i in ids)]
         if lacking:
             raise ValueError(f"the readers file has no amounts for {lacking} on every tier description")
         self._need_model()
@@ -2684,7 +2685,7 @@ class AnimaRunner(_sr.SanaRunner):
             self._publish_index(repo, metas)
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"cannot write to {self.cfg.repo_id} ({e}); the HF_TOKEN needs WRITE access") from e
-        eid = ax.CGD_TEST_ID
+        eid = spec["id"]
         prev = metas.get(eid, {})
         if prev.get("status") == "done" and not force:
             print(f"[{self.TAG}] {eid} is done already (force=True reruns it)", flush=True)
@@ -2698,21 +2699,21 @@ class AnimaRunner(_sr.SanaRunner):
         recipe["characters"] = (f"the updated characters (the fourth: {ax.BED2_FOURTH[0]} / {ax.BED2_FOURTH[1]}, its "
                                 f"pictures with \"{ax.AGE_GUARD}\" added to the negative prompt)")
         recipe["readers"] = R.get("source", "readers.json")
-        meta = {"id": eid, "title": ax.CGD_TEST_TITLE, "date": ax.CGD_DATE, "kind": "group_readers", "status": "running",
+        render = spec["render"]
+        meta = {"id": eid, "title": spec["title"], "date": spec["date"], "kind": "group_readers", "status": "running",
                 "pairs": list(ax.CGD_PAIRS), "recipe": recipe}
         repo.commit({f"{base}/meta.json": sx.dumps(meta),
-                     f"{base}/README.md": ax.render_group_readers_readme(meta, recipe)}, f"{eid}: started (README)")
+                     f"{base}/README.md": render(meta, recipe)}, f"{eid}: started (README)")
         out_dir = Path(self._need("data_root")) / "experiments" / eid
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "readers.json").write_text(json.dumps(R, indent=1), encoding="utf-8")
         t0 = time.time()
         try:
-            result = self._group_readers(R, out_dir)
+            result = self._group_readers(R, out_dir, spec)
         except Exception as e:  # noqa: BLE001
             meta.update(status="failed", error=f"{type(e).__name__}: {e}"[:500])
             self._safe(lambda: repo.commit({f"{base}/meta.json": sx.dumps(meta),
-                                            f"{base}/README.md": ax.render_group_readers_readme(meta, recipe)},
-                                           f"{eid}: failed"))
+                                            f"{base}/README.md": render(meta, recipe)}, f"{eid}: failed"))
             raise
         reads = result["reads"]
         summary = "; ".join(f"{t} tier: " + ", ".join(f"{r} {v['OUTCOME'].lower()}" for r, v in reads[t]["readers"].items())
@@ -2720,7 +2721,7 @@ class AnimaRunner(_sr.SanaRunner):
         meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
                     seconds=round(time.time() - t0), finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
         (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
-        files = {f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": ax.render_group_readers_readme(meta, recipe),
+        files = {f"{base}/meta.json": sx.dumps(meta), f"{base}/README.md": render(meta, recipe),
                  f"{base}/result.json": out_dir / "result.json", f"{base}/readers.json": out_dir / "readers.json",
                  f"{base}/tagger_probs.npz": out_dir / "tagger_probs.npz"}
         for f in sorted(out_dir.glob("sheet_*.jpg")):
@@ -2737,7 +2738,7 @@ class AnimaRunner(_sr.SanaRunner):
                       + f"  all three moved {v['whole_pictures']}/{v['of']}", flush=True)
         return meta
 
-    def _group_readers(self, R: dict, out_dir: Path) -> dict:
+    def _group_readers(self, R: dict, out_dir: Path, spec: dict) -> dict:
         import shutil
 
         import numpy as np
@@ -2746,9 +2747,10 @@ class AnimaRunner(_sr.SanaRunner):
         probs_fn, index, names, counts = self._cp_judges(judged)        # both judges before any picture
         self._judge()
         defs = {k: ax.CP_PAIRS[k][:2] for k in judged}
-        amounts = {n: R["amounts"][n] for n in ax.CGD_READERS}
+        names, prefix = spec["readers"], spec["prefix"]
+        amounts = {n: R["amounts"][n] for n in names}
         refs = ax.cgd_refs()
-        readers = ax.cgd_plans(amounts)
+        readers = ax.cgd_plans(amounts, names, prefix=prefix)
         plans = {**ax.cgd_ref_plans(), **readers}
         pulled = {n for n, items in plans.items() if self._cp_pull(n, items)}
 
@@ -2777,18 +2779,28 @@ class AnimaRunner(_sr.SanaRunner):
 
         for n in plans:
             register(n)
+        for items_file in sorted((Path(self._need("data_root")) / "datasets").glob("c[gp]*/items.jsonl")):
+            n = items_file.parent.name                                 # another test's set on this runtime (e055 <- e054)
+            if n in plans:
+                continue
+            img = items_file.parent / "images"
+            for line in items_file.read_text(encoding="utf-8").splitlines():
+                it = json.loads(line)
+                if (img / f"{it['name']}.png").is_file() and (img / f"{it['name']}.txt").is_file():
+                    have.setdefault(sig(it), img / f"{it['name']}.png")
         todo = set()
         for n, items in plans.items():
             gaps = set(_ts.missing_images(self._cp_root(n), items))
             todo |= {sig(it) for it in items if it["name"] in gaps and sig(it) not in have}
         need = len(todo)
         total = sum(len(items) for items in plans.values())
-        print(f"[{self.TAG}] e054: {len(plans)} sets ({len(readers)} reader sets of "
+        tag = spec["id"][:4]
+        print(f"[{self.TAG}] {tag}: {len(plans)} sets ({len(readers)} reader sets of "
               f"{ax.CGD_SPLITS['trained'] * len(ax.CGR_CORNERS)} descriptions, {len(plans) - len(readers)} reference "
               f"sets) = {total} pictures; {len(pulled)} sets from the "
               f"data repo; {need} distinct pictures to draw (the rest copied or already here; a picture draws up to "
               f"{len(ax.CGD_PAIRS) + 2} passes a step)", flush=True)
-        eta = _sr._Eta(self.TAG, "e054 drawing", need) if need else None
+        eta = _sr._Eta(self.TAG, f"{tag} drawing", need) if need else None
         res, copied = {}, {}
         for n, items in plans.items():
             got = fill(n) if n in readers else 0
@@ -2800,12 +2812,12 @@ class AnimaRunner(_sr.SanaRunner):
             res[n]["from"] = ("drawn" if d == len(items) else
                               f"{d} drawn, {copied[n]} copied" if d or copied[n] else
                               "data repo" if n in pulled else "this runtime")
-            print(f"[{self.TAG}] e054 {n} ({res[n]['from']}; highest age read {max(res[n]['age']):.2f})", flush=True)
+            print(f"[{self.TAG}] {tag} {n} ({res[n]['from']}; highest age read {max(res[n]['age']):.2f})", flush=True)
         self._assert_stock()
         plain = res[refs["plain"]]["scores"]
         corners = {lab: res[n]["scores"] for lab, n in refs.items() if lab != "plain"}
-        scores = {r: {t: res[ax.cgd_set_name(r, t)]["scores"] for t in ax.CGD_TIERS} for r in ax.CGD_READERS}
-        reads = ax.cgd_reads(scores, plain, corners, amounts)
+        scores = {r: {t: res[ax.cgd_set_name(r, t, prefix=prefix)]["scores"] for t in ax.CGD_TIERS} for r in names}
+        reads = ax.cgd_reads(scores, plain, corners, amounts, spec["controls"])
 
         def tile(n, i):
             if i in res[n]["withheld"]:
@@ -2820,13 +2832,13 @@ class AnimaRunner(_sr.SanaRunner):
             firsts = list(range(0, len(trows), ax.CGD_SPLITS[t]))      # the first description of each corner
             grid = [[tile(refs["plain"], trows[j]["cell"]) for j in firsts],
                     [tile(refs[ax.cgr_label(tuple(trows[j]["corner"]))], trows[j]["cell"]) for j in firsts]]
-            grid += [[tile(ax.cgd_set_name(r, t), j) for j in firsts] for r in ax.CGD_READERS]
+            grid += [[tile(ax.cgd_set_name(r, t, prefix=prefix), j) for j in firsts] for r in names]
             _grid(grid, out_dir / f"sheet_{t}.jpg", tile=192)
         np.savez_compressed(out_dir / "tagger_probs.npz", tags=np.array(names), **{n: res[n]["probs"] for n in readers})
         drawn = sum(res[n]["drawn"] for n in plans)
         return {"reads": reads, "reading": R.get("marks", {}), "picks": R.get("picks", {}),
                 "amounts": {r: {t: [ax.cgd_amounts(amounts[r][x["id"]]) for x in rows if x["split"] == t]
-                                for t in ax.CGD_TIERS} for r in ax.CGD_READERS},
+                                for t in ax.CGD_TIERS} for r in names},
                 "pictures": {"total": total, "drawn": drawn, "copied": sum(copied.values()),
                              "reused": total - drawn - sum(copied.values())},
                 "sets": {n: {"from": res[n]["from"], "data_repo_folder": res[n]["kept"],

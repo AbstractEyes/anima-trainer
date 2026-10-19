@@ -528,7 +528,7 @@ def test_connector_registry_and_rules():
     for rid in (ax.HUB_READ_ID, ax.TRIANGULATION_ID, ax.ARM_READ_ID,    # e038 / e045 likewise: the reads' folders (triangulate)
                 ax.NANO_READ_ID, ax.NANO_RELAY_ID, ax.NANO_COMPARATOR_ID,   # e046-e049: the nano battery's folders
                 ax.NANO_RELAY_TRAINED_ID, ax.CP_TEST_ID, ax.CPS_TEST_ID,     # e050-e052: the counterpoint pairs
-                ax.CPG_TEST_ID, ax.CGR_TEST_ID, ax.CGD_TEST_ID):
+                ax.CPG_TEST_ID, ax.CGR_TEST_ID, ax.CGD_TEST_ID, ax.CGF_TEST_ID):
         assert {i for i in ids_here if i[:4] == rid[:4]} == {rid}
     assert all(a.features is None and not a.reading and not a.date for a in ax.CONNECTOR_ARMS[:10])
     assert {a.date for a in hub} == {"2026-10-07"}
@@ -2491,3 +2491,25 @@ def test_group_readers_end_to_end(runner, fake_hub, monkeypatch):
     assert set(ax.cgd_plans(R["amounts"])) <= kept and set(ax.cgd_refs().values()) <= kept
     n = len(batches)
     assert s.run_group_readers(R)["status"] == "done" and len(batches) == n      # done already: nothing drawn again
+    # e055 on the same runtime: its own readers and sets (cgf2_*), a picture identical to one of e054's copied from e054's sets
+    F = {"source": "made up", "amounts": {"qwen": R["amounts"]["qwen"], "framed": dict(half),
+                                          "framed_stack": _reader_amounts(scale=0.75), "framed_base": _reader_amounts(scale=0.0),
+                                          "birth": _reader_amounts(only="eye_colour")}}
+    with pytest.raises(ValueError):
+        s.run_group_readers(R, test="e055")                            # e054's readers are not e055's
+    done = sum(rendered)
+    m55 = s.run_group_readers(F, test="e055")
+    r55 = m55["result"]
+    old = {json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True) for v in plans.values() for it in v}
+    new = {json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True)
+           for v in ax.cgd_plans(F["amounts"], ax.CGF_READERS, prefix="cgf").values() for it in v} - old
+    assert m55["id"] == ax.CGF_TEST_ID and r55["pictures"]["drawn"] == sum(rendered) - done == len(new) > 0
+    assert set(ax.cgd_plans(F["amounts"], ax.CGF_READERS, prefix="cgf")) == {n for n in r55["sets"] if n.startswith("cgf2_")}
+    u = r55["reads"]["unseen"]
+    assert u["readers"]["framed"]["OUTCOME"] == "DRIVES THE GROUP" and u["readers"]["birth"]["OUTCOME"] == "DRIVES 1 OF 3"
+    assert u["controls_carrying"]["eye_colour"] == ["birth"] and u["readers"]["framed_base"]["credited"] == []
+    readme55 = repo.files_[f"experiments/{ax.CGF_TEST_ID}/README.md"].decode()
+    assert "one fetch per slider" in readme55 and "**DRIVES THE GROUP**" in readme55
+    clean = ax.render_framed_readers_readme({"status": "running"}, {"model": "Anima"})
+    for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery", "U2"):
+        assert word not in clean

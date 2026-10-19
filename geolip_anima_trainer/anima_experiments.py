@@ -3260,9 +3260,9 @@ def cgd_amounts(a) -> list[float]:
     return [cpg_grid(x) for x in a]
 
 
-def cgd_set_name(reader: str, tier: str, bed: int = CGD_BED) -> str:
-    """'cgd2_beatrix_unseen'."""
-    return f"cgd{'' if bed == 1 else bed}_{cp_slug(reader)}_{tier}"
+def cgd_set_name(reader: str, tier: str, bed: int = CGD_BED, prefix: str = "cgd") -> str:
+    """'cgd2_beatrix_unseen' (a later test of the same design names its sets with its own prefix)."""
+    return f"{prefix}{'' if bed == 1 else bed}_{cp_slug(reader)}_{tier}"
 
 
 def cgd_items(tier: str, amounts: dict, bed: int = CGD_BED) -> list[dict]:
@@ -3286,10 +3286,11 @@ def cgd_items(tier: str, amounts: dict, bed: int = CGD_BED) -> list[dict]:
     return out
 
 
-def cgd_plans(amounts: dict, readers=None, bed: int = CGD_BED) -> dict:
+def cgd_plans(amounts: dict, readers=None, bed: int = CGD_BED, prefix: str = "cgd") -> dict:
     """{set name: items} of the readers' sets in drawing order (per reader: the trained tier, then the unseen tier).
     amounts = {reader: {row id: [reading per pair]}}."""
-    return {cgd_set_name(r, t, bed): cgd_items(t, amounts[r], bed) for r in (readers or CGD_READERS) for t in CGD_TIERS}
+    return {cgd_set_name(r, t, bed, prefix): cgd_items(t, amounts[r], bed) for r in (readers or CGD_READERS)
+            for t in CGD_TIERS}
 
 
 def cgd_refs(bed: int = CGD_BED) -> dict:
@@ -3343,7 +3344,7 @@ def cgd_read_marks(amounts: dict) -> dict:
     return out
 
 
-def cgd_reads(scores: dict, plain: dict, corners: dict, amounts: dict) -> dict:
+def cgd_reads(scores: dict, plain: dict, corners: dict, amounts: dict, controls_of=CGD_CONTROLS) -> dict:
     """The picture marks fixed before the run. scores = {reader: {tier: {pair: [score per picture, in the tier's
     description order]}}}; plain = {pair: [score per cell]} (the plain prompt's set); corners = {corner label: {pair:
     [score per cell]}} (e053's slider group at amount 1); amounts = {reader: {row id: [reading per pair]}}. Per reader,
@@ -3384,9 +3385,9 @@ def cgd_reads(scores: dict, plain: dict, corners: dict, amounts: dict) -> dict:
                            "whole_pictures": int(sum(moved)), "of": len(trows),
                            "OUTCOME": ("DRIVES THE GROUP" if n == len(CGD_PAIRS) else
                                        f"DRIVES {n} OF {len(CGD_PAIRS)}" if n else "DRIVES NONE")}
-        controls = {k: [r for r in CGD_CONTROLS if r in per and per[r]["pairs"][k]["carried"]] for k in CGD_PAIRS}
+        controls = {k: [r for r in controls_of if r in per and per[r]["pairs"][k]["carried"]] for k in CGD_PAIRS}
         for reader, v in per.items():
-            v["credited"] = [] if reader in CGD_CONTROLS else [k for k in v["pairs_carried"] if not controls[k]]
+            v["credited"] = [] if reader in controls_of else [k for k in v["pairs_carried"] if not controls[k]]
         out[tier] = {"readers": per, "controls_carrying": controls}
     return out
 
@@ -3502,3 +3503,118 @@ def render_group_readers_readme(meta: dict, recipe: dict) -> str:
             "set).",
             "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
     return "\n".join(out)
+
+
+# the group-readers tests registered so far (a test of the same design names its readers, controls, set prefix, README)
+GROUP_READER_TESTS = {"e054": dict(id=CGD_TEST_ID, title=CGD_TEST_TITLE, date=CGD_DATE, readers=CGD_READERS,
+                                    controls=CGD_CONTROLS, prefix="cgd", render=render_group_readers_readme)}
+
+
+# ---- e055: the framed nano arms read each description in their own frame (one fetch per slider) ---------------------------
+CGF_TEST_ID = "e055_anima_framed_group_readers"
+CGF_TEST_TITLE = ("The stock model: the framed nano arms read each description in their own frame and set the three group sliders, "
+                  "one fetch per slider")
+CGF_DATE = "2026-10-18"
+CGF_READERS = ("qwen", "framed", "framed_stack", "framed_base", "birth")   # qwen: e054's plain-description readings (reused)
+CGF_CONTROLS = ("birth",)
+CGF_NAMES = {"qwen": "Qwen3 0.6B, final state, reading the plain description (the reference; e054's readings and pictures)",
+             "framed": "the best framed nano tap: one framed version x block x read position (picked on the training "
+                       "descriptions)",
+             "framed_stack": "the four nano bodies side by side at one framed version (picked the same way)",
+             "framed_base": "the picked tap's body at the end of its diet, before any framed training, read in the same frame "
+                            "(the frames' effect: a comparison)",
+             "birth": "the picked tap's body untrained, read in the same frame (a control that must fail)"}
+
+
+def render_framed_readers_readme(meta: dict, recipe: dict) -> str:
+    """e055's README: e054's design and rule with the framed reading; the result when done."""
+    res = meta.get("result") or {}
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    refs = "\n".join(f"- {t}: {u}" for t, u in CGD_REFERENCES)
+    readers = "\n".join(f"| {r} | {n} |" for r, n in CGF_NAMES.items())
+    out = [f"# {CGF_TEST_ID}: {CGF_TEST_TITLE}", "",
+           f"Date: {CGF_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Why",
+           f"In {CGD_TEST_ID} text readers read one description of hair colour, expression and eye colour as a plain caption "
+           "and set the three group sliders from that one state. The byte-level readers held the attributes while the "
+           "wordings were ones they had trained on and scattered on new ones. The framed nano arms were trained to read "
+           "records written in frames and to fetch a record's value when asked for its key. Here each description is "
+           "written in that frame grammar and each slider is set from its own fetch, so the attributes no longer share one "
+           "state.", "",
+           "## Design",
+           f"- **The descriptions, tiers, cells, pictures and judge**: {CGD_TEST_ID}'s, unchanged (the same 96 training "
+           "descriptions, the trained tier and the unseen tier of 32, one picture per description).",
+           "- **The frame** (the arms' own training layout, built by their trainer's frame builder): the caption register's "
+           "head, then one sized 32-byte data frame per attribute in the order the description writes them, each holding one "
+           "record (the key, then the wording without its noun: `hair` -> `golden`, `expression` -> `warm smile`, `eyes` -> "
+           "`crimson`; spaces fill the frame), then the question for one attribute (its key) and its value, then the end "
+           "byte. Three rows per description, one per attribute.",
+           "- **Where it is read**: the reader's stream state (blocks 0-6, layer-normed) at the question's separator (the "
+           "pointer: where the arm starts to copy) or at the end byte after the value (the content), whichever reads held-out "
+           "wordings better (below); the copy check from the same pass (the value's bytes are the arm's greedy choice at "
+           "every step).",
+           "- **The reading**: per pair, on the rows asking that pair, the ridge regression of the side (+1 / -1) on the "
+           "standardized state of the 96 training descriptions; a training description read with itself left out. Read that "
+           "way nearly every tap reads all of its training sides (the state after the value holds the value's bytes), so the "
+           "strength, the block and the position are chosen by **held-out words**: per pair, each side's i-th training "
+           "wording held out together with every training description whose wording shares a word with either, the reading "
+           "fit on the rest and read on the held-out descriptions (288 reads), ties by the left-out reading, then by name. "
+           "The amount on the picture: the reading rounded to a quarter step, clipped to [-1.5, 1.5].",
+           "- **The readers**:", "", "| reader | what it is |", "|---|---|", readers, "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           f"{CGD_TEST_ID}'s: per reader, tier, pair and side, the 16 descriptions' pictures each against their cell's plain "
+           "picture; the side is carried when the mean moves its way, at least 12 of 16 move that way and the mean is beyond 3 "
+           "standard errors; a reader **DRIVES THE GROUP** when all three pairs are carried on both sides. The control (the "
+           "untrained body) must drive no pair; a pair it carries in a tier is credited to no reader there. Beside it: how "
+           "far each side moves as a share of the group at amount 1, the copy rates, the frames' effect (the framed tap "
+           "against its body before framed training) and the stability of each wording's amount across the descriptions "
+           "it appears in.", ""]
+    if meta.get("status") == "done":
+        r = res.get("reads") or {}
+        out += ["## Result", meta.get("summary", ""), ""]
+        for tier in CGD_TIERS:
+            per = (r.get(tier) or {}).get("readers") or {}
+            if not per:
+                continue
+            out += [f"### The {tier} tier", "",
+                    "| reader | verdict | " + " | ".join(f"{k.replace('_', ' ')} + / -" for k in CGD_PAIRS)
+                    + " | all three moved | credited |",
+                    "|---|---|" + "---|" * len(CGD_PAIRS) + "---|---|"]
+            for name, v in per.items():
+                cells = []
+                for k in CGD_PAIRS:
+                    sd = v["pairs"][k]["sides"]
+                    cells.append(" / ".join(f"{sd[m]['OUTCOME'].lower()} ({sd[m]['how_far']:.2f})" for m in "+-"))
+                out.append(f"| {name} | **{v['OUTCOME']}** | " + " | ".join(cells)
+                           + f" | {v['whole_pictures']} of {v['of']} | {', '.join(v['credited']) or 'none'} |")
+            out += ["", "Each cell: the side's verdict and, in brackets, how far it moved as a share of the group at "
+                    "amount 1.", ""]
+        held = res.get("withheld") or {}
+        out += [("No picture was withheld." if not held else
+                 "Withheld (off the sheets, the set out of the data repo): "
+                 + "; ".join(f"{n}: {', '.join(v)}" for n, v in held.items()) + "."), ""]
+        pics = res.get("pictures") or {}
+        if pics:
+            out += [f"Pictures: {pics.get('total')} read, {pics.get('drawn')} drawn in this run, {pics.get('copied')} copied "
+                    f"from identical ones, {pics.get('reused')} reused.", ""]
+        out += ["Sheets (`sheet_<tier>.jpg`): one column per corner (the first description of each corner, on its own "
+                "character at the first seed); rows: the plain prompt, the group at amount 1, then the readers in the "
+                "order of the table above.", ""]
+        out += [f"![{t}](sheet_{t}.jpg)" for t in CGD_TIERS] + [""]
+    elif meta.get("status") == "failed":
+        out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
+    else:
+        out += ["## Result", "Running.", ""]
+    out += ["## Files",
+            "- `readers.json`: every reader's readings and reading marks, which tap each reader is, every tap's held-out-words "
+            "reading, the copy rates, the stability, every framed version's best tap.",
+            "- `result.json`: every picture's score on every judged pair, the marks, where each set came from.",
+            "- `tagger_probs.npz`: every drawn picture's probability for each of the judge's tags (float16, one array per "
+            "set).",
+            "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
+    return "\n".join(out)
+
+
+GROUP_READER_TESTS["e055"] = dict(id=CGF_TEST_ID, title=CGF_TEST_TITLE, date=CGF_DATE, readers=CGF_READERS,
+                                  controls=CGF_CONTROLS, prefix="cgf", render=render_framed_readers_readme)

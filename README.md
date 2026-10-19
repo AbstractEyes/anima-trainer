@@ -229,6 +229,14 @@ cache → two-phase train):
   sets all three sliders from that single reading; one picture per description, judged on all three. Two tiers:
   new combinations of the training wordings, and wordings never trained. The readings come from the data repo
   (`beatrix/cgd_readers.json`); the reference pictures too; the readers' sets are kept there (`sets/cgd2_*`).
+- **`anima_colab_framed_readers.ipynb`**
+  [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_framed_readers.ipynb)
+  — e055 on **Anima**: the framed readers on the group. The nano arms trained on framed records read the same
+  descriptions written in their own frame grammar (one 32-byte record frame per attribute, then the question for one
+  attribute and its value), and each slider is set from its own fetch instead of one shared reading. Qwen3's
+  plain-description readings are the reference; the picked arm's body before framed training and its untrained start
+  read in the same frame beside it. The readings come from the data repo (`beatrix/cgf_readers.json`); pictures
+  identical to earlier ones are copied; the readers' sets are kept there (`sets/cgf2_*`).
 
 ## Programmatic / sweeps
 

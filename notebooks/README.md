@@ -146,6 +146,29 @@ the runner's release tag, then `setup()` → `run_counterpoint_words()`.
   view; the other seven characters' pictures are the earlier sets', reused through `prefetch_first_bed()`). The readers' amounts come from a separate reading step
   (`readers.json`); the notebook never runs the text models.
 
+## `anima_colab_framed_readers.ipynb`
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_framed_readers.ipynb)
+
+**e055, the framed readers on the group** (`AnimaRunner.run_group_readers(readers, test="e055")`), uploaded into
+`experiments/e055_anima_framed_group_readers` of
+[AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). The bootstrap checks out
+the runner's release tag (v0.7.0), then `setup()` → `run_group_readers(<the readers file from the data repo>, test="e055")`.
+
+- **The question:** e054's text readers held the three attributes on wordings they had trained on and scattered on new
+  ones. The small byte-level nano arms trained on framed records fetch a record's value when asked for its key: written
+  in that frame grammar, with each slider set from its own fetch, do they set the group from a description?
+- **The frame:** the caption register's head, then one sized 32-byte data frame per attribute in the order the
+  description writes them, each holding one record (the key and the wording without its noun: `hair` -> `golden`,
+  `expression` -> `warm smile`, `eyes` -> `crimson`), then the question for one attribute and its value. Three rows per
+  description, one per attribute; the reader's state at the question's separator or at the end byte after the value.
+- **The readers:** Qwen3's plain-description readings (the reference; e054's readings, its pictures reused), the best
+  framed nano tap and the four nano bodies side by side at one framed version (both picked on the training
+  descriptions alone, by how many sides they read with a wording and its word-sharing wordings held out of the fit), the picked tap's body at the end of its diet before any framed training (the frames' effect) and
+  the same body untrained (the control that must fail). The readings (per pair, on the rows asking that pair, a ridge
+  regression of the side on the reader's state, trained on 96 descriptions) are made beforehand and stored in the data
+  repo's `beatrix/cgf_readers.json`.
+- **The descriptions, cells, pictures and rule:** e054's, unchanged (below).
+
 ## `anima_colab_group_readers.ipynb`
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_group_readers.ipynb)
 
