@@ -146,6 +146,25 @@ the runner's release tag, then `setup()` → `run_counterpoint_words()`.
   view; the other seven characters' pictures are the earlier sets', reused through `prefetch_first_bed()`). The readers' amounts come from a separate reading step
   (`readers.json`); the notebook never runs the text models.
 
+## `anima_colab_offtarget_readers.ipynb`
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_offtarget_readers.ipynb)
+
+**e058, the off-target tier** (`AnimaRunner.run_group_readers(readers, test="e058")`), uploaded into
+`experiments/e058_anima_offtarget_readers` of
+[AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). The bootstrap checks out
+the runner's release tag (v0.10.0), then `setup()` → `run_group_readers(<the readers file from the data repo>, test="e058")`.
+
+- **The question:** a reader wired into a picture system meets descriptions that name none of its sliders' sides, where the
+  right amount is zero. Does each reader leave the three sliders at zero, and does training add that over an untrained
+  reader of the same shape?
+- **The off-target wordings** (`cgo_checks()`, fixed before any read): no word of them appears in any wording of the earlier
+  tests (the expression nouns look, face and expression aside, which the unseen wordings use on both sides alike); none
+  names a hair colour, a smile or a frown, or an eye colour. 32 descriptions (`cgo_rows()`), each wording 8 times, on the
+  near tier's characters and seeds.
+- **The rule:** a pair stays plain when at least 24 of 32 amounts round to zero and the pictures' mean absolute move on it is
+  under a quarter of the group's full move; Beatrix in the framed grammar is credited against her untrained copy, the
+  framed nano tap against its untrained body (`cgo_tier_reads`).
+
 ## `anima_colab_near_readers.ipynb`
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_near_readers.ipynb)
 

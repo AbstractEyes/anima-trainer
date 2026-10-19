@@ -2693,6 +2693,9 @@ class AnimaRunner(_sr.SanaRunner):
             return prev
         base = f"experiments/{eid}"
         recipe = self._cp_recipe()
+        if getattr(self.cfg, "data_repo_id", None):                    # the readers' sets, under the test's own prefix
+            recipe["sets kept in"] = (f"https://huggingface.co/datasets/{self.cfg.data_repo_id} "
+                                      f"(sets/{spec['prefix']}{ax.CGD_BED}_*)")
         recipe["group"] = ", ".join(f"{k.replace('_', ' ')} ({ax.CP_PAIRS[k][0]} / {ax.CP_PAIRS[k][1]})" for k in ax.CGD_PAIRS)
         recipe["sliders"] = ("v(plain) + sum over the pairs of |a| (v(the tag of a's side) - v(plain)) on the conditional "
                              "branch at every step, a = the reader's reading rounded to a quarter step and clipped to "
@@ -2733,6 +2736,12 @@ class AnimaRunner(_sr.SanaRunner):
         print(f"[{self.TAG}] {eid} done in {_sr._hms(meta['seconds'])}", flush=True)
         for t in tiers:
             for r, v in reads[t]["readers"].items():
+                if t == "off":                                         # e058: the amounts at 0 and the pictures' move
+                    print(f"[{self.TAG}]   {t:8s} {r:24s} {v['OUTCOME']:24s} "
+                          + "  ".join(f"{k} {v['pairs'][k]['zeros']}/{v['pairs'][k]['of']} at 0, move "
+                                      f"{v['pairs'][k]['mean_abs_move']:.2f}" for k in ax.CGD_PAIRS)
+                          + f"  left plain {v['plain_pictures']}/{v['of']}", flush=True)
+                    continue
                 print(f"[{self.TAG}]   {t:8s} {r:18s} {v['OUTCOME']:16s} "
                       + "  ".join(f"{k} " + "/".join(f"{v['pairs'][k]['sides'][m]['frac_pos' if m == '+' else 'frac_neg']:.2f}"
                                                      for m in "+-") for k in ax.CGD_PAIRS)
@@ -2819,7 +2828,7 @@ class AnimaRunner(_sr.SanaRunner):
         plain = res[refs["plain"]]["scores"]
         corners = {lab: res[n]["scores"] for lab, n in refs.items() if lab != "plain"}
         scores = {r: {t: res[ax.cgd_set_name(r, t, prefix=prefix)]["scores"] for t in tiers} for r in names}
-        reads = ax.cgd_reads(scores, plain, corners, amounts, spec["controls"], tiers)
+        reads = ax.cgd_reads(scores, plain, corners, amounts, spec["controls"], tiers, control_of=spec.get("control_of"))
 
         def tile(n, i):
             if i in res[n]["withheld"]:
@@ -2831,8 +2840,9 @@ class AnimaRunner(_sr.SanaRunner):
         for t in tiers:
             trows = ax.cgd_tier_rows(t)
             firsts = list(range(0, len(trows), ax.CGD_SPLITS[t]))      # the first description of each corner
-            grid = [[tile(refs["plain"], trows[j]["cell"]) for j in firsts],
-                    [tile(refs[ax.cgr_label(tuple(trows[j]["corner"]))], trows[j]["cell"]) for j in firsts]]
+            grid = [[tile(refs["plain"], trows[j]["cell"]) for j in firsts]]
+            if trows[0]["corner"] is not None:                         # the off-target tier has no corner: no group row
+                grid.append([tile(refs[ax.cgr_label(tuple(trows[j]["corner"]))], trows[j]["cell"]) for j in firsts])
             grid += [[tile(ax.cgd_set_name(r, t, prefix=prefix), j) for j in firsts] for r in names]
             _grid(grid, out_dir / f"sheet_{t}.jpg", tile=192)
         np.savez_compressed(out_dir / "tagger_probs.npz", tags=np.array(names), **{n: res[n]["probs"] for n in readers})

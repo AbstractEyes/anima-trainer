@@ -2340,6 +2340,64 @@ def test_near_tier_design_is_the_registered_one():
     assert ax.GROUP_READER_TESTS["e057"]["tiers"] == ("near",) and "tiers" not in ax.GROUP_READER_TESTS["e054"]
 
 
+def test_offtarget_tier_design_is_the_registered_one():
+    """e058's off-target tier: no word of any earlier wording list (the expression nouns aside), no word shared by two pairs,
+    each wording 8 times, the near tier's cells in order, no description repeated, no corner, one fixed shuffle; e054's 167
+    registered rows untouched; the spec pairs each framed reader with its untrained control."""
+    import collections
+    assert ax.cgo_checks() == {"clash": [], "shared": [], "nouns": []}
+    rows = ax.cgo_rows()
+    assert len(rows) == 32 and [r["id"] for r in rows] == [f"off{i:02d}" for i in range(32)] and ax.cgo_rows() == rows
+    assert len({tuple(r["words"]) for r in rows}) == 32 and ax.cgd_tier_rows("off") == rows
+    assert all(r["corner"] is None and r["split"] == "off" for r in rows)
+    for i, k in enumerate(ax.CGD_PAIRS):
+        got = collections.Counter(r["words"][i] for r in rows)
+        assert set(got) == set(ax.CGO_PHRASES[k]) and set(got.values()) == {8}
+    assert [r["cell"] for r in rows] == [r["cell"] for r in ax.cgn_rows()]
+    assert len(ax.cgd_rows()) == 167 and "off" not in {r["split"] for r in ax.cgd_rows()}
+    spec = ax.GROUP_READER_TESTS["e058"]
+    assert spec["tiers"] == ("off",) and spec["control_of"] == {"beatrix_framed": "beatrix_untrained_framed",
+                                                                "nano_framed": "birth_framed"}
+    assert set(spec["control_of"].values()) == set(spec["controls"])
+
+
+def test_offtarget_marks():
+    """e058's rule on made-up readings and scores: a reader whose amounts round to 0 stays plain (its pictures are the plain
+    ones); 24 of 32 at 0 is the line; a mean move of a quarter of the group's or more breaks it; a pair is credited only
+    when the reader's control moves it; the reading marks count the same zeros."""
+    rows = ax.cgo_rows()
+    plain = {k: [0.01 * (x % 3) for x in range(16)] for k in ax.CGD_PAIRS}
+    corners = {ax.cgr_label(c): {k: [7.0 * c[i] + plain[k][x] for x in range(16)] for i, k in enumerate(ax.CGD_PAIRS)}
+               for c in ax.CGR_CORNERS}
+
+    def pics(am):
+        return {"off": {k: [7.0 * ax.cgd_amounts(am[r["id"]])[i] + plain[k][r["cell"]] for r in rows]
+                        for i, k in enumerate(ax.CGD_PAIRS)}}
+
+    quiet = {r["id"]: [0.1, -0.12, 0.0] for r in rows}
+    edge = {r["id"]: ([0.5, 0.0, 0.0] if j < 8 else [0.0, 0.0, 0.0]) for j, r in enumerate(rows)}       # 24 of 32 at 0
+    over = {r["id"]: ([0.5, 0.0, 0.0] if j < 9 else [0.0, 0.0, 0.0]) for j, r in enumerate(rows)}       # 23 of 32 at 0
+    far = {r["id"]: ([1.5, 0.0, 0.0] if j < 8 else [0.0, 0.0, 0.0]) for j, r in enumerate(rows)}        # 24 at 0, moved .375
+    loud = {r["id"]: [0.5, -0.5, 1.0] for r in rows}
+    am = {"a": quiet, "b": edge, "c": over, "e": far, "d": loud}
+    out = ax.cgo_tier_reads({n: pics(a) for n, a in am.items()}, plain, corners, am, {"a": "d", "b": "a"})
+    per = out["readers"]
+    assert per["a"]["OUTCOME"] == "STAYS PLAIN ON THE GROUP" and per["a"]["plain_pictures"] == 32
+    assert per["a"]["pairs"]["hair_colour"]["mean_abs_move"] == pytest.approx(0.0) and per["a"]["credited"] == list(ax.CGD_PAIRS)
+    assert per["b"]["OUTCOME"] == "STAYS PLAIN ON THE GROUP" and per["b"]["pairs"]["hair_colour"]["zeros"] == 24
+    assert per["b"]["pairs"]["hair_colour"]["mean_abs_move"] == pytest.approx(0.125) and per["b"]["credited"] == []
+    assert per["c"]["OUTCOME"] == "STAYS PLAIN ON 2 OF 3" and per["c"]["pairs"]["hair_colour"]["OUTCOME"] == "MOVES IT"
+    assert per["e"]["pairs"]["hair_colour"]["mean_abs_move"] == pytest.approx(0.375)
+    assert per["e"]["pairs"]["hair_colour"]["OUTCOME"] == "MOVES IT" and per["e"]["credited"] == []
+    assert per["d"]["OUTCOME"] == "STAYS PLAIN ON NONE" and per["d"]["pairs"]["eye_colour"]["mean_move"] == pytest.approx(1.0)
+    assert out["controls_plain"] == {k: ["a"] for k in ax.CGD_PAIRS}
+    m = ax.cgo_tier_marks(edge)
+    assert m["OUTCOME"] == "PLAIN ON THE GROUP" and m["whole_descriptions"] == 24 and m["pairs"]["hair_colour"]["above"] == 0.25
+    assert ax.cgo_tier_marks(over)["OUTCOME"] == "PLAIN ON 2 OF 3"
+    full = ax.cgd_read_marks({**_reader_amounts(), **edge}, tiers=ax.CGO_TIERS)
+    assert full["tiers"]["off"] == m and full["train"]["total"] == 288
+
+
 def test_group_reader_items():
     """A reader's pictures: the plain prompt composed with one prompt per pair at the grid amount (a pair at 0 left out);
     all three at 0 is the plain set's item and all three at +-1 e053's slider group, but for the name."""
@@ -2579,5 +2637,45 @@ def test_group_readers_end_to_end(runner, fake_hub, monkeypatch):
     readme57 = repo.files_[f"experiments/{ax.CGN_TEST_ID}/README.md"].decode()
     assert "golden blonde hair" in readme57 and "### The near tier" in readme57 and "sheet_near.jpg" in readme57
     clean = ax.render_near_readers_readme({"status": "running"}, {"model": "Anima"})
+    for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery", "U2"):
+        assert word not in clean
+    # e058 on the same runtime: the off-target tier (cgo2_*_off), no sides; a framed reader credited against its control
+    off = [r["id"] for r in ax.cgo_rows()]
+
+    def offs(fn):
+        return {i: fn(j) for j, i in enumerate(off)}
+
+    O = {"source": "made up", "amounts": {
+        "qwen": offs(lambda j: [0.25 if j < 10 else 0.0, 0.0, 0.0]),
+        "beatrix": offs(lambda j: [0.1, -0.1, 0.1]),
+        "beatrix_framed": offs(lambda j: [0.0, 0.0, 0.0]),
+        "nano_framed": offs(lambda j: [0.75, 0.0, 0.0]),
+        "beatrix_untrained_framed": offs(lambda j: [0.5 if j % 2 else -0.5, 1.0, -0.25 if j % 3 else 0.25]),
+        "birth_framed": offs(lambda j: [0.0, 0.05, 0.0])}}
+    with pytest.raises(ValueError):
+        s.run_group_readers({"amounts": {"qwen": O["amounts"]["qwen"]}}, test="e058")
+    done = sum(rendered)
+    m58 = s.run_group_readers(O, test="e058")
+    r58 = m58["result"]
+    old |= {json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True) for v in p57.values() for it in v}
+    p58 = ax.cgd_plans(O["amounts"], ax.CGO_READERS, prefix="cgo", tiers=ax.CGO_TIERS)
+    new = {json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True) for v in p58.values() for it in v} - old
+    assert m58["id"] == ax.CGO_TEST_ID and r58["pictures"]["drawn"] == sum(rendered) - done == len(new) > 0
+    assert set(p58) == {n for n in r58["sets"] if n.startswith("cgo2_")} and all(n.endswith("_off") for n in p58)
+    assert list(r58["reads"]) == ["off"] and list(r58["amounts"]["qwen"]) == ["off"]
+    off_r = r58["reads"]["off"]["readers"]
+    assert off_r["beatrix_framed"]["OUTCOME"] == "STAYS PLAIN ON THE GROUP" and off_r["beatrix_framed"]["plain_pictures"] == 32
+    assert off_r["beatrix_untrained_framed"]["OUTCOME"] == "STAYS PLAIN ON NONE"
+    assert off_r["beatrix_framed"]["credited"] == list(ax.CGD_PAIRS)
+    assert off_r["nano_framed"]["OUTCOME"] == "STAYS PLAIN ON 2 OF 3" and off_r["nano_framed"]["credited"] == []
+    assert off_r["birth_framed"]["OUTCOME"] == "STAYS PLAIN ON THE GROUP" and off_r["birth_framed"]["credited"] == []
+    assert off_r["qwen"]["pairs"]["hair_colour"]["OUTCOME"] == "MOVES IT" and off_r["qwen"]["credited"] == []
+    assert off_r["beatrix"]["OUTCOME"] == "STAYS PLAIN ON THE GROUP" and off_r["beatrix"]["credited"] == []
+    assert r58["reads"]["off"]["controls_plain"]["hair_colour"] == ["birth_framed"]
+    readme58 = repo.files_[f"experiments/{ax.CGO_TEST_ID}/README.md"].decode()
+    assert "### The off-target tier" in readme58 and "sheet_off.jpg" in readme58 and "long hair" in readme58
+    assert "(sets/cgo2_*)" in readme58 and "**STAYS PLAIN ON THE GROUP**" in readme58
+    assert f"experiments/{ax.CGO_TEST_ID}/sheet_off.jpg" in repo.files_
+    clean = ax.render_offtarget_readers_readme({"status": "running"}, {"model": "Anima"})
     for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery", "U2"):
         assert word not in clean

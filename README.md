@@ -251,6 +251,13 @@ cache → two-phase train):
   the plain description, Beatrix and the framed nano tap in the framed grammar, two untrained controls in the framed
   grammar), one picture per description. The readings come from the data repo (`beatrix/cgn_readers.json`); pictures
   identical to earlier ones are copied; the readers' sets are kept there (`sets/cgn2_*`).
+- **`anima_colab_offtarget_readers.ipynb`**
+  [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_offtarget_readers.ipynb)
+  — e058 on **Anima**: the off-target tier. 32 descriptions that name no side of the group (long or wavy hair, a composed
+  look, small or close-set eyes), where the right amount is zero: the same six readers on their earlier readings; a reader
+  stays plain on a pair when its amounts round to zero and the pictures do not move, and a framed reader is credited
+  against its untrained control. The readings come from the data repo (`beatrix/cgo_readers.json`); a description read at
+  zero everywhere is the plain picture itself; the readers' sets are kept there (`sets/cgo2_*`).
 
 ## Programmatic / sweeps
 

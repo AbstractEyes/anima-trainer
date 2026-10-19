@@ -3142,7 +3142,7 @@ CGD_BED = 2                                 # the updated characters
 CGD_FRAMING = "upper body"
 CGD_READ_FORM = CPG_READ_FORM               # a description is read in e052's frame, at its closing full stop
 CGD_PLAIN_FRAME = PREFIX + "1girl, solo, upper body."       # the frame with no wording (descriptive)
-CGD_SPLITS = {"train": 12, "trained": 4, "unseen": 4, "near": 4}       # descriptions per corner (near: e057's tier)
+CGD_SPLITS = {"train": 12, "trained": 4, "unseen": 4, "near": 4, "off": 4}   # per corner (near: e057's; off: e058's, per sheet column)
 CGD_TIERS = ("trained", "unseen")           # trained: new combinations of training wordings; unseen: wordings never trained
 CGD_ORDERS = ((0, 1, 2), (1, 2, 0), (2, 0, 1), (0, 2, 1), (2, 1, 0), (1, 0, 2))   # the order the three wordings are written in
 CGD_SHARE_CAP = 2                           # of a side's 8 training wordings, at most this many share any one word
@@ -3256,7 +3256,10 @@ def cgd_rows() -> list[dict]:
 
 
 def cgd_tier_rows(tier: str) -> list[dict]:
-    """The descriptions of one tier: e054's registered rows for its tiers, e057's near rows (cgn_rows) for 'near'."""
+    """The descriptions of one tier: e054's registered rows for its tiers, e057's near rows (cgn_rows) for 'near', e058's
+    off-target rows (cgo_rows) for 'off'."""
+    if tier == "off":
+        return cgo_rows()
     return cgn_rows() if tier == "near" else [r for r in cgd_rows() if r["split"] == tier]
 
 
@@ -3324,6 +3327,9 @@ def cgd_read_marks(amounts: dict, tiers=CGD_TIERS) -> dict:
                            for i, k in enumerate(CGD_PAIRS)}, "tiers": {}}
     out["train"]["total"] = sum(out["train"][k] for k in CGD_PAIRS)
     for tier in tiers:
+        if tier == "off":                                              # e058: no sides; the right amount is 0
+            out["tiers"][tier] = cgo_tier_marks(amounts, tier)
+            continue
         trows = cgd_tier_rows(tier)
         A = np.array([amounts[r["id"]] for r in trows], dtype=float)
         C = np.array([r["corner"] for r in trows], dtype=float)
@@ -3348,7 +3354,8 @@ def cgd_read_marks(amounts: dict, tiers=CGD_TIERS) -> dict:
     return out
 
 
-def cgd_reads(scores: dict, plain: dict, corners: dict, amounts: dict, controls_of=CGD_CONTROLS, tiers=CGD_TIERS) -> dict:
+def cgd_reads(scores: dict, plain: dict, corners: dict, amounts: dict, controls_of=CGD_CONTROLS, tiers=CGD_TIERS,
+              control_of=None) -> dict:
     """The picture marks fixed before the run. scores = {reader: {tier: {pair: [score per picture, in the tier's
     description order]}}}; plain = {pair: [score per cell]} (the plain prompt's set); corners = {corner label: {pair:
     [score per cell]}} (e053's slider group at amount 1); amounts = {reader: {row id: [reading per pair]}}. Per reader,
@@ -3357,10 +3364,14 @@ def cgd_reads(scores: dict, plain: dict, corners: dict, amounts: dict, controls_
     all three are. Beside it: HOW FAR (the side's summed move over the summed move of the group at amount 1 on the same
     cells: at least CGD_FAR most of the way, under CGD_PART little, else part of the way), the pictures with every pair
     moved its way (of 32) and the grid amounts. The controls must drive no pair; a pair a control carries in a tier is
-    credited to no reader there."""
+    credited to no reader there. The off-target tier ('off', e058) has its own rule (cgo_tier_reads; control_of =
+    {reader: its control})."""
     import numpy as np
     out: dict = {}
     for tier in tiers:
+        if tier == "off":
+            out[tier] = cgo_tier_reads(scores, plain, corners, amounts, control_of, tier)
+            continue
         trows = cgd_tier_rows(tier)
         per = {}
         for reader, by_tier in scores.items():
@@ -3588,6 +3599,9 @@ def _framed_result_tail(meta: dict, res: dict, readers_file: str, tiers=CGD_TIER
             per = (r.get(tier) or {}).get("readers") or {}
             if not per:
                 continue
+            if tier == "off":
+                out += _offtarget_table(per)
+                continue
             out += [f"### The {tier} tier", "",
                     "| reader | verdict | " + " | ".join(f"{k.replace('_', ' ')} + / -" for k in CGD_PAIRS)
                     + " | all three moved | credited |",
@@ -3609,9 +3623,14 @@ def _framed_result_tail(meta: dict, res: dict, readers_file: str, tiers=CGD_TIER
         if pics:
             out += [f"Pictures: {pics.get('total')} read, {pics.get('drawn')} drawn in this run, {pics.get('copied')} copied "
                     f"from identical ones, {pics.get('reused')} reused.", ""]
-        out += ["Sheets (`sheet_<tier>.jpg`): one column per corner (the first description of each corner, on its own "
-                "character at the first seed); rows: the plain prompt, the group at amount 1, then the readers in the "
-                "order of the table above.", ""]
+        if all(t == "off" for t in tiers):
+            out += ["Sheet (`sheet_off.jpg`): one column per fourth description (on its own character and seed); rows: the "
+                    "plain prompt, then the readers in the order of the table above (a reader that stays plain shows the "
+                    "plain picture again).", ""]
+        else:
+            out += ["Sheets (`sheet_<tier>.jpg`): one column per corner (the first description of each corner, on its own "
+                    "character at the first seed); rows: the plain prompt, the group at amount 1, then the readers in the "
+                    "order of the table above.", ""]
         out += [f"![{t}](sheet_{t}.jpg)" for t in tiers] + [""]
     elif meta.get("status") == "failed":
         out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
@@ -3790,3 +3809,195 @@ def render_near_readers_readme(meta: dict, recipe: dict) -> str:
 
 GROUP_READER_TESTS["e057"] = dict(id=CGN_TEST_ID, title=CGN_TEST_TITLE, date=CGN_DATE, readers=CGN_READERS,
                                   controls=CGN_CONTROLS, prefix="cgn", render=render_near_readers_readme, tiers=CGN_TIERS)
+
+
+# ---- e058: the off-target tier: descriptions that name no side of the group; the right amount is 0 ---------------------------
+CGO_TEST_ID = "e058_anima_offtarget_readers"
+CGO_TEST_TITLE = ("The stock model: text readers read descriptions that name no side of the group (the hair's length or "
+                  "texture, a composed face, the eyes' shape) and should leave the three sliders at zero")
+CGO_DATE = "2026-10-19"
+CGO_SEED = 58
+CGO_TIERS = ("off",)
+CGO_PHRASES = {                             # 4 a pair: no value of the pair's dimension, no word of any earlier wording list
+    "hair_colour": tuple(w + _HAIR for w in ("long", "short", "wavy", "straight")),
+    "expression": ("a composed look", "an impassive face", "a stoic expression", "a blank expression"),
+    "eye_colour": ("small eyes", "close-set eyes", "upturned eyes", "almond-shaped eyes"),
+}
+CGO_NOUNS = frozenset({"look", "face", "expression"})    # expression nouns: the unseen wordings use them on both sides alike
+CGO_READERS = CGN_READERS
+CGO_CONTROLS = CGN_CONTROLS
+CGO_CONTROL_OF = {"beatrix_framed": "beatrix_untrained_framed", "nano_framed": "birth_framed"}
+CGO_ZEROS = 24                              # of 32 amounts at 0 to stay plain: three quarters, the carried rule's share
+CGO_MOVE = 0.25                             # the mean absolute move under one grid step of the group's full move
+
+
+def cgo_checks() -> dict:
+    """The off-target wordings' rule, fixed before any read: no word of an off-target wording (the overlap rule's word split,
+    the expression nouns aside) appears in any wording of any earlier list (every pair, side and tier of e050-e057); no word
+    is shared by two pairs' off-target wordings; each expression noun appears on both unseen expression sides.
+    -> {'clash': [...], 'shared': [...], 'nouns': [...]}, all empty."""
+    seen: set = set()
+    for lists in (CPG_PHRASES, CGD_PHRASES, CGN_PHRASES):
+        for P in lists.values():
+            for ws in P.values():
+                for w in ws:
+                    seen |= cpg_words(w)
+    own = {k: set().union(*(cpg_words(w) - CGO_NOUNS for w in ws)) for k, ws in CGO_PHRASES.items()}
+    out: dict = {"clash": [], "shared": [], "nouns": []}
+    for k, ws in CGO_PHRASES.items():
+        for w in ws:
+            hit = (cpg_words(w) - CGO_NOUNS) & seen
+            if hit:
+                out["clash"].append((k, w, sorted(hit)))
+    ks = list(CGO_PHRASES)
+    for a in range(len(ks)):
+        for b in range(a + 1, len(ks)):
+            if own[ks[a]] & own[ks[b]]:
+                out["shared"].append((ks[a], ks[b], sorted(own[ks[a]] & own[ks[b]])))
+    sides = [set().union(*(cpg_words(w) for w in CGD_PHRASES["expression"]["unseen" + s])) for s in "+-"]
+    out["nouns"] = sorted(n for n in CGO_NOUNS if not all(n in s for s in sides))
+    return out
+
+
+def cgo_rows() -> list[dict]:
+    """e058's off-target tier: 32 descriptions, one off-target wording a pair (each pair's four wordings 8 times, a seeded
+    shuffle), joined by commas in one of six orders, the i-th on the i-th near description's cell; no corner (the right
+    amount is 0 on every pair); the first shuffle from CGO_SEED with no description repeated."""
+    cells = [r["cell"] for r in cgn_rows()]
+    for attempt in range(1000):
+        seed = CGO_SEED + 1000 * attempt
+        pools = [_cgd_cycle(CGO_PHRASES[k], len(cells), seed + 10 * i) for i, k in enumerate(CGD_PAIRS)]
+        rows = []
+        for j, cell in enumerate(cells):
+            words = [pools[i][j] for i in range(len(CGD_PAIRS))]
+            order = CGD_ORDERS[j % len(CGD_ORDERS)]
+            text = ", ".join(words[i] for i in order)
+            rows.append({"id": f"off{j:02d}", "split": "off", "corner": None, "words": words, "order": list(order),
+                         "text": text, "frame": CGD_READ_FORM.format(w=text), "cell": cell})
+        if len({tuple(r["words"]) for r in rows}) == len(rows):
+            return rows
+    raise RuntimeError("no shuffle met the rules")  # pragma: no cover
+
+
+def cgo_tier_marks(amounts: dict, tier: str = "off") -> dict:
+    """The off-target tier's reading marks (no pictures). amounts = {row id: [reading per pair]}. Per pair: the grid amounts
+    at 0 (of 32), the mean amount size, the shares above and below 0; the pair is read PLAIN when at least CGO_ZEROS
+    amounts are 0; the descriptions with all three at 0 (their picture is the plain picture)."""
+    rows = cgd_tier_rows(tier)
+    G = [cgd_amounts(amounts[r["id"]]) for r in rows]
+    pairs = {}
+    for i, k in enumerate(CGD_PAIRS):
+        g = [a[i] for a in G]
+        zeros = sum(1 for x in g if x == 0)
+        pairs[k] = {"zeros": zeros, "of": len(g), "mean_size": sum(abs(x) for x in g) / len(g),
+                    "above": sum(1 for x in g if x > 0) / len(g), "below": sum(1 for x in g if x < 0) / len(g),
+                    "plain": zeros >= CGO_ZEROS}
+    n = sum(v["plain"] for v in pairs.values())
+    return {"pairs": pairs, "whole_descriptions": sum(1 for a in G if not any(a)), "of": len(rows),
+            "OUTCOME": ("PLAIN ON THE GROUP" if n == len(CGD_PAIRS) else
+                        f"PLAIN ON {n} OF {len(CGD_PAIRS)}" if n else "PLAIN ON NONE")}
+
+
+def cgo_tier_reads(scores: dict, plain: dict, corners: dict, amounts: dict, control_of=None, tier: str = "off") -> dict:
+    """The off-target tier's picture marks, fixed before the run. Per reader and pair: the 32 grid amounts (an amount under
+    an eighth is 0 and leaves the pair's slider off) and the 32 pictures' moves on the pair's score against their cell's
+    plain picture, each over the group's full move on that cell (the mean size of the eight corners' moves at amount 1). The
+    pair STAYS PLAIN when at least CGO_ZEROS amounts are 0 and the mean absolute move is under CGO_MOVE; the reader STAYS
+    PLAIN ON THE GROUP when all three pairs do. Credited: a pair a reader stays plain on while its control (control_of =
+    {reader: its control}) does not; a reference (no control) and a control are credited nothing."""
+    import numpy as np
+    rows = cgd_tier_rows(tier)
+    full = {k: [float(np.mean([abs(float(c[k][r["cell"]]) - float(plain[k][r["cell"]])) for c in corners.values()]))
+                for r in rows] for k in CGD_PAIRS}
+    per = {}
+    for reader, by_tier in scores.items():
+        S = by_tier[tier]
+        G = [cgd_amounts(amounts[reader][r["id"]]) for r in rows]
+        pairs = {}
+        for i, k in enumerate(CGD_PAIRS):
+            rel = [(float(S[k][j]) - float(plain[k][r["cell"]])) / full[k][j] if full[k][j] else 0.0
+                   for j, r in enumerate(rows)]
+            g = [a[i] for a in G]
+            zeros = sum(1 for x in g if x == 0)
+            move = float(np.mean(np.abs(rel)))
+            pairs[k] = {"zeros": zeros, "of": len(rows), "mean_size": float(np.mean(np.abs(g))), "mean_abs_move": move,
+                        "mean_move": float(np.mean(rel)), "above": sum(1 for x in g if x > 0) / len(g),
+                        "below": sum(1 for x in g if x < 0) / len(g), "amounts": g,
+                        "OUTCOME": "STAYS PLAIN" if zeros >= CGO_ZEROS and move < CGO_MOVE else "MOVES IT"}
+        n = sum(v["OUTCOME"] == "STAYS PLAIN" for v in pairs.values())
+        per[reader] = {"pairs": pairs, "plain_pairs": [k for k in CGD_PAIRS if pairs[k]["OUTCOME"] == "STAYS PLAIN"],
+                       "plain_pictures": sum(1 for a in G if not any(a)), "of": len(rows),
+                       "OUTCOME": ("STAYS PLAIN ON THE GROUP" if n == len(CGD_PAIRS) else
+                                   f"STAYS PLAIN ON {n} OF {len(CGD_PAIRS)}" if n else "STAYS PLAIN ON NONE")}
+    control_of = control_of or {}
+    for reader, v in per.items():
+        c = control_of.get(reader)
+        v["control"] = c
+        v["credited"] = [k for k in v["plain_pairs"] if k not in per[c]["plain_pairs"]] if c in per else []
+    controls = sorted(set(control_of.values()))
+    return {"readers": per, "controls_plain": {k: [c for c in controls if c in per and k in per[c]["plain_pairs"]]
+                                               for k in CGD_PAIRS}}
+
+
+def _offtarget_table(per: dict) -> list:
+    """The off-target tier's result table (e058)."""
+    out = ["### The off-target tier", "",
+           "| reader | verdict | " + " | ".join(k.replace("_", " ") for k in CGD_PAIRS) + " | pictures left plain | credited |",
+           "|---|---|" + "---|" * len(CGD_PAIRS) + "---|---|"]
+    for name, v in per.items():
+        cells = [f"{p['OUTCOME'].lower()}: {p['zeros']} of {p['of']} at 0, size {p['mean_size']:.2f}, move "
+                 f"{p['mean_abs_move']:.2f}" for p in (v["pairs"][k] for k in CGD_PAIRS)]
+        out.append(f"| {name} | **{v['OUTCOME']}** | " + " | ".join(cells) + f" | {v['plain_pictures']} of {v['of']} | "
+                   + (", ".join(v["credited"]) or "none") + " |")
+    return out + ["", "Each cell: the pair's verdict, the amounts at 0, the mean amount size and the mean absolute move of the "
+                  "pictures on the pair as a share of the group's full move. Credited: a pair the reader stays plain on while "
+                  "its untrained control does not.", ""]
+
+
+def render_offtarget_readers_readme(meta: dict, recipe: dict) -> str:
+    """e058's README: the off-target wordings, the readers on their registered fits, the rule fixed before the run; the result
+    when done."""
+    res = meta.get("result") or {}
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    readers = "\n".join(f"| {r} | {n} |" for r, n in CGN_NAMES.items())
+    words = "\n".join(f"| {k.replace('_', ' ')} | {', '.join(CGO_PHRASES[k])} | {', '.join(CGD_PHRASES[k]['train+'])} / "
+                      f"{', '.join(CGD_PHRASES[k]['train-'])} |" for k in CGD_PAIRS)
+    out = [f"# {CGO_TEST_ID}: {CGO_TEST_TITLE}", "",
+           f"Date: {CGO_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Why",
+           f"In {CGB_TEST_ID} Beatrix, read in the framed grammar, set small amounts on wordings she could not read (her "
+           "pictures stayed near the plain one), where an untrained model of her shape set large amounts that went either "
+           "way. A text reader wired into a picture system meets many descriptions that name none of its sliders' sides, and "
+           "there the right amount is zero. Here every description names the three attributes without any value of the "
+           "group's dimensions (the hair's length or texture, a composed face, the eyes' shape): does each reader leave the "
+           "sliders at zero, and does training add that over an untrained reader of the same shape?", "",
+           "## Design",
+           "- **The off-target wordings** (fixed before any read; no word of them appears in any wording of the earlier "
+           "tests, the expression nouns look, face and expression aside, which the unseen wordings use on both sides alike; "
+           "none names a hair colour, a smile or a frown, or an eye colour):", "",
+           "| pair | off-target wordings | the pair's training wordings (+ / -) |", "|---|---|---|", words, "",
+           "- **The tier**: 32 descriptions, one off-target wording a pair (each wording 8 times), joined with commas in one "
+           f"of six orders, on the characters and seeds of {CGN_TEST_ID}'s tier, read against the same plain pictures and "
+           "the same group at amount 1.",
+           "- **The readings**: each reader's own fit on the 96 training descriptions, as registered in its earlier test; "
+           "the off-target descriptions are read with that full fit. The amount on the picture: the reading rounded to a "
+           "quarter step, clipped to [-1.5, 1.5]; an amount under an eighth is 0 and leaves the pair's slider off, so a "
+           "description read at 0 on all three pairs is the plain picture itself.",
+           "- **The readers**:", "", "| reader | what it is |", "|---|---|", readers, "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           "Per reader and pair: the 32 grid amounts and the 32 pictures' moves on the pair's score against their cell's "
+           "plain picture, each as a share of the group's full move on that cell (the mean size of the eight corners' moves "
+           f"at amount 1). The pair **STAYS PLAIN** when at least {CGO_ZEROS} of 32 amounts are 0 and the mean absolute move "
+           f"is under {CGO_MOVE}; a reader **STAYS PLAIN ON THE GROUP** when all three pairs do. Beatrix in the framed "
+           "grammar is credited against her untrained copy, the framed nano tap against its body untrained: a pair is "
+           "credited when the reader stays plain on it and its control does not. Qwen3 and Beatrix on the plain description "
+           "are references.", ""]
+    out += _framed_result_tail(meta, res, "every reader's readings of the off-target descriptions (each on its registered "
+                                          "fit), the reading marks, which block and position each reader is.", CGO_TIERS)
+    return "\n".join(out)
+
+
+GROUP_READER_TESTS["e058"] = dict(id=CGO_TEST_ID, title=CGO_TEST_TITLE, date=CGO_DATE, readers=CGO_READERS,
+                                  controls=CGO_CONTROLS, control_of=CGO_CONTROL_OF, prefix="cgo",
+                                  render=render_offtarget_readers_readme, tiers=CGO_TIERS)
