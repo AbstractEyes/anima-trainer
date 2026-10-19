@@ -146,6 +146,24 @@ the runner's release tag, then `setup()` → `run_counterpoint_words()`.
   view; the other seven characters' pictures are the earlier sets', reused through `prefetch_first_bed()`). The readers' amounts come from a separate reading step
   (`readers.json`); the notebook never runs the text models.
 
+## `anima_colab_near_readers.ipynb`
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_near_readers.ipynb)
+
+**e057, the near tier** (`AnimaRunner.run_group_readers(readers, test="e057")`), uploaded into
+`experiments/e057_anima_near_readers` of
+[AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). The bootstrap checks out
+the runner's release tag (v0.9.0), then `setup()` → `run_group_readers(<the readers file from the data repo>, test="e057")`.
+
+- **The question:** every reader reads the wordings it trained on (by their spelling) and no byte-level reader reads
+  wordings that share no word with training. Do the readers reach new combinations of words they know, does the framed
+  grammar carry them better than the plain description, and does training add anything an untrained reader lacks?
+- **The near wordings** (`cgn_checks()`, fixed before any read): every word is one the same side's training wordings use,
+  none is a training wording, none shares a word with the other side's or another pair's training wordings. 32
+  descriptions (`cgn_rows()`), 4 a corner, on the tiers' characters and seeds; the earlier tests' descriptions untouched.
+- **The readers:** each with its earlier fit on the 96 training descriptions (the same block, read position and
+  strength): Qwen3 and Beatrix on the plain description, Beatrix and the framed nano tap in the framed grammar, and the two
+  untrained controls in the framed grammar. The readings are stored in the data repo's `beatrix/cgn_readers.json`.
+
 ## `anima_colab_beatrix_framed.ipynb`
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_beatrix_framed.ipynb)
 

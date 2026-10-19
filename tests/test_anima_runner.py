@@ -2319,6 +2319,27 @@ def test_group_reader_design_is_the_registered_one():
         assert word not in readme
 
 
+def test_near_tier_design_is_the_registered_one():
+    """e057's near tier: every near wording made only of its own side's training words (no other side's or pair's word, none a
+    training wording), each used 4 times a side, the tiers' cells (2 a cell, 4 characters a corner), no description repeated,
+    one fixed shuffle; e054's 167 registered rows untouched (the near rows are a tier of their own)."""
+    import collections
+    assert ax.cgn_checks() == {"foreign": [], "clash": [], "identical": []}
+    rows = ax.cgn_rows()
+    assert len(rows) == 32 and [r["id"] for r in rows] == [f"near{i:02d}" for i in range(32)] and ax.cgn_rows() == rows
+    assert len({tuple(r["words"]) for r in rows}) == 32 and ax.cgd_tier_rows("near") == rows
+    for i, k in enumerate(ax.CGD_PAIRS):
+        for side, m in ((1, "+"), (-1, "-")):
+            got = collections.Counter(r["words"][i] for r in rows if r["corner"][i] == side)
+            assert set(got) == set(ax.CGN_PHRASES[k]["near" + m]) and set(got.values()) == {4}
+    assert collections.Counter(r["cell"] for r in rows) == {c: 2 for c in range(16)}
+    for c in ax.CGR_CORNERS:
+        assert len({ax.attr_cells()[r["cell"]][0] for r in rows if tuple(r["corner"]) == c}) == 4
+    assert len(ax.cgd_rows()) == 167 and "near" not in {r["split"] for r in ax.cgd_rows()}
+    assert ax.cgd_tier_rows("unseen") == [r for r in ax.cgd_rows() if r["split"] == "unseen"]
+    assert ax.GROUP_READER_TESTS["e057"]["tiers"] == ("near",) and "tiers" not in ax.GROUP_READER_TESTS["e054"]
+
+
 def test_group_reader_items():
     """A reader's pictures: the plain prompt composed with one prompt per pair at the grid amount (a pair at 0 left out);
     all three at 0 is the plain set's item and all three at +-1 e053's slider group, but for the name."""
@@ -2352,7 +2373,7 @@ def _reader_amounts(flip: "str | None" = None, scale: float = 1.0, drag: float =
     """Made-up readings: every description read at its corner times `scale`; `flip` names a pair read backwards on its -
     side; `drag` moves the hair reading with the eye colour's side; `only` keeps one pair (the rest at 0)."""
     out = {}
-    for r in ax.cgd_rows():
+    for r in ax.cgd_rows() + ax.cgn_rows():
         c = r["corner"] or [0, 0, 0]
         a = [scale * x for x in c]
         if flip and c[ax.CGD_PAIRS.index(flip)] < 0:
@@ -2531,5 +2552,32 @@ def test_group_readers_end_to_end(runner, fake_hub, monkeypatch):
     readme56 = repo.files_[f"experiments/{ax.CGB_TEST_ID}/README.md"].decode()
     assert "never trained on frames" in readme56 and "held-out-words reading" in readme56
     clean = ax.render_beatrix_framed_readme({"status": "running"}, {"model": "Anima"})
+    for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery", "U2"):
+        assert word not in clean
+    # e057 on the same runtime: the near tier (cgn2_*_near), six readers, two controls; nothing of the earlier tiers drawn again
+    N = {"source": "made up", "amounts": {"qwen": _reader_amounts(), "beatrix": _reader_amounts(scale=0.5),
+                                          "beatrix_framed": _reader_amounts(flip="expression"),
+                                          "nano_framed": _reader_amounts(scale=1.25),
+                                          "beatrix_untrained_framed": _reader_amounts(only="eye_colour"),
+                                          "birth_framed": _reader_amounts(scale=0.0)}}
+    with pytest.raises(ValueError):
+        s.run_group_readers(B, test="e057")                            # e056's readers are not e057's
+    done = sum(rendered)
+    m57 = s.run_group_readers(N, test="e057")
+    r57 = m57["result"]
+    old |= {json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True)
+            for v in ax.cgd_plans(B["amounts"], ax.CGB_READERS, prefix="cgb").values() for it in v}
+    p57 = ax.cgd_plans(N["amounts"], ax.CGN_READERS, prefix="cgn", tiers=ax.CGN_TIERS)
+    new = {json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True) for v in p57.values() for it in v} - old
+    assert m57["id"] == ax.CGN_TEST_ID and r57["pictures"]["drawn"] == sum(rendered) - done == len(new) > 0
+    assert set(p57) == {n for n in r57["sets"] if n.startswith("cgn2_")} and all(n.endswith("_near") for n in p57)
+    assert list(r57["reads"]) == ["near"] and list(r57["amounts"]["qwen"]) == ["near"]
+    near = r57["reads"]["near"]
+    assert near["readers"]["qwen"]["OUTCOME"] == "DRIVES THE GROUP" and near["readers"]["birth_framed"]["OUTCOME"] == "DRIVES NONE"
+    assert near["controls_carrying"]["eye_colour"] == ["beatrix_untrained_framed"]
+    assert near["readers"]["qwen"]["credited"] == ["hair_colour", "expression"]
+    readme57 = repo.files_[f"experiments/{ax.CGN_TEST_ID}/README.md"].decode()
+    assert "golden blonde hair" in readme57 and "### The near tier" in readme57 and "sheet_near.jpg" in readme57
+    clean = ax.render_near_readers_readme({"status": "running"}, {"model": "Anima"})
     for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery", "U2"):
         assert word not in clean

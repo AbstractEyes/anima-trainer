@@ -3142,7 +3142,7 @@ CGD_BED = 2                                 # the updated characters
 CGD_FRAMING = "upper body"
 CGD_READ_FORM = CPG_READ_FORM               # a description is read in e052's frame, at its closing full stop
 CGD_PLAIN_FRAME = PREFIX + "1girl, solo, upper body."       # the frame with no wording (descriptive)
-CGD_SPLITS = {"train": 12, "trained": 4, "unseen": 4}       # descriptions per corner
+CGD_SPLITS = {"train": 12, "trained": 4, "unseen": 4, "near": 4}       # descriptions per corner (near: e057's tier)
 CGD_TIERS = ("trained", "unseen")           # trained: new combinations of training wordings; unseen: wordings never trained
 CGD_ORDERS = ((0, 1, 2), (1, 2, 0), (2, 0, 1), (0, 2, 1), (2, 1, 0), (1, 0, 2))   # the order the three wordings are written in
 CGD_SHARE_CAP = 2                           # of a side's 8 training wordings, at most this many share any one word
@@ -3211,11 +3211,12 @@ def _cgd_cycle(words, n: int, seed: int) -> list:
 
 def _cgd_split(split: str, seed: int) -> list[dict]:
     n = CGD_SPLITS[split]
-    lists = "unseen" if split == "unseen" else "train"
+    lists = split if split in ("unseen", "near") else "train"
+    phrases = CGN_PHRASES if split == "near" else CGD_PHRASES
     pools = {}
     for i, k in enumerate(CGD_PAIRS):
         for s, m in ((1, "+"), (-1, "-")):
-            pools[(k, s)] = _cgd_cycle(CGD_PHRASES[k][lists + m], n * len(CGR_CORNERS) // 2, seed + 10 * i + (s > 0))
+            pools[(k, s)] = _cgd_cycle(phrases[k][lists + m], n * len(CGR_CORNERS) // 2, seed + 10 * i + (s > 0))
     rows = []
     for ci, c in enumerate(CGR_CORNERS):
         for j in range(n):
@@ -3254,6 +3255,11 @@ def cgd_rows() -> list[dict]:
     return train + trained + unseen + desc
 
 
+def cgd_tier_rows(tier: str) -> list[dict]:
+    """The descriptions of one tier: e054's registered rows for its tiers, e057's near rows (cgn_rows) for 'near'."""
+    return cgn_rows() if tier == "near" else [r for r in cgd_rows() if r["split"] == tier]
+
+
 def cgd_amounts(a) -> list[float]:
     """A reader's three readings on the picture grid (e052's: quarter steps, clipped to the range the slider was measured
     on)."""
@@ -3272,9 +3278,7 @@ def cgd_items(tier: str, amounts: dict, bed: int = CGD_BED) -> list[dict]:
     pair is e053's slider group. Captioned with the plain prompt. amounts = {row id: [reading per pair]}."""
     cells = attr_cells()
     out = []
-    for r in cgd_rows():
-        if r["split"] != tier:
-            continue
+    for r in cgd_tier_rows(tier):
         ci, sd = cells[r["cell"]]
         plain = cp_prompt(None, CGD_FRAMING, ci, bed)
         it = {"name": f"{r['id']}_{ci:02d}_{sd}", "seed": sd, "caption": plain, "prompt": plain}
@@ -3286,11 +3290,11 @@ def cgd_items(tier: str, amounts: dict, bed: int = CGD_BED) -> list[dict]:
     return out
 
 
-def cgd_plans(amounts: dict, readers=None, bed: int = CGD_BED, prefix: str = "cgd") -> dict:
-    """{set name: items} of the readers' sets in drawing order (per reader: the trained tier, then the unseen tier).
-    amounts = {reader: {row id: [reading per pair]}}."""
+def cgd_plans(amounts: dict, readers=None, bed: int = CGD_BED, prefix: str = "cgd", tiers=CGD_TIERS) -> dict:
+    """{set name: items} of the readers' sets in drawing order (per reader: its tiers in order; e054's are the trained tier,
+    then the unseen tier). amounts = {reader: {row id: [reading per pair]}}."""
     return {cgd_set_name(r, t, bed, prefix): cgd_items(t, amounts[r], bed) for r in (readers or CGD_READERS)
-            for t in CGD_TIERS}
+            for t in tiers}
 
 
 def cgd_refs(bed: int = CGD_BED) -> dict:
@@ -3306,7 +3310,7 @@ def cgd_ref_plans(bed: int = CGD_BED) -> dict:
             **{cgr_set_name(c, "sliders", bed): cgr_items(c, "sliders", bed) for c in CGR_CORNERS}}
 
 
-def cgd_read_marks(amounts: dict) -> dict:
+def cgd_read_marks(amounts: dict, tiers=CGD_TIERS) -> dict:
     """The reading marks (no pictures) of one reader. amounts = {row id: [reading per pair]}, a training row read left out.
     'train': per pair the training descriptions read on their side (of 96) and the total (of 288): the picks' statistic,
     blind to the tiers. Per tier and pair: per side the 16 readings under the words rule in the side's direction (READS
@@ -3319,8 +3323,8 @@ def cgd_read_marks(amounts: dict) -> dict:
     out: dict = {"train": {k: int(sum(1 for r in tr if np.sign(amounts[r["id"]][i]) == r["corner"][i]))
                            for i, k in enumerate(CGD_PAIRS)}, "tiers": {}}
     out["train"]["total"] = sum(out["train"][k] for k in CGD_PAIRS)
-    for tier in CGD_TIERS:
-        trows = [r for r in rows if r["split"] == tier]
+    for tier in tiers:
+        trows = cgd_tier_rows(tier)
         A = np.array([amounts[r["id"]] for r in trows], dtype=float)
         C = np.array([r["corner"] for r in trows], dtype=float)
         pairs = {}
@@ -3344,7 +3348,7 @@ def cgd_read_marks(amounts: dict) -> dict:
     return out
 
 
-def cgd_reads(scores: dict, plain: dict, corners: dict, amounts: dict, controls_of=CGD_CONTROLS) -> dict:
+def cgd_reads(scores: dict, plain: dict, corners: dict, amounts: dict, controls_of=CGD_CONTROLS, tiers=CGD_TIERS) -> dict:
     """The picture marks fixed before the run. scores = {reader: {tier: {pair: [score per picture, in the tier's
     description order]}}}; plain = {pair: [score per cell]} (the plain prompt's set); corners = {corner label: {pair:
     [score per cell]}} (e053's slider group at amount 1); amounts = {reader: {row id: [reading per pair]}}. Per reader,
@@ -3355,10 +3359,9 @@ def cgd_reads(scores: dict, plain: dict, corners: dict, amounts: dict, controls_
     moved its way (of 32) and the grid amounts. The controls must drive no pair; a pair a control carries in a tier is
     credited to no reader there."""
     import numpy as np
-    rows = cgd_rows()
     out: dict = {}
-    for tier in CGD_TIERS:
-        trows = [r for r in rows if r["split"] == tier]
+    for tier in tiers:
+        trows = cgd_tier_rows(tier)
         per = {}
         for reader, by_tier in scores.items():
             S = by_tier[tier]
@@ -3575,13 +3578,13 @@ def render_framed_readers_readme(meta: dict, recipe: dict) -> str:
     return "\n".join(out)
 
 
-def _framed_result_tail(meta: dict, res: dict, readers_file: str) -> list:
-    """The result, files and references sections of the READMEs of the readings in the framed grammar (e055, e056)."""
+def _framed_result_tail(meta: dict, res: dict, readers_file: str, tiers=CGD_TIERS) -> list:
+    """The result, files and references sections of the READMEs of the readings in the framed grammar (e055-e057)."""
     out: list = []
     if meta.get("status") == "done":
         r = res.get("reads") or {}
         out += ["## Result", meta.get("summary", ""), ""]
-        for tier in CGD_TIERS:
+        for tier in tiers:
             per = (r.get(tier) or {}).get("readers") or {}
             if not per:
                 continue
@@ -3609,7 +3612,7 @@ def _framed_result_tail(meta: dict, res: dict, readers_file: str) -> list:
         out += ["Sheets (`sheet_<tier>.jpg`): one column per corner (the first description of each corner, on its own "
                 "character at the first seed); rows: the plain prompt, the group at amount 1, then the readers in the "
                 "order of the table above.", ""]
-        out += [f"![{t}](sheet_{t}.jpg)" for t in CGD_TIERS] + [""]
+        out += [f"![{t}](sheet_{t}.jpg)" for t in tiers] + [""]
     elif meta.get("status") == "failed":
         out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
     else:
@@ -3686,3 +3689,104 @@ def render_beatrix_framed_readme(meta: dict, recipe: dict) -> str:
 
 GROUP_READER_TESTS["e056"] = dict(id=CGB_TEST_ID, title=CGB_TEST_TITLE, date=CGB_DATE, readers=CGB_READERS,
                                   controls=CGB_CONTROLS, prefix="cgb", render=render_beatrix_framed_readme)
+
+
+# ---- e057: the near tier: new wordings made only of words each side's training wordings use ---------------------------------
+CGN_TEST_ID = "e057_anima_near_readers"
+CGN_TEST_TITLE = ("The stock model: text readers set the three group sliders from new wordings made of words they trained on "
+                  "(the near tier), read as plain captions and in the framed grammar")
+CGN_DATE = "2026-10-19"
+CGN_SEED = 57
+CGN_TIERS = ("near",)
+CGN_PHRASES = {                             # 4 a side: every word one the same side's training wordings use
+    "hair_colour": {"near+": tuple(w + _HAIR for w in ("golden blonde", "pale blonde", "bright yellow", "light golden")),
+                    "near-": tuple(w + _HAIR for w in ("very black", "raven black", "inky black", "jet dark"))},
+    "expression": {"near+": ("a warm grin", "a cheerful smile", "grinning sweetly", "laughing sweetly"),
+                   "near-": ("a fierce frown", "a deep scowl", "scowling angrily", "glaring angrily")},
+    "eye_colour": {"near+": ("crimson-red eyes", "ruby-red eyes", "scarlet-red eyes", "garnet-red eyes"),
+                   "near-": ("sapphire-blue eyes", "navy-blue eyes", "cobalt-blue eyes", "azure-blue eyes")},
+}
+CGN_READERS = ("qwen", "beatrix", "beatrix_framed", "nano_framed", "beatrix_untrained_framed", "birth_framed")
+CGN_CONTROLS = ("beatrix_untrained_framed", "birth_framed")
+CGN_NAMES = {"qwen": "Qwen3 0.6B, final state, reading the plain description (the reference; its training fit of "
+                     f"{CGD_TEST_ID})",
+             "beatrix": f"Beatrix 3s, block 20, reading the plain description (her training fit of {CGD_TEST_ID})",
+             "beatrix_framed": f"Beatrix read in the framed grammar (her block, position and training fit of {CGB_TEST_ID})",
+             "nano_framed": f"the framed nano tap of {CGF_TEST_ID} (its block, position and training fit)",
+             "beatrix_untrained_framed": f"an untrained model of Beatrix's shape in the framed grammar ({CGB_TEST_ID}'s "
+                                         "control; a control that must fail)",
+             "birth_framed": f"the framed nano tap's body untrained ({CGF_TEST_ID}'s control; a control that must fail)"}
+
+
+def cgn_checks() -> dict:
+    """The near wordings' rule, fixed before any read: every word of a near wording (the overlap rule's word split) is a word
+    the same side's training wordings use; none is identical to a training wording; none shares a word with the other side's
+    or another pair's training wordings. -> {'foreign': [...], 'clash': [...], 'identical': [...]}, all empty."""
+    own = {(k, s): set().union(*(cpg_words(w) for w in CGD_PHRASES[k]["train" + s])) for k in CGD_PAIRS for s in "+-"}
+    train = {w for k in CGD_PAIRS for s in "+-" for w in CGD_PHRASES[k]["train" + s]}
+    out: dict = {"foreign": [], "clash": [], "identical": []}
+    for k in CGD_PAIRS:
+        for s in "+-":
+            others = set().union(*(v for key, v in own.items() if key != (k, s)))
+            for w in CGN_PHRASES[k]["near" + s]:
+                cw = cpg_words(w)
+                if cw - own[(k, s)]:
+                    out["foreign"].append((k, s, w, sorted(cw - own[(k, s)])))
+                if cw & others:
+                    out["clash"].append((k, s, w, sorted(cw & others)))
+                if w in train:
+                    out["identical"].append((k, s, w))
+    return out
+
+
+def cgn_rows() -> list[dict]:
+    """e057's near tier: 32 descriptions (4 a corner), one near wording per pair joined by commas in one of six orders, on the
+    tiers' cells (e054's references hold); the first shuffle from CGN_SEED with no description repeated."""
+    for attempt in range(1000):
+        rows = _cgd_split("near", CGN_SEED + 1000 * attempt)
+        if len({tuple(r["words"]) for r in rows}) == len(rows):
+            return rows
+    raise RuntimeError("no shuffle met the rules")  # pragma: no cover
+
+
+def render_near_readers_readme(meta: dict, recipe: dict) -> str:
+    """e057's README: the near wordings, the readers on their registered fits, e054's rule; the result when done."""
+    res = meta.get("result") or {}
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    readers = "\n".join(f"| {r} | {n} |" for r, n in CGN_NAMES.items())
+    words = "\n".join(f"| {k.replace('_', ' ')} | {s} | {', '.join(CGN_PHRASES[k]['near' + s])} | "
+                      f"{', '.join(CGD_PHRASES[k]['train' + s])} |" for k in CGD_PAIRS for s in "+-")
+    out = [f"# {CGN_TEST_ID}: {CGN_TEST_TITLE}", "",
+           f"Date: {CGN_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Why",
+           f"In {CGD_TEST_ID}, {CGF_TEST_ID} and {CGB_TEST_ID} every reader, untrained ones included, read the wordings it "
+           "had trained on (by their spelling), and no byte-level reader read wordings that share no word with training. "
+           "Between the two lies the case a person meets most: new wordings made of words the reader has seen (golden "
+           "blonde, a fierce frown, sapphire-blue eyes). Does a reader's conditioning reach new combinations of known words, "
+           "does the framed grammar carry them better than the plain caption, and does training add anything an untrained "
+           "reader of the same shape lacks?", "",
+           "## Design",
+           "- **The near wordings** (fixed before any read; every word is one the same side's training wordings use, none is "
+           "a training wording, none shares a word with the other side's or another pair's training wordings):", "",
+           "| pair | side | near wordings | the side's training wordings |", "|---|---|---|---|", words, "",
+           f"- **The tier**: 32 descriptions (4 a corner), built as {CGD_TEST_ID}'s unseen tier (one wording a pair, joined "
+           "with commas in one of six orders), on the same characters and seeds, read against the same plain pictures and "
+           "the same group at amount 1.",
+           "- **The readings**: each reader's own fit on the 96 training descriptions, as registered in its earlier test "
+           "(the same block, read position and strength); the near descriptions are read with that full fit. The amount on "
+           "the picture: the reading rounded to a quarter step, clipped to [-1.5, 1.5].",
+           "- **The readers**:", "", "| reader | what it is |", "|---|---|", readers, "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           f"{CGD_TEST_ID}'s: per reader, pair and side, the 16 descriptions' pictures each against their cell's plain "
+           "picture; the side is carried when the mean moves its way, at least 12 of 16 move that way and the mean is beyond 3 "
+           "standard errors; a reader **DRIVES THE GROUP** when all three pairs are carried on both sides. The controls (the "
+           "untrained models) must drive no pair; a pair a control carries is credited to no reader. Beside it: how far each "
+           "side moves as a share of the group at amount 1, and the reading marks.", ""]
+    out += _framed_result_tail(meta, res, "every reader's readings of the near descriptions (each on its registered fit), "
+                                          "the reading marks, which block and position each reader is.", CGN_TIERS)
+    return "\n".join(out)
+
+
+GROUP_READER_TESTS["e057"] = dict(id=CGN_TEST_ID, title=CGN_TEST_TITLE, date=CGN_DATE, readers=CGN_READERS,
+                                  controls=CGN_CONTROLS, prefix="cgn", render=render_near_readers_readme, tiers=CGN_TIERS)

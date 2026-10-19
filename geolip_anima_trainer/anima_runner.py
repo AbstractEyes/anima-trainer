@@ -2672,8 +2672,9 @@ class AnimaRunner(_sr.SanaRunner):
         prompt, e053's group, another reader's) is copied, not drawn again. Every new set is kept in the data repo.
         Skipped when the repo lists it as done (force=True reruns the reads; the sets come back from the data repo)."""
         spec = ax.GROUP_READER_TESTS[test]
+        tiers = spec.get("tiers", ax.CGD_TIERS)
         R = readers if isinstance(readers, dict) else json.loads(Path(readers).read_text(encoding="utf-8"))
-        ids = [r["id"] for r in ax.cgd_rows() if r["split"] in ax.CGD_TIERS]
+        ids = [r["id"] for t in tiers for r in ax.cgd_tier_rows(t)]
         lacking = [n for n in spec["readers"] if any(i not in R.get("amounts", {}).get(n, {}) for i in ids)]
         if lacking:
             raise ValueError(f"the readers file has no amounts for {lacking} on every tier description")
@@ -2717,7 +2718,7 @@ class AnimaRunner(_sr.SanaRunner):
             raise
         reads = result["reads"]
         summary = "; ".join(f"{t} tier: " + ", ".join(f"{r} {v['OUTCOME'].lower()}" for r, v in reads[t]["readers"].items())
-                            for t in ax.CGD_TIERS)
+                            for t in tiers)
         meta.update(status="done", result={k: v for k, v in result.items() if k != "cells"}, summary=summary,
                     seconds=round(time.time() - t0), finished_utc=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"))
         (out_dir / "result.json").write_text(json.dumps(result, indent=1, default=float), encoding="utf-8")
@@ -2730,7 +2731,7 @@ class AnimaRunner(_sr.SanaRunner):
         metas[eid] = meta
         self._safe(lambda: self._publish_index(repo, metas))
         print(f"[{self.TAG}] {eid} done in {_sr._hms(meta['seconds'])}", flush=True)
-        for t in ax.CGD_TIERS:
+        for t in tiers:
             for r, v in reads[t]["readers"].items():
                 print(f"[{self.TAG}]   {t:8s} {r:18s} {v['OUTCOME']:16s} "
                       + "  ".join(f"{k} " + "/".join(f"{v['pairs'][k]['sides'][m]['frac_pos' if m == '+' else 'frac_neg']:.2f}"
@@ -2748,9 +2749,10 @@ class AnimaRunner(_sr.SanaRunner):
         self._judge()
         defs = {k: ax.CP_PAIRS[k][:2] for k in judged}
         names, prefix = spec["readers"], spec["prefix"]
+        tiers = spec.get("tiers", ax.CGD_TIERS)
         amounts = {n: R["amounts"][n] for n in names}
         refs = ax.cgd_refs()
-        readers = ax.cgd_plans(amounts, names, prefix=prefix)
+        readers = ax.cgd_plans(amounts, names, prefix=prefix, tiers=tiers)
         plans = {**ax.cgd_ref_plans(), **readers}
         pulled = {n for n, items in plans.items() if self._cp_pull(n, items)}
 
@@ -2816,8 +2818,8 @@ class AnimaRunner(_sr.SanaRunner):
         self._assert_stock()
         plain = res[refs["plain"]]["scores"]
         corners = {lab: res[n]["scores"] for lab, n in refs.items() if lab != "plain"}
-        scores = {r: {t: res[ax.cgd_set_name(r, t, prefix=prefix)]["scores"] for t in ax.CGD_TIERS} for r in names}
-        reads = ax.cgd_reads(scores, plain, corners, amounts, spec["controls"])
+        scores = {r: {t: res[ax.cgd_set_name(r, t, prefix=prefix)]["scores"] for t in tiers} for r in names}
+        reads = ax.cgd_reads(scores, plain, corners, amounts, spec["controls"], tiers)
 
         def tile(n, i):
             if i in res[n]["withheld"]:
@@ -2826,9 +2828,8 @@ class AnimaRunner(_sr.SanaRunner):
                 return im
             return Image.open(self._cp_root(n) / "images" / f"{plans[n][i]['name']}.png").convert("RGB")
 
-        rows = ax.cgd_rows()
-        for t in ax.CGD_TIERS:
-            trows = [r for r in rows if r["split"] == t]
+        for t in tiers:
+            trows = ax.cgd_tier_rows(t)
             firsts = list(range(0, len(trows), ax.CGD_SPLITS[t]))      # the first description of each corner
             grid = [[tile(refs["plain"], trows[j]["cell"]) for j in firsts],
                     [tile(refs[ax.cgr_label(tuple(trows[j]["corner"]))], trows[j]["cell"]) for j in firsts]]
@@ -2837,8 +2838,8 @@ class AnimaRunner(_sr.SanaRunner):
         np.savez_compressed(out_dir / "tagger_probs.npz", tags=np.array(names), **{n: res[n]["probs"] for n in readers})
         drawn = sum(res[n]["drawn"] for n in plans)
         return {"reads": reads, "reading": R.get("marks", {}), "picks": R.get("picks", {}),
-                "amounts": {r: {t: [ax.cgd_amounts(amounts[r][x["id"]]) for x in rows if x["split"] == t]
-                                for t in ax.CGD_TIERS} for r in names},
+                "amounts": {r: {t: [ax.cgd_amounts(amounts[r][x["id"]]) for x in ax.cgd_tier_rows(t)]
+                                for t in tiers} for r in names},
                 "pictures": {"total": total, "drawn": drawn, "copied": sum(copied.values()),
                              "reused": total - drawn - sum(copied.values())},
                 "sets": {n: {"from": res[n]["from"], "data_repo_folder": res[n]["kept"],

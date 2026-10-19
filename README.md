@@ -244,6 +244,13 @@ cache → two-phase train):
   of her shape (the control) and Qwen3's plain readings (the reference). The readings come from the data repo
   (`beatrix/cgb_readers.json`); pictures identical to earlier ones are copied; the readers' sets are kept there
   (`sets/cgb2_*`).
+- **`anima_colab_near_readers.ipynb`**
+  [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_near_readers.ipynb)
+  — e057 on **Anima**: the near tier. 32 new descriptions whose every word is one the same side's training wordings use
+  (golden blonde hair, a fierce frown, sapphire-blue eyes): six readers, each on its earlier reading (Qwen3 and Beatrix on
+  the plain description, Beatrix and the framed nano tap in the framed grammar, two untrained controls in the framed
+  grammar), one picture per description. The readings come from the data repo (`beatrix/cgn_readers.json`); pictures
+  identical to earlier ones are copied; the readers' sets are kept there (`sets/cgn2_*`).
 
 ## Programmatic / sweeps
 
