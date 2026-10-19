@@ -2513,3 +2513,23 @@ def test_group_readers_end_to_end(runner, fake_hub, monkeypatch):
     clean = ax.render_framed_readers_readme({"status": "running"}, {"model": "Anima"})
     for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery", "U2"):
         assert word not in clean
+    # e056 on the same runtime: Beatrix read in the frame (cgb2_*), pictures identical to e054's or e055's copied
+    B = {"source": "made up", "amounts": {"qwen": R["amounts"]["qwen"], "beatrix": _reader_amounts(scale=0.75),
+                                          "beatrix_untrained": _reader_amounts(only="hair_colour")}}
+    with pytest.raises(ValueError):
+        s.run_group_readers(F, test="e056")                            # e055's readers are not e056's
+    done = sum(rendered)
+    m56 = s.run_group_readers(B, test="e056")
+    r56 = m56["result"]
+    old |= {json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True)
+            for v in ax.cgd_plans(F["amounts"], ax.CGF_READERS, prefix="cgf").values() for it in v}
+    new = {json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True)
+           for v in ax.cgd_plans(B["amounts"], ax.CGB_READERS, prefix="cgb").values() for it in v} - old
+    assert m56["id"] == ax.CGB_TEST_ID and r56["pictures"]["drawn"] == sum(rendered) - done == len(new) > 0
+    assert set(ax.cgd_plans(B["amounts"], ax.CGB_READERS, prefix="cgb")) == {n for n in r56["sets"] if n.startswith("cgb2_")}
+    assert r56["reads"]["unseen"]["controls_carrying"]["hair_colour"] == ["beatrix_untrained"]
+    readme56 = repo.files_[f"experiments/{ax.CGB_TEST_ID}/README.md"].decode()
+    assert "never trained on frames" in readme56 and "held-out-words reading" in readme56
+    clean = ax.render_beatrix_framed_readme({"status": "running"}, {"model": "Anima"})
+    for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery", "U2"):
+        assert word not in clean

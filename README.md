@@ -237,6 +237,13 @@ cache → two-phase train):
   plain-description readings are the reference; the picked arm's body before framed training and its untrained start
   read in the same frame beside it. The readings come from the data repo (`beatrix/cgf_readers.json`); pictures
   identical to earlier ones are copied; the readers' sets are kept there (`sets/cgf2_*`).
+- **`anima_colab_beatrix_framed.ipynb`**
+  [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_beatrix_framed.ipynb)
+  — e056 on **Anima**: Beatrix read in the frame. Beatrix, never trained on frames, reads the same descriptions written
+  in the framed arms' grammar (e055's rows, byte for byte), each slider from its own question, beside an untrained model
+  of her shape (the control) and Qwen3's plain readings (the reference). The readings come from the data repo
+  (`beatrix/cgb_readers.json`); pictures identical to earlier ones are copied; the readers' sets are kept there
+  (`sets/cgb2_*`).
 
 ## Programmatic / sweeps
 

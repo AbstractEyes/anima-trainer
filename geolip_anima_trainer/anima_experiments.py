@@ -3530,7 +3530,6 @@ def render_framed_readers_readme(meta: dict, recipe: dict) -> str:
     """e055's README: e054's design and rule with the framed reading; the result when done."""
     res = meta.get("result") or {}
     rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
-    refs = "\n".join(f"- {t}: {u}" for t, u in CGD_REFERENCES)
     readers = "\n".join(f"| {r} | {n} |" for r, n in CGF_NAMES.items())
     out = [f"# {CGF_TEST_ID}: {CGF_TEST_TITLE}", "",
            f"Date: {CGF_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
@@ -3570,6 +3569,15 @@ def render_framed_readers_readme(meta: dict, recipe: dict) -> str:
            "far each side moves as a share of the group at amount 1, the copy rates, the frames' effect (the framed tap "
            "against its body before framed training) and the stability of each wording's amount across the descriptions "
            "it appears in.", ""]
+    out += _framed_result_tail(meta, res, "every reader's readings and reading marks, which tap each reader is, every tap's "
+                                          "held-out-words reading, the copy rates, the stability, every framed version's best "
+                                          "tap.")
+    return "\n".join(out)
+
+
+def _framed_result_tail(meta: dict, res: dict, readers_file: str) -> list:
+    """The result, files and references sections of the READMEs of the readings in the framed grammar (e055, e056)."""
+    out: list = []
     if meta.get("status") == "done":
         r = res.get("reads") or {}
         out += ["## Result", meta.get("summary", ""), ""]
@@ -3607,14 +3615,74 @@ def render_framed_readers_readme(meta: dict, recipe: dict) -> str:
     else:
         out += ["## Result", "Running.", ""]
     out += ["## Files",
-            "- `readers.json`: every reader's readings and reading marks, which tap each reader is, every tap's held-out-words "
-            "reading, the copy rates, the stability, every framed version's best tap.",
+            f"- `readers.json`: {readers_file}",
             "- `result.json`: every picture's score on every judged pair, the marks, where each set came from.",
             "- `tagger_probs.npz`: every drawn picture's probability for each of the judge's tags (float16, one array per "
             "set).",
-            "- `sheet_*.jpg`: contact sheets.", "", "## References", refs, ""]
-    return "\n".join(out)
+            "- `sheet_*.jpg`: contact sheets.", "", "## References",
+            "\n".join(f"- {t}: {u}" for t, u in CGD_REFERENCES), ""]
+    return out
 
 
 GROUP_READER_TESTS["e055"] = dict(id=CGF_TEST_ID, title=CGF_TEST_TITLE, date=CGF_DATE, readers=CGF_READERS,
                                   controls=CGF_CONTROLS, prefix="cgf", render=render_framed_readers_readme)
+
+
+# ---- e056: Beatrix reads each description in the framed nano arms' grammar (one fetch per slider) ---------------------------
+CGB_TEST_ID = "e056_anima_beatrix_framed_readers"
+CGB_TEST_TITLE = ("The stock model: Beatrix reads each description written in the framed nano arms' grammar and sets the three "
+                  "group sliders, one fetch per slider")
+CGB_DATE = "2026-10-19"
+CGB_READERS = ("qwen", "beatrix", "beatrix_untrained")   # qwen: e054's plain-description readings (reused)
+CGB_CONTROLS = ("beatrix_untrained",)
+CGB_NAMES = {"qwen": "Qwen3 0.6B, final state, reading the plain description (the reference; e054's readings and pictures)",
+             "beatrix": "Beatrix (mini-beatrix-3 at step 245,674; never trained on frames) read in the framed grammar at her "
+                        "best block and read position (picked on the training descriptions)",
+             "beatrix_untrained": "an untrained model of her shape read at the same block and position (a control that must "
+                                  "fail)"}
+
+
+def render_beatrix_framed_readme(meta: dict, recipe: dict) -> str:
+    """e056's README: e055's frame and e054's rule with Beatrix as the reader; the result when done."""
+    res = meta.get("result") or {}
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    readers = "\n".join(f"| {r} | {n} |" for r, n in CGB_NAMES.items())
+    out = [f"# {CGB_TEST_ID}: {CGB_TEST_TITLE}", "",
+           f"Date: {CGB_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Why",
+           f"In {CGD_TEST_ID} Beatrix read each description of hair colour, expression and eye colour as a plain caption, one "
+           "state for all three attributes, and the amounts she set for the same wording varied from one description to the "
+           f"next. In {CGF_TEST_ID} the small nano bodies read each description written in the framed arms' grammar set the "
+           "group precisely on wordings they had trained on, and so did a nano body never trained on frames: the precision "
+           "came from the format, which puts the value's bytes where the state is read. Here Beatrix, who was never trained "
+           "on frames either, reads each description in that format, each slider from its own question.", "",
+           "## Design",
+           f"- **The descriptions, tiers, cells, pictures and judge**: {CGD_TEST_ID}'s, unchanged (the same 96 training "
+           "descriptions, the trained tier and the unseen tier of 32, one picture per description).",
+           f"- **The frame**: {CGF_TEST_ID}'s rows, byte for byte (the caption register's head, one sized 32-byte data frame "
+           "per attribute holding one record, then the question for one attribute and its value, then the end byte; three "
+           "rows per description).",
+           f"- **Where it is read**: her stream state (blocks 8-28, the block output layer-normed, as in {CGD_TEST_ID}) at the "
+           "question's separator or at the end byte after the value, whichever reads held-out wordings better (below); the "
+           "copy check from her own forward (the value's bytes are her greedy choice at every step).",
+           f"- **The reading**: {CGF_TEST_ID}'s: per pair, on the rows asking that pair, the ridge regression of the side "
+           "(+1 / -1) on the standardized state of the 96 training descriptions; the strength, the block and the position "
+           "chosen by **held-out words** (per pair, each side's i-th training wording held out together with every training "
+           "description whose wording shares a word with either; 288 reads), ties by the left-out reading, then by name. "
+           "The amount on the picture: the reading rounded to a quarter step, clipped to [-1.5, 1.5].",
+           "- **The readers**:", "", "| reader | what it is |", "|---|---|", readers, "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           f"{CGD_TEST_ID}'s: per reader, tier, pair and side, the 16 descriptions' pictures each against their cell's plain "
+           "picture; the side is carried when the mean moves its way, at least 12 of 16 move that way and the mean is beyond 3 "
+           "standard errors; a reader **DRIVES THE GROUP** when all three pairs are carried on both sides. The control (the "
+           "untrained model) must drive no pair; a pair it carries in a tier is credited to no reader there. Beside it: how "
+           "far each side moves as a share of the group at amount 1, the copy rates and the stability of each wording's "
+           f"amount across the descriptions it appears in (against her plain-caption reading of {CGD_TEST_ID}).", ""]
+    out += _framed_result_tail(meta, res, "both readers' readings and reading marks, which block and position each reader "
+                                          "is, every tap's held-out-words reading, the copy rates, the stability.")
+    return "\n".join(out)
+
+
+GROUP_READER_TESTS["e056"] = dict(id=CGB_TEST_ID, title=CGB_TEST_TITLE, date=CGB_DATE, readers=CGB_READERS,
+                                  controls=CGB_CONTROLS, prefix="cgb", render=render_beatrix_framed_readme)

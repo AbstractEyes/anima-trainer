@@ -146,6 +146,23 @@ the runner's release tag, then `setup()` → `run_counterpoint_words()`.
   view; the other seven characters' pictures are the earlier sets', reused through `prefetch_first_bed()`). The readers' amounts come from a separate reading step
   (`readers.json`); the notebook never runs the text models.
 
+## `anima_colab_beatrix_framed.ipynb`
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_beatrix_framed.ipynb)
+
+**e056, Beatrix read in the frame** (`AnimaRunner.run_group_readers(readers, test="e056")`), uploaded into
+`experiments/e056_anima_beatrix_framed_readers` of
+[AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). The bootstrap checks out
+the runner's release tag (v0.8.0), then `setup()` → `run_group_readers(<the readers file from the data repo>, test="e056")`.
+
+- **The question:** in e055 the nano bodies read in the framed grammar set the group precisely on trained wordings, and so
+  did a nano body never trained on frames: the precision is the format's. Is Beatrix, whose plain-caption reading in e054
+  varied from description to description, as steady when read in that format, and does she read any new wording?
+- **The readers:** Qwen3's plain-description readings (the reference; e054's pictures reused), Beatrix at her best block
+  and read position (picked on the training descriptions alone, by held-out words) and an untrained model of her shape at
+  the same block and position (the control that must fail). The readings are made beforehand and stored in the data
+  repo's `beatrix/cgb_readers.json`.
+- **The frame, descriptions, cells, pictures and rule:** e055's and e054's, unchanged (below).
+
 ## `anima_colab_framed_readers.ipynb`
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_framed_readers.ipynb)
 
