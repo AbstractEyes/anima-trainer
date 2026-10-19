@@ -2361,6 +2361,22 @@ def test_offtarget_tier_design_is_the_registered_one():
     assert set(spec["control_of"].values()) == set(spec["controls"])
 
 
+def test_joint_readers_spec():
+    """e062: the four joined readers on the unseen tier, the two with an untrained body as controls (e054's tier rule), their
+    sets under their own prefix with a plain slug, a README without in-house words."""
+    spec = ax.GROUP_READER_TESTS["e062"]
+    assert spec["tiers"] == ("unseen",) and spec["prefix"] == "cgj" and spec["readers"] == ax.CGJ_READERS
+    assert set(spec["controls"]) == set(ax.CGJ_CONTROL_OF.values()) and set(ax.CGJ_NAMES) == set(ax.CGJ_READERS)
+    names = ax.cgd_plans({r: {x["id"]: [0.0, 0.0, 0.0] for x in ax.cgd_tier_rows("unseen")} for r in ax.CGJ_READERS},
+                         ax.CGJ_READERS, prefix="cgj", tiers=ax.CGJ_TIERS)
+    assert sorted(names) == sorted(f"cgj2_{ax.cp_slug(r)}_unseen" for r in ax.CGJ_READERS)
+    assert "cgj2_qwen-nano-framed_unseen" in names
+    clean = ax.render_joint_readers_readme({"status": "running"}, {"model": "Anima"})
+    assert "**DRIVES THE GROUP**" in clean and "232" in clean
+    for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery", "U2"):
+        assert word not in clean
+
+
 def test_zero_rows_design_is_the_registered_one():
     """e061's zero rows: no word of any earlier wording list (e058's off-target wordings included; the expression nouns
     aside), no word shared by two pairs, each wording 8 times, no description repeated, no corner and no cell, one fixed

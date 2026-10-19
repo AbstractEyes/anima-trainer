@@ -4177,3 +4177,58 @@ def render_zero_class_readme(meta: dict, recipe: dict) -> str:
 GROUP_READER_TESTS["e061"] = dict(id=CGZ_TEST_ID, title=CGZ_TEST_TITLE, date=CGZ_DATE, readers=CGO_READERS,
                                   controls=CGO_CONTROLS, control_of=CGO_CONTROL_OF, prefix="cgz",
                                   render=render_zero_class_readme, tiers=CGZ_TIERS)
+
+
+# ---- e062: the joint reader: Anima's own text encoder read together with a framed reader --------------------------------
+CGJ_TEST_ID = "e062_anima_joint_readers"
+CGJ_TEST_TITLE = ("The stock model: Anima's own text encoder read together with a framed byte reader (one joined state per "
+                  "slider) sets the three group sliders from wordings no reader trained on")
+CGJ_DATE = "2026-10-19"
+CGJ_TIERS = ("unseen",)
+CGJ_READERS = ("qwen+beatrix_framed", "qwen+nano_framed", "qwen+beatrix_untrained_framed", "qwen+birth_framed")
+CGJ_CONTROLS = ("qwen+beatrix_untrained_framed", "qwen+birth_framed")
+CGJ_CONTROL_OF = {"qwen+beatrix_framed": "qwen+beatrix_untrained_framed", "qwen+nano_framed": "qwen+birth_framed"}
+CGJ_NAMES = {"qwen+beatrix_framed": f"Qwen3's final state on the plain description joined with Beatrix's state in the framed "
+                                    f"grammar ({CGB_TEST_ID}'s block and position)",
+             "qwen+nano_framed": f"Qwen3's final state joined with the framed nano tap's state ({CGF_TEST_ID}'s block and "
+                                 "position; its narrower state repeated four times so the two weigh alike)",
+             "qwen+beatrix_untrained_framed": "Qwen3's final state joined with an untrained model of Beatrix's shape in the framed "
+                                              "grammar (a control)",
+             "qwen+birth_framed": "Qwen3's final state joined with the framed nano tap's body untrained (a control)"}
+
+
+def render_joint_readers_readme(meta: dict, recipe: dict) -> str:
+    """e062's README: why, the joint readers, the unseen tier's rule fixed before the run; the result when done."""
+    res = meta.get("result") or {}
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    readers = "\n".join(f"| {r} | {n} |" for r, n in CGJ_NAMES.items())
+    out = [f"# {CGJ_TEST_ID}: {CGJ_TEST_TITLE}", "",
+           f"Date: {CGJ_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Why",
+           f"From {CGD_TEST_ID} to {CGZ_TEST_ID}: the byte-level readers read in the framed grammar set the sliders exactly on "
+           "wordings whose words they trained on and not beyond them; Qwen3, Anima's own text encoder, reads more widely but "
+           "loosely. Here each slider reads one joined state: Qwen3's and a framed reader's together. Before any picture the "
+           "joined readers' held-out-words count (a training wording and every training description sharing a word with it held "
+           "out of the fit, 288 reads) decided whether pictures are drawn: the Qwen3 + nano tap reader read 232 against Qwen3's "
+           "212 alone and 183 with the untrained nano body, so the unseen tier is drawn for the four joined readers.", "",
+           "## Design",
+           f"- **The tier**: {CGD_TEST_ID}'s unseen tier (32 descriptions whose wordings share no word with the 96 training "
+           "descriptions), on its characters and seeds, read against the same plain pictures and the same group at amount 1.",
+           "- **The readings**: per pair the ridge regression of the side on the joined state standardized over the 96 training "
+           "descriptions, at the strength the held-out words chose; the unseen descriptions read with the full fit; the amount "
+           "on the picture: the reading rounded to a quarter step, clipped to [-1.5, 1.5].",
+           "- **The readers**:", "", "| reader | what it is |", "|---|---|", readers, "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           f"{CGD_TEST_ID}'s rule: per reader, pair and side, the 16 descriptions' pictures each against their cell's plain "
+           "picture; the side is carried when the mean moves its way, at least 12 of 16 move that way and the mean is beyond 3 "
+           "standard errors; a reader **DRIVES THE GROUP** when all three pairs are carried on both sides; a pair a control "
+           "carries is credited to no reader.", ""]
+    out += _framed_result_tail(meta, res, "every joined reader's readings of the tiers' descriptions, the held-out words, the "
+                                          "reading marks.", CGJ_TIERS)
+    return "\n".join(out)
+
+
+GROUP_READER_TESTS["e062"] = dict(id=CGJ_TEST_ID, title=CGJ_TEST_TITLE, date=CGJ_DATE, readers=CGJ_READERS,
+                                  controls=CGJ_CONTROLS, control_of=CGJ_CONTROL_OF, prefix="cgj",
+                                  render=render_joint_readers_readme, tiers=CGJ_TIERS)
