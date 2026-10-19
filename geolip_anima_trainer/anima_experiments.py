@@ -3630,7 +3630,8 @@ def _framed_result_tail(meta: dict, res: dict, readers_file: str, tiers=CGD_TIER
         else:
             out += ["Sheets (`sheet_<tier>.jpg`): one column per corner (the first description of each corner, on its own "
                     "character at the first seed); rows: the plain prompt, the group at amount 1, then the readers in the "
-                    "order of the table above.", ""]
+                    "order of the table above" + (" (the off-target sheet: one column per fourth description, no group "
+                                                  "row)" if "off" in tiers else "") + ".", ""]
         out += [f"![{t}](sheet_{t}.jpg)" for t in tiers] + [""]
     elif meta.get("status") == "failed":
         out += ["## Result", f"The run failed: `{meta.get('error', '')}`.", ""]
@@ -4001,3 +4002,68 @@ def render_offtarget_readers_readme(meta: dict, recipe: dict) -> str:
 GROUP_READER_TESTS["e058"] = dict(id=CGO_TEST_ID, title=CGO_TEST_TITLE, date=CGO_DATE, readers=CGO_READERS,
                                   controls=CGO_CONTROLS, control_of=CGO_CONTROL_OF, prefix="cgo",
                                   render=render_offtarget_readers_readme, tiers=CGO_TIERS)
+
+
+# ---- e059: the caption-finetuned nano body on the unseen and off-target tiers -----------------------------------------------
+CGC_TEST_ID = "e059_anima_caption_readers"
+CGC_TEST_TITLE = ("The stock model: a nano body finetuned on captions, each attribute in many wordings, reads descriptions in the "
+                  "framed grammar beside its control, its start and its untrained body, on wordings it never trained on and on "
+                  "descriptions that name no side")
+CGC_DATE = "2026-10-19"
+CGC_TIERS = ("unseen", "off")
+CGC_READERS = ("mx_cp", "mx", "mx_cpx", "birth")
+CGC_CONTROLS = ("mx_cpx", "birth")
+CGC_CONTROL_OF = {"mx_cp": "mx_cpx"}
+CGC_NAMES = {"mx_cp": "the nano body Pollux dual after the caption phase (captions from a caption pack, each attribute in many "
+                      "wordings, its records written as frames), read in the framed grammar at its best block and position",
+             "mx": "the same body before the caption phase (its start: the mixed phase's end), at the same block and position",
+             "mx_cpx": "the same caption phase with every frame taken from another caption, so the frame says nothing about its "
+                       "caption (a control that must fail), at the same block and position",
+             "birth": "the body untrained (a control that must fail), at the same block and position"}
+
+
+def render_caption_readers_readme(meta: dict, recipe: dict) -> str:
+    """e059's README: why, the readers, both tiers' rules fixed before the run; the result when done."""
+    res = meta.get("result") or {}
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    readers = "\n".join(f"| {r} | {n} |" for r, n in CGC_NAMES.items())
+    out = [f"# {CGC_TEST_ID}: {CGC_TEST_TITLE}", "",
+           f"Date: {CGC_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Why",
+           f"From {CGD_TEST_ID} to {CGO_TEST_ID}: read in the framed grammar, every reader set the three sliders precisely on "
+           "wordings whose words it had trained on, and an untrained reader of the same shape did as well (the frame puts the "
+           "value's letters where the reader is read, so a trained wording is a spelling test); no byte-level reader read "
+           "wordings that share no word with training; no reader left the sliders at zero on descriptions that name no side. "
+           "What the readers lack is word meaning. Here the nano body Pollux dual has been finetuned on captions in which each "
+           "attribute comes in many wordings, written as framed records: does it now read wordings it never trained on, and "
+           "does it leave the sliders at zero when a description names no side? Its control saw the same captions with every "
+           "frame taken from another caption.", "",
+           "## Design",
+           f"- **The tiers**: {CGD_TEST_ID}'s unseen tier (32 descriptions whose wordings share no word with the 96 training "
+           f"descriptions) and {CGO_TEST_ID}'s off-target tier (32 descriptions that name no side), on their characters and "
+           "seeds, read against the same plain pictures and the same group at amount 1.",
+           "- **The readings**: each description written in the framed grammar (three sized 32-byte record frames, then the "
+           "question for one attribute and its value), each slider read on the rows asking its attribute; per pair the ridge "
+           "regression of the side on the state standardized over the 96 training descriptions; the finetuned body's block and "
+           "position picked by held-out words (a wording and every training wording sharing a word with it held out of the "
+           "fit), the other three bodies read at the same block and position; the amount on the picture: the reading rounded "
+           "to a quarter step, clipped to [-1.5, 1.5].",
+           "- **The readers**:", "", "| reader | what it is |", "|---|---|", readers, "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           f"- **The unseen tier**: {CGD_TEST_ID}'s rule: per reader, pair and side, the 16 descriptions' pictures each "
+           "against their cell's plain picture; the side is carried when the mean moves its way, at least 12 of 16 move that "
+           "way and the mean is beyond 3 standard errors; a reader **DRIVES THE GROUP** when all three pairs are carried on "
+           "both sides; a pair a control carries is credited to no reader.",
+           f"- **The off-target tier**: {CGO_TEST_ID}'s rule: a pair **STAYS PLAIN** when at least {CGO_ZEROS} of 32 amounts "
+           f"are 0 and the pictures' mean absolute move on it is under {CGO_MOVE} of the group's full move; the finetuned body "
+           "is credited against its control.", ""]
+    out += _framed_result_tail(meta, res, "every reader's readings of both tiers' descriptions, the reading marks, the "
+                                          "held-out-words read of every block and position, which block and position was "
+                                          "picked.", CGC_TIERS)
+    return "\n".join(out)
+
+
+GROUP_READER_TESTS["e059"] = dict(id=CGC_TEST_ID, title=CGC_TEST_TITLE, date=CGC_DATE, readers=CGC_READERS,
+                                  controls=CGC_CONTROLS, control_of=CGC_CONTROL_OF, prefix="cgc",
+                                  render=render_caption_readers_readme, tiers=CGC_TIERS)

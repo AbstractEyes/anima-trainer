@@ -146,6 +146,23 @@ the runner's release tag, then `setup()` → `run_counterpoint_words()`.
   view; the other seven characters' pictures are the earlier sets', reused through `prefetch_first_bed()`). The readers' amounts come from a separate reading step
   (`readers.json`); the notebook never runs the text models.
 
+## `anima_colab_caption_readers.ipynb`
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_caption_readers.ipynb)
+
+**e059, a caption-finetuned nano body on the readers' hardest tiers** (`AnimaRunner.run_group_readers(readers, test="e059")`),
+uploaded into `experiments/e059_anima_caption_readers` of
+[AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). The bootstrap checks out
+the runner's release tag (v0.11.0), then `setup()` → `run_group_readers(<the readers file from the data repo>, test="e059")`.
+
+- **The question:** read in the framed grammar, the earlier readers set the sliders precisely only on wordings whose words
+  they had trained on, and untrained readers did as well. Does a nano body finetuned on captions, each attribute in many
+  wordings, read wordings it never trained on, and leave the sliders at zero when a description names no side?
+- **The readers:** the finetuned body Pollux dual at its best block and position (picked by held-out words), and at the same
+  block and position its start, its control (the same captions, every frame taken from another caption) and its untrained
+  body.
+- **The rules:** the unseen tier by the group rule (a pair a control carries is credited to no reader), the off-target tier by
+  the stay-plain rule (`cgo_tier_reads`; the finetuned body credited against its control).
+
 ## `anima_colab_offtarget_readers.ipynb`
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_offtarget_readers.ipynb)
 

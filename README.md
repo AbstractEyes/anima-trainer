@@ -258,6 +258,12 @@ cache → two-phase train):
   stays plain on a pair when its amounts round to zero and the pictures do not move, and a framed reader is credited
   against its untrained control. The readings come from the data repo (`beatrix/cgo_readers.json`); a description read at
   zero everywhere is the plain picture itself; the readers' sets are kept there (`sets/cgo2_*`).
+- **`anima_colab_caption_readers.ipynb`**
+  [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/main/notebooks/anima_colab_caption_readers.ipynb)
+  — e059 on **Anima**: a nano body finetuned on captions (each attribute in many wordings) reads, in the framed grammar,
+  wordings it never trained on and descriptions that name no side, beside its control (the same captions, every frame from
+  another caption), its start and its untrained body. The readings come from the data repo (`beatrix/cgc_readers.json`); the
+  readers' sets are kept there (`sets/cgc2_*`).
 
 ## Programmatic / sweeps
 

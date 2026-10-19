@@ -2398,6 +2398,19 @@ def test_offtarget_marks():
     assert full["tiers"]["off"] == m and full["train"]["total"] == 288
 
 
+def test_caption_readers_spec():
+    """e059's spec: the caption-finetuned body, its start and its two controls on the unseen and off-target tiers; the finetuned
+    body credited against its control off target; its sets named by reader and tier; the README names both rules."""
+    spec = ax.GROUP_READER_TESTS["e059"]
+    assert spec["tiers"] == ("unseen", "off") and spec["readers"] == ("mx_cp", "mx", "mx_cpx", "birth")
+    assert spec["control_of"] == {"mx_cp": "mx_cpx"} and set(spec["controls"]) == {"mx_cpx", "birth"}
+    zero = {r: {x["id"]: [0.0, 0.0, 0.0] for t in spec["tiers"] for x in ax.cgd_tier_rows(t)} for r in spec["readers"]}
+    names = list(ax.cgd_plans(zero, spec["readers"], prefix="cgc", tiers=spec["tiers"]))
+    assert names == [f"cgc2_{r.replace('_', '-')}_{t}" for r in spec["readers"] for t in spec["tiers"]]
+    text = ax.render_caption_readers_readme({"status": "running"}, {"model": "Anima"})
+    assert "**DRIVES THE GROUP**" in text and "**STAYS PLAIN**" in text and "held out" in text
+
+
 def test_group_reader_items():
     """A reader's pictures: the plain prompt composed with one prompt per pair at the grid amount (a pair at 0 left out);
     all three at 0 is the plain set's item and all three at +-1 e053's slider group, but for the name."""
@@ -2677,5 +2690,35 @@ def test_group_readers_end_to_end(runner, fake_hub, monkeypatch):
     assert "(sets/cgo2_*)" in readme58 and "**STAYS PLAIN ON THE GROUP**" in readme58
     assert f"experiments/{ax.CGO_TEST_ID}/sheet_off.jpg" in repo.files_
     clean = ax.render_offtarget_readers_readme({"status": "running"}, {"model": "Anima"})
+    for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery", "U2"):
+        assert word not in clean
+    # e059 on the same runtime: the caption-finetuned body on the unseen and off-target tiers (cgc2_*), four readers
+    uns = [r for r in ax.cgd_rows() if r["split"] == "unseen"]
+    C = {"source": "made up", "amounts": {
+        "mx_cp": {**{r["id"]: [float(x) for x in r["corner"]] for r in uns}, **offs(lambda j: [0.0, 0.0, 0.0])},
+        "mx": {**{r["id"]: [0.0, 0.0, 0.0] for r in uns}, **offs(lambda j: [0.5, -0.5, 0.5])},
+        "mx_cpx": {**{r["id"]: [0.0, 0.0, 0.0] for r in uns}, **offs(lambda j: [0.75, 0.0, -0.75])},
+        "birth": {**{r["id"]: [0.0, 0.0, 0.0] for r in uns}, **offs(lambda j: [0.0, 0.0, 0.0])}}}
+    with pytest.raises(ValueError):
+        s.run_group_readers(O, test="e059")                            # e058's readers are not e059's
+    done = sum(rendered)
+    m59 = s.run_group_readers(C, test="e059")
+    r59 = m59["result"]
+    old |= {json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True) for v in p58.values() for it in v}
+    p59 = ax.cgd_plans(C["amounts"], ax.CGC_READERS, prefix="cgc", tiers=ax.CGC_TIERS)
+    new = {json.dumps({k: v for k, v in it.items() if k != "name"}, sort_keys=True) for v in p59.values() for it in v} - old
+    assert m59["id"] == ax.CGC_TEST_ID and r59["pictures"]["drawn"] == sum(rendered) - done == len(new) > 0
+    assert set(p59) == {n for n in r59["sets"] if n.startswith("cgc2_")} and len(p59) == 8
+    assert list(r59["reads"]) == ["unseen", "off"]
+    u59, o59 = r59["reads"]["unseen"]["readers"], r59["reads"]["off"]["readers"]
+    assert u59["mx_cp"]["OUTCOME"] == "DRIVES THE GROUP" and u59["mx_cp"]["credited"] == list(ax.CGD_PAIRS)
+    assert u59["mx"]["OUTCOME"] == "DRIVES NONE" and u59["birth"]["OUTCOME"] == "DRIVES NONE"
+    assert o59["mx_cp"]["OUTCOME"] == "STAYS PLAIN ON THE GROUP" and o59["mx_cp"]["credited"] == ["hair_colour", "eye_colour"]
+    assert o59["mx_cpx"]["OUTCOME"] == "STAYS PLAIN ON 1 OF 3" and o59["mx"]["OUTCOME"] == "STAYS PLAIN ON NONE"
+    readme59 = repo.files_[f"experiments/{ax.CGC_TEST_ID}/README.md"].decode()
+    assert "### The unseen tier" in readme59 and "### The off-target tier" in readme59 and "sheet_off.jpg" in readme59
+    assert "no group row" in readme59 and "(sets/cgc2_*)" in readme59
+    assert f"experiments/{ax.CGC_TEST_ID}/sheet_unseen.jpg" in repo.files_
+    clean = ax.render_caption_readers_readme({"status": "running"}, {"model": "Anima"})
     for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery", "U2"):
         assert word not in clean
