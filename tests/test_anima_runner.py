@@ -2361,6 +2361,30 @@ def test_offtarget_tier_design_is_the_registered_one():
     assert set(spec["control_of"].values()) == set(spec["controls"])
 
 
+def test_zero_rows_design_is_the_registered_one():
+    """e061's zero rows: no word of any earlier wording list (e058's off-target wordings included; the expression nouns
+    aside), no word shared by two pairs, each wording 8 times, no description repeated, no corner and no cell, one fixed
+    shuffle; no zero wording is one of the off-target tier's."""
+    import collections
+    assert ax.cgz_checks() == {"clash": [], "shared": []}
+    rows = ax.cgz_rows()
+    assert len(rows) == 48 and [r["id"] for r in rows] == [f"zero{i:02d}" for i in range(48)] and ax.cgz_rows() == rows
+    assert len({tuple(r["words"]) for r in rows}) == 48
+    assert all(r["corner"] is None and r["cell"] is None and r["split"] == "zero" for r in rows)
+    for i, k in enumerate(ax.CGD_PAIRS):
+        got = collections.Counter(r["words"][i] for r in rows)
+        assert set(got) == set(ax.CGZ_PHRASES[k]) and set(got.values()) == {8}
+        assert not set(ax.CGZ_PHRASES[k]) & set(ax.CGO_PHRASES[k])
+    assert {tuple(r["order"]) for r in rows} == set(ax.CGD_ORDERS)
+    spec = ax.GROUP_READER_TESTS["e061"]
+    assert spec["tiers"] == ("off",) and spec["prefix"] == "cgz" and spec["readers"] == ax.CGO_READERS
+    assert spec["control_of"] == ax.CGO_CONTROL_OF and set(spec["control_of"].values()) == set(spec["controls"])
+    clean = ax.render_zero_class_readme({"status": "running"}, {"model": "Anima"})
+    assert "curly hair" in clean and "almond-shaped eyes" in clean and "**STAYS PLAIN**" in clean
+    for word in ("S-1", "Phil", "docket", "canon/", "Opus", "Fable", "amendment", "battery", "U2"):
+        assert word not in clean
+
+
 def test_offtarget_marks():
     """e058's rule on made-up readings and scores: a reader whose amounts round to 0 stays plain (its pictures are the plain
     ones); 24 of 32 at 0 is the line; a mean move of a quarter of the group's or more breaks it; a pair is credited only

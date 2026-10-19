@@ -4067,3 +4067,113 @@ def render_caption_readers_readme(meta: dict, recipe: dict) -> str:
 GROUP_READER_TESTS["e059"] = dict(id=CGC_TEST_ID, title=CGC_TEST_TITLE, date=CGC_DATE, readers=CGC_READERS,
                                   controls=CGC_CONTROLS, control_of=CGC_CONTROL_OF, prefix="cgc",
                                   render=render_caption_readers_readme, tiers=CGC_TIERS)
+
+
+# ---- e061: the zero class: readers fitted with descriptions that name no side, read on new ones -------------------------
+CGZ_TEST_ID = "e061_anima_zero_class_readers"
+CGZ_SEED = 61
+CGZ_PHRASES = {                             # 6 a pair, a fit's zero rows: no value of the pair's dimension, no word of any
+    "hair_colour": tuple(w + _HAIR for w in ("curly", "braided", "messy", "layered", "tousled", "cropped")),   # earlier list
+    "expression": ("a thoughtful look", "a focused look", "a pensive face", "an attentive look", "a quiet face",
+                   "a contemplative look"),
+    "eye_colour": ("narrow eyes", "hooded eyes", "downturned eyes", "prominent eyes", "tiny eyes", "oval eyes"),
+}
+CGZ_ROWS = 48                               # the zero rows: each wording 8 times
+
+
+def cgz_checks() -> dict:
+    """The zero rows' wordings, fixed before any read: no word (the overlap rule's word split, the expression nouns aside)
+    appears in any wording of any earlier list, e058's off-target wordings included (those are the test's); no word is
+    shared by two pairs' wordings. -> {'clash': [...], 'shared': [...]}, both empty."""
+    seen: set = set()
+    for lists in (CPG_PHRASES, CGD_PHRASES, CGN_PHRASES):
+        for P in lists.values():
+            for ws in P.values():
+                for w in ws:
+                    seen |= cpg_words(w)
+    for ws in CGO_PHRASES.values():
+        for w in ws:
+            seen |= cpg_words(w)
+    own = {k: set().union(*(cpg_words(w) - CGO_NOUNS for w in ws)) for k, ws in CGZ_PHRASES.items()}
+    out: dict = {"clash": [], "shared": []}
+    for k, ws in CGZ_PHRASES.items():
+        for w in ws:
+            hit = (cpg_words(w) - CGO_NOUNS) & seen
+            if hit:
+                out["clash"].append((k, w, sorted(hit)))
+    ks = list(CGZ_PHRASES)
+    for a in range(len(ks)):
+        for b in range(a + 1, len(ks)):
+            if own[ks[a]] & own[ks[b]]:
+                out["shared"].append((ks[a], ks[b], sorted(own[ks[a]] & own[ks[b]])))
+    return out
+
+
+def cgz_rows() -> list[dict]:
+    """e061's zero rows: 48 descriptions that name no side, one wording a pair (each of a pair's six wordings 8 times, a
+    seeded shuffle), joined by commas in one of six orders; no corner (a reader's fit takes them at 0 on every pair) and no
+    cell (they are only read, never drawn); the first shuffle from CGZ_SEED with no description repeated."""
+    for attempt in range(1000):
+        seed = CGZ_SEED + 1000 * attempt
+        pools = [_cgd_cycle(CGZ_PHRASES[k], CGZ_ROWS, seed + 10 * i) for i, k in enumerate(CGD_PAIRS)]
+        rows = []
+        for j in range(CGZ_ROWS):
+            words = [pools[i][j] for i in range(len(CGD_PAIRS))]
+            order = CGD_ORDERS[j % len(CGD_ORDERS)]
+            text = ", ".join(words[i] for i in order)
+            rows.append({"id": f"zero{j:02d}", "split": "zero", "corner": None, "words": words, "order": list(order),
+                         "text": text, "frame": CGD_READ_FORM.format(w=text), "cell": None})
+        if len({tuple(r["words"]) for r in rows}) == len(rows):
+            return rows
+    raise RuntimeError("no shuffle met the rules")  # pragma: no cover
+
+
+CGZ_TEST_TITLE = ("The stock model: text readers fitted with descriptions that name no side of the group (taken at zero) read "
+                  "new descriptions that name no side, and should leave the three sliders at zero")
+CGZ_DATE = "2026-10-19"
+CGZ_TIERS = CGO_TIERS
+
+
+def render_zero_class_readme(meta: dict, recipe: dict) -> str:
+    """e061's README: the zero rows, the readers refitted with them, the rule fixed before the run; the result when done."""
+    res = meta.get("result") or {}
+    rec = "\n".join(f"| {k} | {v} |" for k, v in recipe.items())
+    readers = "\n".join(f"| {r} | {n} |" for r, n in CGN_NAMES.items())
+    words = "\n".join(f"| {k.replace('_', ' ')} | {', '.join(CGZ_PHRASES[k])} | {', '.join(CGO_PHRASES[k])} |"
+                      for k in CGD_PAIRS)
+    out = [f"# {CGZ_TEST_ID}: {CGZ_TEST_TITLE}", "",
+           f"Date: {CGZ_DATE}. Model: {ANIMA.model_name} ([{BASE_MODEL}](https://huggingface.co/{BASE_MODEL})), no LoRA.", "",
+           "## Why",
+           f"In {CGO_TEST_ID} no reader left the sliders at zero on descriptions that name no side: every reader's fit was "
+           "made on training descriptions that each name a side, so the fit has no zero answer and every description lands "
+           "on one side of each pair. Here each reader is fitted again on the same state with descriptions that name no side "
+           "added at zero, then reads the off-target descriptions, whose wordings none of the added descriptions uses.", "",
+           "## Design",
+           "- **The added descriptions** (fixed before any read; no word of them appears in any wording of the earlier tests, "
+           "the off-target wordings included, the expression nouns look, face and expression aside): 48 descriptions, one "
+           "wording a pair, each wording 8 times, joined with commas in one of six orders, taken at 0 on all three pairs:", "",
+           "| pair | the added (zero) wordings | the off-target wordings read |", "|---|---|---|", words, "",
+           f"- **The tier**: {CGO_TEST_ID}'s 32 off-target descriptions, on its characters and seeds, read against the same "
+           "plain pictures and the same group at amount 1.",
+           "- **The readings**: each reader on its registered state, block, read position and strength; per pair the ridge "
+           "regression of the side on the standardized state of the 96 training descriptions and the 48 added ones at 0; "
+           "the off-target descriptions read with the full fit. The amount on the picture: the reading rounded to a quarter "
+           "step, clipped to [-1.5, 1.5]; an amount under an eighth is 0 and leaves the pair's slider off, so a description "
+           "read at 0 on all three pairs is the plain picture itself.",
+           "- **The readers**:", "", "| reader | what it is |", "|---|---|", readers, "",
+           "## Recipe", "| setting | value |", "|---|---|", rec, "",
+           "## The rule (fixed before the run)",
+           f"{CGO_TEST_ID}'s rule: per reader and pair, the 32 grid amounts and the 32 pictures' moves on the pair's score "
+           "against their cell's plain picture, each as a share of the group's full move on that cell. The pair **STAYS "
+           f"PLAIN** when at least {CGO_ZEROS} of 32 amounts are 0 and the mean absolute move is under {CGO_MOVE}. Beatrix "
+           "in the framed grammar is credited against her untrained copy, the framed nano tap against its body untrained: a "
+           "pair is credited when the reader stays plain on it and its control does not. Qwen3 and Beatrix on the plain "
+           "description are references.", ""]
+    out += _framed_result_tail(meta, res, "every reader's readings of the off-target descriptions on the refitted fit, the "
+                                          "reading marks, the fit's cost on the descriptions that name a side.", CGZ_TIERS)
+    return "\n".join(out)
+
+
+GROUP_READER_TESTS["e061"] = dict(id=CGZ_TEST_ID, title=CGZ_TEST_TITLE, date=CGZ_DATE, readers=CGO_READERS,
+                                  controls=CGO_CONTROLS, control_of=CGO_CONTROL_OF, prefix="cgz",
+                                  render=render_zero_class_readme, tiers=CGZ_TIERS)
