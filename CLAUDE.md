@@ -39,6 +39,9 @@ installable package **`geolip_anima_trainer`** (console command **`anima`**):
   `notebooks/sana_colab_train.ipynb`: the experiment SEQUENCE (self-rendered mood sets → configs →
   train → diffusers-load evaluation per epoch), one folder per experiment in the HF experiments repo.
   See "Sana — model type `sana`" below.
+- `qwen_image21_runner.py` + `download_qwen_image21.py` — the **Qwen-Image 2.1 Colab** runner behind
+  `notebooks/qwen_image21_mega_liminal.ipynb` (parity check → dataset → the loss screen → the full run →
+  sheets, uploads to the release repo). See "Qwen-Image 2.1 — model type `qwen_image21`" below.
 - `api.py` / `cli.py` — the Python API and the `anima` CLI.
 - `templates/anima_lora.toml`, `templates/anima_dataset.toml` — packaged templates;
   copy into `./configs` with `anima init-config`.
@@ -478,6 +481,55 @@ trainer via `launch.spawn` + `LaunchPlan.master_port` on a free port; never two 
 set, so each cache has one writer; finished arms evaluated in the kernel while the others train; on a failure
 no new arm starts, the running ones finish, then it raises; Ctrl-C terminates the trainers it started). A
 control's summary reads against the upbeat arm of its OWN draw (`sana_experiments.reference_arm`).
+
+### Qwen-Image 2.1 — model type `qwen_image21` (the AbstractEyes diffusion-pipe fork, release `qwen-image21-v1`)
+Third model type (2026-11-01). Trainer side = the fork's `models/qwen_image21.py` on a ComfyUI submodule that has
+`comfy/ldm/qwen_image21` (v0.43.0): text to image only; the ComfyUI split files of `Comfy-Org/Qwen-Image-2.1`
+(`diffusion_models/qwen_image_2.1_bf16.safetensors` 14.2 GB — train on the bf16 file, the int8 one is for
+inference —, `vae/qwen_image_2.1_vae_bf16.safetensors` (RGBA, 16x per side, 64 latent channels),
+`text_encoders/qwen3vl_8b_int8_convrot.safetensors`); the fork's `cfg = w` = the distillation-preserving loss
+v_raw = (v(x_t, c) + (w − 1)·v(x_t, empty)) / w against noise − x_0 (empty-caption branch under no_grad;
+pipeline_stages 1). Package side: `ModelConfig(type='qwen_image21', diffusion_model, vae, text_encoders=[{path,
+type='qwen_image'}], timestep_sample_method, cfg)` (`api.qwen_image21_model(paths, cfg=)`); `render_lora_toml`
+writes the 2.1 `[model]` block (text_encoders as inline tables, `cfg` only when set) and header, plus
+`max_steps` and `[adapter] exclude_modules` when set (any model); `validate()`: exactly one text encoder of type
+`qwen_image`, both files, cfg in (1, 10] and only with pipeline_stages 1, cfg refused on other model types, no
+LLM adapter, no activation-checkpointing warning (the 7B needs it); `preset_optimizer` = plain Adam wd 0 at 1e-4
+(DiffSynth-Studio's 2.1 LoRA example: rank 32, 1e-4, 1 MP); `build_plan` refuses a diffusion-pipe without
+`models/qwen_image21.py`; `download_qwen_image21.py` (`anima download --model qwen_image21`, keeps the repo
+layout); templates `qwen_image21_lora.toml` / `qwen_image21_dataset.toml`. Licence: the Qwen Research License
+(non-commercial = research or evaluation; derivatives display "Built with Qwen"; redistributions carry a copy of
+the licence and a NOTICE with its attribution sentence). Data rule: no picture the 2025 Qwen-Image generated
+trains 2.1 (ft1 qwen_90k and qwen-synth-characters are Qwen-Image renders).
+
+**Colab runner** (`qwen_image21_runner.py` + `notebooks/qwen_image21_mega_liminal.ipynb`; the notebook clones
+this repo's `qwen-image21` branch). The bootstrap `anima_colab.install(REPO, dp_url=DP_FORK_URL,
+dp_ref=QWEN21_FORK_REF, similarity=False)` clones the fork TAG into its own folder
+`external/diffusion-pipe-fork-qwen-image21-v1` (never pulled; marker `.anima_colab_installed_fork_<ref>`), so the
+Sana/Anima checkout at `external/diffusion-pipe-fork` never moves; `_point_at_fork` prefers it and refuses a fork
+without the ComfyUI 2.1 tree. Steps: `setup()` (data under `/content/qwen_image21_data`; the three files; the
+resolved commits recorded) → `parity()` (the fork's `tools/qwen_image21_parity.py` as a subprocess with
+`QWEN_IMAGE21_DIR` / `QWEN_IMAGE21_SAMPLE_OUT`; rows parsed, `checks/` shipped, raises on any FAIL) →
+`prepare_dataset()` (`AbstractPhil/mega-liminal` `data/<class>/` → `class_folders` → `rebalance`: repeats
+1,1,3,5,6,7,7,8,8,8 = 2,789 samples an epoch) → `screen()` → `train()` → `sheets()`. **The screen**: arms
+`SCREEN_ARMS = (None, 3.0, 4.0, 5.0)`, each `screen_steps` 400 with 72 previews at 768 px rendered at step0 and at
+the final save: `DRIFT_PROMPTS` (32 PartiPrompts, chosen by a fixed per-category rule) at two seeds + the first
+8 `SHOWCASE` prompts; reads (`screen_reads`, DINOv2-base pooled cosine distance): drift (ordinary, same seed,
+before vs after), spread (ordinary, seed vs seed, before), domain (own prompts), contrast (luminance-std ratio),
+repeat (step0 vs the FIRST arm's step0 = the control); `screen_pick`: a failed control (repeat ≥ spread) → no pick;
+eligible = drift < spread and contrast ≥ 0.9; pick = max domain/drift. Reads ship to `screen/reads/<arm>.json`
+with `screen_setting()`; a rerun (or a new runtime) reuses every arm whose shipped reads carry the same setting.
+**train()** takes the pick (or `cfg=w` / `cfg=None`; refuses otherwise), rank 32, 4 epochs, 15 `SHOWCASE`
+previews at 1024 px each save. **Uploads**: `_write_check()` before any GPU minute (creates the repo private if
+missing; commits `qwen_image21/README.md` + `LICENSE` (fetched from Qwen/Qwen-Image-2.1) + `NOTICE`); then
+`_Shipper`: one background thread, one commit per submit, waits 15 s → 10 min over eight attempts, 401/403/404
+give up at once, never raises, `shipped_<repo>.json` records path → size so a rerun ships only new or changed
+files; a save (and its previews) ships once the next save exists, step0's once the first save exists, the rest
+at the end (DONE.json is written before the final ship). Layout: `qwen_image21/rank32/<name>-qwen-image21-r32-
+<arm>-eNN.safetensors` + `samples/<arm>/<save>/` + `training/<arm>/`; `screen/` (same, `sNNN` saves) +
+`reads/`, `screen.md`; `checks/`. `tests/test_qwen_image21.py` covers the config block and rules, the
+templates, the fork check, the downloader, the runner pieces, the screen end to end against a fake trainer, the
+uploader, the layout, the licence files, the bootstrap's pinned release and the notebook.
 
 ### Anima experiments — `anima_runner.py` + `anima_experiments.py` + `anima_colab_experiments.ipynb`
 The Sana sequence machinery on Anima (2026-10-03), uploading to `AbstractPhil/geolip-beatrix-anima`. What

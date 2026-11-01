@@ -1,0 +1,38 @@
+# =============================================================================
+# qwen_image21_dataset.toml  —  dataset config for Qwen-Image-2.1 finetuning
+# Referenced by qwen_image21_lora.toml via `dataset = 'configs/qwen_image21_dataset.toml'`
+# -----------------------------------------------------------------------------
+# One [[directory]] per concept: image files + matching .txt captions. With several
+# concepts, set num_repeats so the small ones count without being memorized
+# (`anima build` computes dampened repeats).
+# -----------------------------------------------------------------------------
+# Caching: on first run, latents (the RGBA VAE, 16x per side; pictures get an opaque
+# alpha channel) and text embeds (Qwen3-VL-8B) are cached to a `cache/` folder inside each
+# image directory. Delete it (or pass --regenerate_cache) if you change resolution or models.
+# Train on photographs and other images Qwen-Image did not generate: renders from the 2025
+# Qwen-Image would pull 2.1 toward its predecessor's look.
+# =============================================================================
+
+# 1 MP training. Image sides round to multiples of 16.
+resolutions = [1024]
+
+# Aspect-ratio bucketing so non-square images aren't center-cropped.
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 7
+
+# Images only (no video) -> single frame bucket.
+frame_buckets = [1]
+
+# -- Captions ------------------------------------------------------------------
+# Qwen-Image-2.1 reads natural-language captions (sentences); shuffling would scramble
+# them, so leave it off.
+shuffle_caption = false
+
+[[directory]]
+path = '/data/datasets/qwen_image21/concept'   # CHANGE
+caption_extension = '.txt'
+num_repeats = 1
+
+# Add one block per additional concept.

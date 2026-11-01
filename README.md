@@ -2,8 +2,9 @@
 
 Bridge + orchestration to finetune **CircleStone Anima** (2B anime text-to-image DiT)
 with **[tdrussell/diffusion-pipe](https://github.com/tdrussell/diffusion-pipe)** — the
-only trainer that natively supports Anima. It also trains **Sana** (diffusers format)
-through the AbstractEyes diffusion-pipe fork; see [Sana](#sana-diffusers-format).
+only trainer that natively supports Anima. It also trains **Sana** (diffusers format) and
+**Qwen-Image 2.1** (text to image) through the AbstractEyes diffusion-pipe fork; see
+[Sana](#sana-diffusers-format) and [Qwen-Image 2.1](#qwen-image-21-text-to-image).
 
 Anima's DiT backbone is NVIDIA Cosmos-Predict2-2B. This package reads an HF
 `datasets`-format parquet repo (columnar, via pyarrow) into the image + `.txt`-sidecar
@@ -264,6 +265,13 @@ cache → two-phase train):
   wordings it never trained on and descriptions that name no side, beside its control (the same captions, every frame from
   another caption), its start and its untrained body. The readings come from the data repo (`beatrix/cgc_readers.json`); the
   readers' sets are kept there (`sets/cgc2_*`).
+- **`qwen_image21_mega_liminal.ipynb`**
+  [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/qwen-image21/notebooks/qwen_image21_mega_liminal.ipynb)
+  — a **Qwen-Image 2.1** LoRA on [AbstractPhil/mega-liminal](https://huggingface.co/datasets/AbstractPhil/mega-liminal):
+  the fork's check that the trainer computes what ComfyUI computes, a short screen of the training loss (the plain loss
+  against the guided loss at three strengths, measured on ordinary prompts and on the LoRA's own), then the full run with
+  the pick; every LoRA, preview and measurement uploads to `AbstractPhil/mega-liminal-lora/qwen_image21/` as it appears.
+  See [Qwen-Image 2.1](#qwen-image-21-text-to-image).
 
 ## Programmatic / sweeps
 
@@ -338,6 +346,57 @@ What differs from Anima:
 > **Licences.** The Sana diffusers checkpoints are Apache-2.0; the bundled Gemma-2-2B-IT text encoder
 > is under Google's [Gemma Terms of Use](https://ai.google.dev/gemma/terms) and
 > [Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy).
+
+## Qwen-Image 2.1 (text to image)
+
+LoRAs for **[Qwen-Image 2.1](https://huggingface.co/Qwen/Qwen-Image-2.1)** train through model type
+**`qwen_image21`** of the [AbstractEyes diffusion-pipe fork](https://github.com/AbstractEyes/diffusion-pipe), release
+`qwen-image21-v1` or later (its `models/qwen_image21.py` and a ComfyUI submodule that has the 2.1 model); `anima train`
+refuses a checkout without it. The fork loads the ComfyUI split files of
+[Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1): the bf16 transformer (train on this one),
+the RGBA VAE and the Qwen3-VL-8B text encoder.
+
+```bash
+anima download --model qwen_image21 --dest models/qwen_image_2.1   # 24 GB; prints the [model] block
+anima init-config --model qwen_image21                             # configs/qwen_image21_lora.toml + _dataset.toml
+anima validate --config configs/qwen_image21_lora.toml
+ANIMA_DIFFUSION_PIPE=/path/to/AbstractEyes/diffusion-pipe \
+  anima train --config configs/qwen_image21_lora.toml --num-gpus 1
+```
+
+```python
+import geolip_anima_trainer as anima
+model = anima.qwen_image21_model(anima.download_qwen_image21("models/qwen_image_2.1"), cfg=4.0)
+cfg = anima.single_concept_preset("datasets/my_concept", output_dir="runs/qwen21", model=model)
+anima.render_train_toml(cfg, "configs/qwen21")
+```
+
+What differs from Anima:
+- **The guidance is trained in.** Qwen-Image 2.1 samples at cfg 1. A plain flow-matching loss wears that guidance away,
+  so the longer a LoRA trains, the more it needs real CFG at inference. `cfg = w` in `[model]` trains against the
+  model's own guided output at strength w instead (the fork's distillation-preserving loss: the unconditional branch
+  runs on the empty caption without gradient; `pipeline_stages = 1`; one extra forward pass per step):
+
+      v_raw = ( v(x_t, caption) + (w - 1) * v(x_t, empty) ) / w,   loss = || v_raw - (noise - x_0) ||^2
+
+  The strength trained into 2.1 is not published; `QwenImage21Runner.screen()` measures w = 3, 4, 5 against the plain
+  loss before a full run.
+- **Captions** are natural language (Qwen3-VL-8B); `shuffle_caption` stays off.
+- **Presets**: plain Adam (weight decay 0) at 1e-4 and rank 32, the settings of DiffSynth-Studio's own Qwen-Image 2.1
+  LoRA example; `timestep_sample_method = 'logit_normal'`; activation checkpointing on (the 7B transformer at 1 MP).
+  `exclude_modules = ['img_mlp.gate_up', 'img_mlp.out']` in `[adapter]` makes an attention-only LoRA.
+- **Previews** sample as ComfyUI samples the base: 25 steps, cfg 1, euler on the model's own time shift
+  (`shift = 1.9937` in `[samples]`, i.e. exp(0.69)).
+- **Output**: LoRAs are saved in ComfyUI format; load one with **LoraLoaderModelOnly** in the 2.1 workflow.
+- **Colab**: `notebooks/qwen_image21_mega_liminal.ipynb` + `geolip_anima_trainer.qwen_image21_runner.QwenImage21Runner`
+  (setup, the parity check, the dataset, the screen, the full run, contact sheets; uploads with retries in the
+  background; a rerun reuses every screen run already measured).
+- **Training data**: photographs and other pictures Qwen-Image did not generate; renders from the 2025 Qwen-Image would
+  pull 2.1 toward its predecessor's look.
+
+> **Licence.** Qwen-Image 2.1 is under the Qwen Research License Agreement: non-commercial use only (research or
+> evaluation). A LoRA is a derivative and carries the same terms; display "Built with Qwen", and ship a copy of the
+> licence and its NOTICE with it (the Colab runner does).
 
 ## Anima experiments (the flavor bed)
 

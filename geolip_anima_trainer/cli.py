@@ -4,7 +4,8 @@ cli.py — the `anima` console command (argparse, stdlib only).
 
 Subcommands map 1:1 onto api.py:
     anima doctor      env diagnostics (read-only)
-    anima download    fetch the 3 Anima model files (--model sana: one Sana diffusers folder)
+    anima download    fetch the 3 Anima model files (--model sana: one Sana diffusers folder;
+                      --model qwen_image21: the 3 Qwen-Image-2.1 ComfyUI files)
     anima inspect     probe an HF config before extracting
     anima export      stream parquet -> img + .txt dirs
     anima build       balanced dataset.toml from concept folders
@@ -35,7 +36,7 @@ def _parse_ids(s: str | None) -> list[int] | None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="anima",
-        description="CircleStone Anima (and Sana) finetune bridge + diffusion-pipe orchestration.")
+        description="CircleStone Anima (and Sana, Qwen-Image-2.1) finetune bridge + diffusion-pipe orchestration.")
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG logging.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -45,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--config", default=None, help="optional lora.toml to sanity-check")
 
     # download
-    g = sub.add_parser("download", help="download the 3 Anima model files (or one Sana folder)")
+    g = sub.add_parser("download", help="download the 3 Anima model files (or one Sana folder, or the 3 Qwen-Image-2.1 files)")
     g.add_argument("--model", default="anima", choices=list(api.MODEL_TYPES))
     g.add_argument("--dest", default=None, help="default models/<model>")
     g.add_argument("--base", default="base-v1.0", choices=list(api._dl.BASE_CHOICES),
@@ -231,6 +232,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"diffusers_path = '{path}'")
             print(f"# and in sana_dataset.toml: resolutions = [{native}]")
             return 0
+        if args.model == "qwen_image21":
+            paths = api.download_qwen_image21(dest)
+            print("\n# ---- paste into qwen_image21_lora.toml [model] ----")
+            print(f"diffusion_model = '{paths['diffusion_model']}'")
+            print(f"vae = '{paths['vae']}'")
+            print(f"text_encoders = [{{path = '{paths['text_encoder']}', type = 'qwen_image'}}]")
+            return 0
         paths = api.download_models(dest, base=args.base)
         print("\n# ---- paste into anima_lora.toml [model] ----")
         print(f"transformer_path = '{paths.transformer_path}'")
@@ -315,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "validate":
         cfg = api.load_train_config(args.config, args.dataset)
         api.validate(cfg)
-        extra = "" if cfg.model.type == "sana" else f", llm_adapter_lr={cfg.model.llm_adapter_lr}"
+        extra = "" if cfg.model.type in ("sana", "qwen_image21") else f", llm_adapter_lr={cfg.model.llm_adapter_lr}"
         print(f"OK: {args.config} is a valid TrainConfig (model={cfg.model.type}, "
               f"adapter={'FFT' if cfg.adapter is None else f'rank {cfg.adapter.rank}'}, "
               f"lr={cfg.optimizer.lr}{extra}).")

@@ -23,6 +23,11 @@ Sana (model type 'sana') is the second supported model. It needs the AbstractEye
 fork (models/sana.py) and takes one diffusers-format folder; validate() enforces its own rules
 (no LLM adapter, preview sizes a multiple of 32, a warning when the dataset resolution is not the
 checkpoint's native one).
+
+Qwen-Image-2.1 (model type 'qwen_image21', text-to-image) is the third. It also needs the fork
+(models/qwen_image21.py, with its ComfyUI submodule at v0.43.0 or newer) and takes the three ComfyUI
+split files of Comfy-Org/Qwen-Image-2.1. validate() checks its text encoder entry and the guided-loss
+option `cfg` (needs pipeline_stages = 1).
 """
 
 from __future__ import annotations
@@ -46,14 +51,16 @@ class ConfigError(ValueError):
 # =============================================================================
 # LORA-SIDE ELEMENTS  (tables of anima_lora.toml)
 # =============================================================================
-MODEL_TYPES = ("anima", "sana")
+MODEL_TYPES = ("anima", "sana", "qwen_image21")
 
 
 @dataclass
 class ModelConfig:
     """[model] — Anima: the DiT + VAE + Qwen text encoder files, and the frozen LLM adapter.
     Sana (type='sana'): one diffusers-format folder (diffusers_path) holding the transformer,
-    the DC-AE autoencoder and the Gemma-2 text encoder; see download_sana.py."""
+    the DC-AE autoencoder and the Gemma-2 text encoder; see download_sana.py.
+    Qwen-Image-2.1 (type='qwen_image21'): the ComfyUI split files (diffusion_model, vae, one
+    text_encoders entry of type 'qwen_image'); see download_qwen_image21.py."""
     type: str = "anima"
     transformer_path: str = ""
     vae_path: str = ""
@@ -68,6 +75,15 @@ class ModelConfig:
     # Training timestep shift (diffusion-pipe reads `shift` from [model]); None -> omitted.
     # Sana: 3.0 = the checkpoints' own sampling shift (scheduler_config.json flow_shift).
     shift: float | None = None
+    # Qwen-Image-2.1 only: the files as the fork's [model] block names them, e.g. from
+    # `anima download --model qwen_image21`; text_encoders = [{"path": ..., "type": "qwen_image"}].
+    diffusion_model: str = ""
+    vae: str = ""
+    text_encoders: list[dict] = field(default_factory=list)
+    timestep_sample_method: str | None = None    # None -> omitted (the fork's default, logit_normal)
+    # Qwen-Image-2.1 only: train against the model's own guided output at strength w (the fork's
+    # distillation-preserving loss, for a CFG-distilled base); None -> the plain flow-matching loss.
+    cfg: float | None = None
 
 
 @dataclass
@@ -77,6 +93,9 @@ class AdapterConfig:
     rank: int = 32                   # single-concept default; 64 for multi-concept.
     dtype: str = "bfloat16"
     init_from_existing: str | None = None   # continue a LoRA; omitted when None.
+    # Module-name suffixes the LoRA skips (peft exclude_modules; the AbstractEyes fork passes it on),
+    # e.g. ['img_mlp.gate_up', 'img_mlp.out'] for an attention-only Qwen-Image-2.1 LoRA; None -> omitted.
+    exclude_modules: list[str] | None = None
 
 
 @dataclass
@@ -125,6 +144,8 @@ class RunConfig:
     # save_every_n_epochs is far too coarse). None -> omit (diffusion-pipe needs at least ONE of
     # save_every_n_{epochs,steps,examples}, train.py:95; we always emit epochs so the assert holds).
     save_every_n_steps: int | None = None
+    # Stop after this many steps (the final save is named step<N>); None -> omit (train all epochs).
+    max_steps: int | None = None
     checkpoint_every_n_minutes: int = 30
     save_dtype: str = "bfloat16"
     # activation_checkpointing is a VRAM<->speed TRADE, not a free win. OFF keeps all 28 DiT
@@ -284,12 +305,20 @@ def _toml_str(v: str) -> str:
     return json.dumps(v, ensure_ascii=False)
 
 
+def _toml_inline_tables(rows: list[dict]) -> str:
+    """A list of TOML inline tables, e.g. [{path = '/m/te.safetensors', type = 'qwen_image'}]."""
+    return "[" + ", ".join("{" + ", ".join(f"{k} = {_toml_scalar(v)}" for k, v in row.items()) + "}"
+                           for row in rows) + "]"
+
+
 _DATASET_CAPTION_NOTE = {
     "anima": ["# Anima is TAG-ORDER sensitive: quality -> subject -> character -> series ->",
               "# @artist -> general. Do NOT shuffle_caption unless keep_tokens protects the",
               "# leading ordered block."],
     "sana": ["# Sana reads natural-language captions (Gemma-2): shuffle_caption would scramble",
              "# sentences; leave it off. Resolutions: the checkpoint's native size (512 or 1024)."],
+    "qwen_image21": ["# Qwen-Image-2.1 reads natural-language captions (Qwen3-VL-8B): shuffle_caption would",
+                     "# scramble sentences; leave it off. Image sides round to multiples of 16."],
 }
 
 
@@ -375,11 +404,32 @@ _SANA_MODEL_NOTE = """\
 # prefix and 300-token selection), so a trained LoRA sees what inference feeds it.
 # shift = the checkpoints' own sampling shift (scheduler_config.json flow_shift = 3.0)."""
 
+_QWEN21_LORA_HEADER = """\
+# =============================================================================
+# qwen_image21_lora.toml  —  diffusion-pipe training config for Qwen-Image-2.1 (text-to-image)
+# Trainer: the AbstractEyes diffusion-pipe fork (model type 'qwen_image21' lives in its
+# models/qwen_image21.py; its ComfyUI submodule must be v0.43.0 or newer).
+# Generated by geolip_anima_trainer.config — edit via the Python API or by hand.
+# Licence: the weights are under the Qwen Research License (research and evaluation);
+# a LoRA is a derivative and carries the same terms ("Built with Qwen").
+# Run:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\
+#     deepspeed --num_gpus=N train.py --deepspeed --config <this file>
+# ============================================================================="""
+
+_QWEN21_MODEL_NOTE = """\
+# The ComfyUI split files of Comfy-Org/Qwen-Image-2.1 (`anima download --model qwen_image21`): train on the
+# bf16 transformer; the text encoder (Qwen3-VL-8B) only runs while caching, so the int8 file ComfyUI's
+# template loads works. 2.1 is CFG-distilled: `cfg = w` trains against the model's own guided output
+# (the fork's distillation-preserving loss), so a LoRA keeps sampling at cfg 1; without it the more a LoRA
+# trains, the more it needs real CFG at inference."""
+
 
 def render_lora_toml(cfg: TrainConfig) -> str:
     """Render a TrainConfig to anima_lora.toml text, canonical comments baked in."""
     r = cfg.run
-    lines = [_SANA_LORA_HEADER if cfg.model.type == "sana" else _LORA_HEADER, ""]
+    header = {"sana": _SANA_LORA_HEADER, "qwen_image21": _QWEN21_LORA_HEADER}.get(cfg.model.type, _LORA_HEADER)
+    lines = [header, ""]
     lines.append(f"output_dir = {_toml_scalar(r.output_dir)}")
     lines.append(f"dataset    = {_toml_scalar(cfg.dataset_toml_path)}")
     lines.append("")
@@ -393,6 +443,8 @@ def render_lora_toml(cfg: TrainConfig) -> str:
         lines.append(f"{name} = {_toml_scalar(getattr(r, name))}")
     if r.save_every_n_steps is not None:   # step-based saving (omitted -> epoch-based only)
         lines.append(f"save_every_n_steps = {r.save_every_n_steps}")
+    if r.max_steps is not None:            # stop early (the final save is step<N>)
+        lines.append(f"max_steps = {r.max_steps}")
     if r.map_num_proc is not None:    # decode-worker pool (omitted -> diffusion-pipe default)
         lines.append(f"map_num_proc = {r.map_num_proc}")
     if r.bf16_master_weights:         # fp32 masters over the bf16 trainable weights (fork: utils/master_adam.py)
@@ -405,6 +457,18 @@ def render_lora_toml(cfg: TrainConfig) -> str:
                   _SANA_MODEL_NOTE,
                   f"diffusers_path = {_toml_scalar(m.diffusers_path)}",
                   f"dtype = {_toml_scalar(m.dtype)}"]
+    elif m.type == "qwen_image21":
+        lines += ["", "[model]",
+                  f"type = {_toml_scalar(m.type)}",
+                  _QWEN21_MODEL_NOTE,
+                  f"diffusion_model = {_toml_scalar(m.diffusion_model)}",
+                  f"vae = {_toml_scalar(m.vae)}",
+                  f"text_encoders = {_toml_inline_tables(m.text_encoders)}",
+                  f"dtype = {_toml_scalar(m.dtype)}"]
+        if m.timestep_sample_method is not None:
+            lines.append(f"timestep_sample_method = {_toml_scalar(m.timestep_sample_method)}")
+        if m.cfg is not None:
+            lines.append(f"cfg = {_toml_scalar(float(m.cfg))}")
     else:
         lines += ["", "[model]",
                   f"type = {_toml_scalar(m.type)}",
@@ -425,6 +489,8 @@ def render_lora_toml(cfg: TrainConfig) -> str:
                   f"dtype = {_toml_scalar(a.dtype)}"]
         if a.init_from_existing:
             lines.append(f"init_from_existing = {_toml_scalar(a.init_from_existing)}")
+        if a.exclude_modules:
+            lines.append(f"exclude_modules = {_toml_scalar(list(a.exclude_modules))}")
     else:
         lines += ["", "# FULL FINE-TUNE: [adapter] omitted; keep optimizer lr low (~5e-6..1e-5)."]
 
@@ -545,8 +611,9 @@ def preset_optimizer(model: ModelConfig) -> OptimizerConfig:
     """The preset optimizer per model. Anima: adamw_optimi at the author's low 2e-5. Sana: plain
     Adam (weight decay 0) at 1e-4, the learning rate of the diffusers Sana LoRA example
     (examples/dreambooth/README_sana.md); 'adam' is wired in the AbstractEyes fork, which Sana
-    needs anyway."""
-    if model.type == "sana":
+    needs anyway. Qwen-Image-2.1: plain Adam (weight decay 0) at 1e-4, the rate of DiffSynth-Studio's
+    own Qwen-Image-2.1 LoRA example (examples/qwen_image_21/model_training: rank 32, 1e-4, 1 MP)."""
+    if model.type in ("sana", "qwen_image21"):
         return OptimizerConfig(type="adam", lr=1e-4, weight_decay=0.0)
     return OptimizerConfig(lr=2e-5)
 
@@ -615,6 +682,7 @@ def validate(cfg: TrainConfig, *, strict: bool = True) -> TrainConfig:
     errs: list[str] = []
     warns: list[str] = []
     sana = cfg.model.type == "sana"
+    qwen = cfg.model.type == "qwen_image21"
 
     # -- model type -------------------------------------------------------------
     if cfg.model.type not in MODEL_TYPES:
@@ -623,16 +691,16 @@ def validate(cfg: TrainConfig, *, strict: bool = True) -> TrainConfig:
     # -- tag-order invariant --------------------------------------------------
     if cfg.dataset.shuffle_caption and cfg.dataset.keep_tokens is None:
         errs.append("shuffle_caption=true requires keep_tokens: " + (
-            "Sana's captions are natural language and shuffling would scramble the sentences."
-            if sana else
+            "this model reads natural-language captions and shuffling would scramble the sentences."
+            if sana or qwen else
             "it protects the ordered quality->subject->character->series->@artist block "
             "(Anima is tag-order sensitive)."))
 
-    # -- frozen-adapter invariant (Anima) / no adapter at all (Sana) ----------
+    # -- frozen-adapter invariant (Anima) / no adapter at all (Sana, Qwen-Image-2.1)
     lr = cfg.model.llm_adapter_lr
-    if sana:
+    if sana or qwen:
         if lr != 0:
-            errs.append(f"llm_adapter_lr={lr}: Sana has no LLM adapter (an Anima-only knob).")
+            errs.append(f"llm_adapter_lr={lr}: {cfg.model.type} has no LLM adapter (an Anima-only knob).")
     elif lr < 0:
         errs.append("llm_adapter_lr must be >= 0.")
     elif lr > 5e-6:
@@ -648,6 +716,26 @@ def validate(cfg: TrainConfig, *, strict: bool = True) -> TrainConfig:
         if native and any(r != native for r in cfg.dataset.resolutions):
             warns.append(f"resolutions={cfg.dataset.resolutions}: this Sana checkpoint was trained at "
                          f"{native} px (transformer sample_size x 32); train at its native size.")
+
+    # -- Qwen-Image-2.1: the files, the text encoder entry, the guided loss ----
+    if qwen:
+        tes = cfg.model.text_encoders or []
+        if (len(tes) != 1 or not isinstance(tes[0], dict) or tes[0].get("type") != "qwen_image"
+                or not tes[0].get("path")):
+            errs.append("Qwen-Image-2.1 takes one text_encoders entry {path = ..., type = 'qwen_image'} "
+                        "(Qwen3-VL-8B, e.g. qwen3vl_8b_int8_convrot.safetensors).")
+        if not cfg.model.diffusion_model or not cfg.model.vae:
+            errs.append("Qwen-Image-2.1 needs model.diffusion_model and model.vae (the ComfyUI split files).")
+        w = cfg.model.cfg
+        if w is not None:
+            if not 1 < float(w) <= 10:
+                errs.append(f"model.cfg={w}: the guided loss takes a guidance strength in (1, 10] "
+                            "(None = the plain flow-matching loss).")
+            if cfg.run.pipeline_stages != 1:
+                errs.append("model.cfg (the guided loss) needs pipeline_stages = 1: its unconditional branch "
+                            "runs without gradient.")
+    elif cfg.model.cfg is not None:
+        errs.append(f"model.cfg is a Qwen-Image-2.1 option (model type is {cfg.model.type!r}).")
 
     # -- optimizer lr ---------------------------------------------------------
     if cfg.optimizer.lr <= 0:
@@ -682,7 +770,7 @@ def validate(cfg: TrainConfig, *, strict: bool = True) -> TrainConfig:
             errs.append(f"bf16_master_weights needs [optimizer] type 'adam' (got {cfg.optimizer.type!r}).")
         if cfg.model.dtype != "bfloat16":
             errs.append(f"bf16_master_weights needs model.dtype 'bfloat16' (got {cfg.model.dtype!r}).")
-    if cfg.run.blocks_to_swap or cfg.run.activation_checkpointing:
+    if cfg.run.blocks_to_swap or (cfg.run.activation_checkpointing and not qwen):   # 2.1's 7B transformer needs it
         warns.append("block_swap/activation_checkpointing enabled: unnecessary on 96GB, slower.")
 
     # -- topology -------------------------------------------------------------

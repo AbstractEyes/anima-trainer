@@ -66,6 +66,38 @@ dp_url=anima_colab.DP_FORK_URL)` clones the fork at `external/diffusion-pipe-for
 
 Sana's weights are Apache-2.0; its Gemma-2-2B-IT text encoder is under the Gemma Terms of Use.
 
+## `qwen_image21_mega_liminal.ipynb`
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/AbstractEyes/anima-trainer/blob/qwen-image21/notebooks/qwen_image21_mega_liminal.ipynb)
+
+A **Qwen-Image 2.1 LoRA** on [AbstractPhil/mega-liminal](https://huggingface.co/datasets/AbstractPhil/mega-liminal)
+on a Colab RTX PRO 6000, trained through model type `qwen_image21` of the
+[AbstractEyes diffusion-pipe fork](https://github.com/AbstractEyes/diffusion-pipe) at its release `qwen-image21-v1`,
+uploaded into `qwen_image21/` of [AbstractPhil/mega-liminal-lora](https://huggingface.co/AbstractPhil/mega-liminal-lora).
+Thin shell over `geolip_anima_trainer.qwen_image21_runner.QwenImage21Runner`: bootstrap (this repo's `qwen-image21`
+branch; `anima_colab.install(..., dp_url=anima_colab.DP_FORK_URL, dp_ref=anima_colab.QWEN21_FORK_REF)` clones the fork
+release at `external/diffusion-pipe-fork-qwen-image21-v1`; one restart), then `setup()` → `parity()` →
+`prepare_dataset()` → `screen()` → `train()` → `sheets()`.
+
+- **The parity check:** the fork's own check on the training card (text encoder, VAE, transformer against ComfyUI's
+  forward, caption padding, the preview sampler, one LoRA step with each loss); any FAIL stops the notebook.
+- **The data:** ten class folders of pictures and `.txt` captions (`liminal, <class>, <description>`), repeats per class
+  square-root dampened (at most 8 per picture): 2,789 samples an epoch.
+- **The screen:** Qwen-Image 2.1 samples at cfg 1 with its guidance trained in, and plain training wears that away; the
+  fork's guided loss (`cfg = w`) trains against the model's own guided output instead. Four short runs (the plain loss;
+  the guided loss at w = 3, 4, 5; 400 steps each) are measured before and after training on 32 ordinary prompts
+  (PartiPrompts) at two seeds and on eight of the LoRA's own prompts (DINOv2 picture distances; luminance contrast). The
+  untrained model rendered again by each later run must sit under the seed-to-seed change, or nothing is picked; a run
+  is eligible when its ordinary prompts change less than a seed change and keep 90% of their contrast; the pick changes
+  its own subject most per unit of change elsewhere. A rerun reuses runs already measured with the same settings.
+- **Recipe:** rank 32, plain Adam (weight decay 0) at 1e-4, 100 warmup steps, 4 epochs at micro-batch 4 (~2,790 steps),
+  1 MP with aspect-ratio buckets, activation checkpointing, a save + 15 previews (25 steps, cfg 1) every epoch.
+- **Uploads** (a WRITE `HF_TOKEN` in Colab Secrets; checked before any GPU minute): `README.md`, `LICENSE`, `NOTICE`;
+  `rank32/` (the LoRA of every epoch in ComfyUI format, `samples/`, `training/`), `screen/`, `checks/`. Each save
+  uploads once the next exists, from a background thread with retries; a failed upload never stops the run.
+
+Qwen-Image 2.1 is under the Qwen Research License Agreement (non-commercial: research or evaluation); its LoRAs carry
+the same terms and "Built with Qwen". MegaLiminal's pictures belong to their creators (research and non-commercial use).
+
 ## `anima_colab_experiments.ipynb`
 The same experiment system on **Anima** (Anima-Base v1.0 at 768 px), uploaded one folder per experiment
 into [AbstractPhil/geolip-beatrix-anima](https://huggingface.co/AbstractPhil/geolip-beatrix-anima). Thin

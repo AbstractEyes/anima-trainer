@@ -23,6 +23,7 @@ import logging
 
 from . import build_multiconcept_dataset as _build
 from . import download_anima as _dl
+from . import download_qwen_image21 as _dl_qwen21
 from . import download_sana as _dl_sana
 from . import hf_to_diffusion_pipe as _bridge
 from . import launch as _launch
@@ -55,7 +56,7 @@ __all__ = [
     # bridge configs
     "ExportConfig", "DatasetTomlConfig", "SubjectBucketConfig", "CaptionMode", "ModelPaths",
     # operations
-    "download_models", "download_sana", "sana_model",
+    "download_models", "download_sana", "sana_model", "download_qwen_image21", "qwen_image21_model",
     "inspect_source", "export_dataset", "export_subject_buckets",
     "build_dataset_toml", "build_mode_tomls", "cache", "cache_push", "cache_pull",
     "reconstruct_dataset", "prune_source_cache", "keepalive", "gpu_keepalive",
@@ -103,6 +104,23 @@ def sana_model(diffusers_path: str | Path, *, shift: float = 3.0) -> ModelConfig
     """The [model] block for a Sana run (bf16; shift 3.0 = the checkpoints' own sampling shift).
     Needs the AbstractEyes diffusion-pipe fork (build_plan refuses a checkout without it)."""
     return ModelConfig(type="sana", diffusers_path=str(diffusers_path), shift=shift)
+
+
+def download_qwen_image21(dest: str | Path, revision: str | None = None) -> dict:
+    """Fetch the three Qwen-Image-2.1 files (Comfy-Org/Qwen-Image-2.1, the repo's folder layout) into dest.
+    Returns {"diffusion_model", "vae", "text_encoder": local path} for qwen_image21_model()."""
+    dest = Path(dest).expanduser().resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    return _dl_qwen21.fetch(dest, revision)
+
+
+def qwen_image21_model(paths: dict, *, cfg: float | None = None) -> ModelConfig:
+    """The [model] block for a Qwen-Image-2.1 run (bf16, logit-normal timesteps). cfg = w trains against the
+    model's own guided output at strength w (the fork's distillation-preserving loss); None = the plain loss.
+    Needs the AbstractEyes diffusion-pipe fork (build_plan refuses a checkout without it)."""
+    return ModelConfig(type="qwen_image21", diffusion_model=str(paths["diffusion_model"]), vae=str(paths["vae"]),
+                       text_encoders=[{"path": str(paths["text_encoder"]), "type": "qwen_image"}],
+                       timestep_sample_method="logit_normal", cfg=cfg)
 
 
 # =============================================================================

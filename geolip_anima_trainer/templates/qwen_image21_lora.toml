@@ -1,0 +1,98 @@
+# =============================================================================
+# qwen_image21_lora.toml  —  diffusion-pipe training config for Qwen-Image-2.1 (text-to-image)
+# Trainer: the AbstractEyes diffusion-pipe fork — model type 'qwen_image21' lives in its
+#   models/qwen_image21.py, with its ComfyUI submodule at v0.43.0 or newer (tag
+#   qwen-image21-v1 or later; `anima train` refuses a checkout without it).
+#   Point ANIMA_DIFFUSION_PIPE at the fork.
+# Model: the ComfyUI split files of Comfy-Org/Qwen-Image-2.1 (`anima download --model qwen_image21`).
+#   Licence: the Qwen Research License (research and evaluation; commercial use needs a
+#   licence from Qwen). A LoRA is a derivative and carries the same terms ("Built with Qwen").
+# Objective: a LoRA on the 2.1 transformer (text encoder + VAE frozen).
+# -----------------------------------------------------------------------------
+# Run:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#     deepspeed --num_gpus=1 train.py --deepspeed --config configs/qwen_image21_lora.toml
+# The LoRA is saved in ComfyUI format (diffusion_model.<module>.lora_A/B.weight): load it with
+# ComfyUI's LoraLoaderModelOnly in the 2.1 workflow.
+# =============================================================================
+
+# ---- top-level run settings -------------------------------------------------
+output_dir = '/data/diffusion_pipe_runs/qwen_image21_lora'   # CHANGE: a new subdir is made per run
+dataset    = 'configs/qwen_image21_dataset.toml'             # CHANGE: path to the dataset toml
+
+epochs = 4
+micro_batch_size_per_gpu = 4
+pipeline_stages = 1                  # single GPU / data parallel (the guided loss needs 1)
+gradient_accumulation_steps = 1
+gradient_clipping = 1.0
+warmup_steps = 100
+
+# ---- eval (optional) ----------------------------------------------------------
+eval_every_n_epochs = 1
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 4
+eval_gradient_accumulation_steps = 1
+
+# ---- checkpointing / saving -------------------------------------------------
+save_every_n_epochs = 1
+checkpoint_every_n_minutes = 30      # full training-state checkpoint for --resume_from_checkpoint
+save_dtype = 'bfloat16'
+
+activation_checkpointing = true      # the 7B transformer at 1 MP and micro batch 4 needs it, even on 96 GB
+compile = false
+partition_method = 'parameters'
+caching_batch_size = 8               # images per VAE forward while caching; keep small
+steps_per_print = 10
+blocks_to_swap = 0
+
+# =============================================================================
+[model]
+type = 'qwen_image21'
+# Train on the bf16 transformer; the int8 file of ComfyUI's template is for inference. The text
+# encoder (Qwen3-VL-8B) only runs while caching, so the int8 file the template loads works.
+diffusion_model = '/data/models/qwen_image_2.1/diffusion_models/qwen_image_2.1_bf16.safetensors'   # CHANGE
+vae = '/data/models/qwen_image_2.1/vae/qwen_image_2.1_vae_bf16.safetensors'                         # CHANGE
+text_encoders = [{path = '/data/models/qwen_image_2.1/text_encoders/qwen3vl_8b_int8_convrot.safetensors', type = 'qwen_image'}]   # CHANGE
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+# 2.1 is CFG-distilled (its workflows sample the base at cfg 1). Plain training pulls the
+# conditional output toward the unguided one, so the more a LoRA trains, the more it needs real
+# CFG at inference. cfg = w trains against the model's own guided output at strength w instead
+# (needs pipeline_stages = 1; one extra forward pass per step). The strength baked into 2.1 is
+# not published: pick w with a short screen (the qwen_image21 runner's screen() does).
+# cfg = 4.0
+
+# =============================================================================
+[adapter]
+type = 'lora'
+# LoRA goes on every Linear inside the 32 transformer blocks (attention and feed-forward).
+rank = 32
+dtype = 'bfloat16'
+# exclude_modules = ['img_mlp.gate_up', 'img_mlp.out']   # attention-only LoRA
+# init_from_existing = '/data/diffusion_pipe_runs/qwen_image21_lora/<run>/epoch2'   # to continue a LoRA
+
+# =============================================================================
+[optimizer]
+# Plain Adam, weight decay 0 (wired as 'adam' in the AbstractEyes fork). 1e-4 at rank 32 is
+# the setting of DiffSynth-Studio's own Qwen-Image-2.1 LoRA example.
+type = 'adam'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.0
+eps = 1e-8
+
+# =============================================================================
+# TRAINING PREVIEWS (optional): uncomment to render these prompts with the in-training
+# weights at every save (and once before the first step) into
+# <output_dir>/<run>/samples/<save>/ and TensorBoard. These are the settings ComfyUI samples
+# the 2.1 base with: 25 steps, cfg 1 (distilled), euler / simple on the model's own time
+# shift (mu 0.69 = shift 1.9937 in the previews' schedule). Sizes: multiples of 16.
+# [samples]
+# prompts = ['a lighthouse on a cliff at dusk', 'a bowl of fruit on a kitchen counter']
+# width = 1024
+# height = 1024
+# steps = 25
+# cfg = 1.0
+# shift = 1.9937
+# seed = 42
+# before_first_step = true
